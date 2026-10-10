@@ -20,10 +20,15 @@ namespace sdbench {
     // The size of the test matrix
     inline constexpr std::size_t kNumResults = kBufferSizes.size() * kFrequenciesKhz.size();
 
+    // Bytes read per measurement. Created on the card as kTestPath if missing.
+    inline constexpr std::size_t kTestFileBytes = 4 * 1024 * 1024;
+    inline constexpr const char* kTestPath = "/sdcard/test.bin";
+
     struct BenchResult {
         std::size_t buffer_size;
         int frequency_khz;
-        float megabytes_per_sec;
+        float megabytes_per_sec;      // fread() through FAT
+        float raw_megabytes_per_sec;  // sdmmc_read_sectors(), no filesystem
     };
 
     std::array<BenchResult, kNumResults> run();

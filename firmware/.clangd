@@ -1,0 +1,4 @@
+# ESP-IDF compiles with xtensa gcc; strip flags clangd doesn't understand.
+CompileFlags:
+  CompilationDatabase: build
+  Remove: [-mlongcalls, -fstrict-volatile-bitfields, -fno-tree-switch-conversion, -fno-shrink-wrap, -mdisable-hardware-atomics, -specs=*]

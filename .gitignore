@@ -1,0 +1,11 @@
+build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock
+.cache/
+models/
+golden/
+*.lfm
+__pycache__/
+.venv/

@@ -1,0 +1,7 @@
+[submodule "firmware/components/M5GFX"]
+	path = firmware/components/M5GFX
+	url = https://github.com/m5stack/M5GFX.git
+	branch = master
+[submodule "firmware/components/M5Unified"]
+	path = firmware/components/M5Unified
+	url = https://github.com/m5stack/M5Unified.git

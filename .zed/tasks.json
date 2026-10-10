@@ -1,0 +1,43 @@
+[
+  {
+    "label": "fw: build",
+    "command": "tools/idf.sh build",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "all"
+  },
+  {
+    "label": "fw: flash + monitor",
+    "command": "tools/idf.sh build flash monitor",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "all",
+    "use_new_terminal": true
+  },
+  {
+    "label": "fw: monitor",
+    "command": "tools/idf.sh monitor",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "fw: menuconfig",
+    "command": "tools/idf.sh menuconfig",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "use_new_terminal": true
+  },
+  {
+    "label": "fw: size",
+    "command": "tools/idf.sh size-components",
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "fw: set-target esp32s3 (first time)",
+    "command": "git submodule update --init && tools/idf.sh set-target esp32s3",
+    "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "host: build + run",
+    "command": "cmake -S host -B host/build -G Ninja && cmake --build host/build && ./host/build/lfm_host",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "all"
+  }
+]

@@ -12,6 +12,12 @@ if [[ ! -f "$IDF_PATH/export.sh" ]]; then
     exit 1
 fi
 
+# A monitor left open in another terminal holds the serial port and makes
+# flash/monitor fail with "port is busy". Close it first.
+if [[ " $* " == *" flash "* || " $* " == *" monitor "* ]]; then
+    pkill -f esp_idf_monitor 2>/dev/null && sleep 0.5 || true
+fi
+
 . "$IDF_PATH/export.sh" > /dev/null
 cd "$ROOT/firmware"
 exec idf.py "$@"

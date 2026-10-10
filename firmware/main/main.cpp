@@ -28,6 +28,8 @@ extern "C" void app_main(void)
     M5.Display.printf("LFM2.5-230M  d=%d L=%d V=%d\n\n", lfm::kDim, lfm::kNumLayers, lfm::kVocab);
     M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 
+    auto results = sdbench::run();
+
     ESP_LOGI(TAG, "free heap: %u, largest block: %u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));

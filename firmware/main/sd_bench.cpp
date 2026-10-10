@@ -64,7 +64,16 @@ namespace {
             }
 
             ~SdCard() {
+                esp_err_t err = esp_vfs_fat_sdcard_unmount(kMountPoint, card_);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "unmount failed: %s", esp_err_to_name(err));
+                }
 
+                err = spi_bus_free(host_);
+
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "unmount failed: %s", esp_err_to_name(err));
+                }
             }
 
             SdCard(const SdCard&) = delete;
@@ -82,6 +91,8 @@ namespace {
 namespace sdbench {
 
     std::array<BenchResult, kNumResults> run() {
+        SdCard sd {kFrequenciesKhz[0]};
+        sdmmc_card_print_info(stdout, sd.card());
         return {};
     }
 

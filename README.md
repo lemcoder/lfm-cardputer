@@ -69,9 +69,31 @@ Xtensa header resolution than macOS clangd.
 - ~163M MACs in layers + 67M in full LM head per token
 - **Bytes read per token is the metric.** Q4 ~130 MB, Q2 ~70 MB; tied head = 25% of it
 
+## Golden reference (tools/golden.py)
+
+`uv run tools/golden.py [--prompt "..." --name x]` runs HF LFM2.5-230M in fp32 and writes
+`golden/<name>/`: `manifest.json` (tokens, config, weights path, tensor index) + one raw
+little-endian `float32` file per activation (`*.f32`, row-major, leading axis = position).
+See the script's docstring for every tensor name (`L2.attn.q_rope`, `L0.conv.Bx`, ...).
+
+Weights: `model.safetensors` (path in manifest) = 8-byte LE header length, JSON header
+(`name -> dtype, shape, data_offsets`), then raw data. All 132 tensors are **BF16**
+(fp32 = bf16 bits << 16). Linear weights are `[out, in]` row-major, so `y = W x` reads rows.
+
+Semantics the C++ must match:
+- RMSNorm: `x * rsqrt(mean(x^2) + 1e-5) * w`, in fp32.
+- Conv layer: `in_proj` -> `[B | C | x]`; `Bx = B*x`; causal depthwise conv, kernel 3
+  (`w[:,0]*Bx[t-2] + w[:,1]*Bx[t-1] + w[:,2]*Bx[t]`); `out_proj(C * conv)`.
+  Decode state per conv layer = last 2 `Bx` rows (2 x 1024 floats).
+- Attention: q/k/v proj -> per-head RMSNorm on q and k -> RoPE (rotate_half: pairs are
+  `(i, i+32)`, theta 1e6) -> causal GQA (2 q heads per kv head), scale 1/8 -> `out_proj`.
+- MLP: `w2(silu(w1 x) * w3 x)`.
+- Layer: `h = x + op(operator_norm(x)); out = h + mlp(ffn_norm(h))`.
+- Head: `logits = embed_tokens @ embedding_norm(h)` (tied).
+
 ## Milestones
 
-0. [ ] tools: dump golden per-layer activations + logits from HF transformers
+0. [x] tools: dump golden per-layer activations + logits from HF transformers
 1. [ ] host: fp32 single-token forward in C++, matches golden layer-by-layer
 2. [ ] host: custom Q4/Q2 block quant; per-layer error, top-1 agreement, perplexity
 3. [ ] host: streaming engine, fixed ~280 KB arena, bytes/token counter

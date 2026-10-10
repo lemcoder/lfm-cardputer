@@ -51,8 +51,15 @@ Xtensa header resolution than macOS clangd.
 ## Hardware facts (Cardputer-Adv, verified against M5Cardputer-UserDemo `CardputerADV` branch)
 
 - ESP32-S3FN8, 240 MHz dual core, 8 MB flash, **no PSRAM** -> ~512 KB SRAM, ~300 KB usable.
-- microSD over **SPI**: MISO 39, MOSI 14, SCLK 40, CS 12. Bus shared with LoRa cap (NSS 5).
-  SDSPI default 20 MHz -> ~2.5 MB/s ceiling. Try 40 MHz, and SDMMC 1-bit via GPIO matrix.
+- microSD wired for SPI: MISO 39, MOSI 14, SCLK 40, CS 12. Bus shared with LoRa cap (NSS 5).
+- **Measured (firmware/main/sd_bench, 32 KB sequential reads):**
+  - SPI 20 MHz: 1.82 MB/s. SPI 40 MHz: fails (GPIO-matrix input timing).
+  - **SD 1-bit mode on the same wires** (CLK 40, CMD 14, DAT0 39, DAT3 12): 2.45 MB/s @ 20 MHz,
+    **4.85 MB/s @ 40 MHz** (97% of the 1-bit ceiling). Input delay phase 0-3 makes no difference.
+  - FATFS `read()` costs ~0% vs raw sectors. `fread()` with `_IONBF` is ~30x slower: don't use it.
+  - 4 KB reads ~17% slower than 32 KB; read weights in >= 32 KB chunks.
+  - Once a card has been in SPI mode it needs a power cycle to enter SD mode (and vice versa here).
+- Free heap after display init: 366 KB, largest block 272 KB.
 
 ## Model facts (LFM2.5-230M config.json)
 
@@ -68,6 +75,6 @@ Xtensa header resolution than macOS clangd.
 1. [ ] host: fp32 single-token forward in C++, matches golden layer-by-layer
 2. [ ] host: custom Q4/Q2 block quant; per-layer error, top-1 agreement, perplexity
 3. [ ] host: streaming engine, fixed ~280 KB arena, bytes/token counter
-4. [ ] device: SD sequential read benchmark (SDSPI 20/40 MHz, SDMMC 1-bit)
+4. [x] device: SD sequential read benchmark -> SD 1-bit @ 40 MHz, 4.85 MB/s
 5. [ ] device: quantized matvec benchmark, scalar then PIE SIMD (cycles/MAC)
 6. [ ] device: full model; then BPE tokenizer; then UI

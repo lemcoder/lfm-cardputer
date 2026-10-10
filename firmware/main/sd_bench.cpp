@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <memory>
 
+#include "driver/sdmmc_host.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_err.h"
@@ -32,14 +33,61 @@ namespace {
     constexpr std::size_t kSectorSize = 512;
 
     // Mounts the card on construction, unmounts on destruction.
-    // Mount failures are recorded in err() instead of aborting, so a card that
-    // can't do 40 MHz shows up as a failed result rather than a reboot loop.
+    // Mount failures are recorded in err() instead of aborting, so a config the
+    // card can't do shows up as a failed result rather than a reboot loop.
     class SdCard {
         public:
-            explicit SdCard(int freq_khz) {
+            explicit SdCard(const sdbench::BusConfig& cfg) {
+                esp_vfs_fat_sdmmc_mount_config_t mountConfig = {
+                    .format_if_mount_failed = false,
+                    .max_files = 2,
+                    .allocation_unit_size = 512,
+                    .disk_status_check_enable = false,
+                    .use_one_fat = false
+                };
+
+                if (cfg.bus == sdbench::Bus::Spi) {
+                    mount_spi(cfg, mountConfig);
+                } else {
+                    mount_sdmmc(cfg, mountConfig);
+                }
+
+                if (err_ != ESP_OK) {
+                    ESP_LOGE(TAG, "mount %s %d kHz: %s", cfg.bus == sdbench::Bus::Spi ? "SPI" : "SD",
+                             cfg.freq_khz, esp_err_to_name(err_));
+                    card_ = nullptr;
+                }
+            }
+
+            ~SdCard() {
+                // Unmount also deinits the SPI/SDMMC host driver.
+                if (card_ != nullptr) {
+                    esp_err_t err = esp_vfs_fat_sdcard_unmount(kMountPoint, card_);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "unmount failed: %s", esp_err_to_name(err));
+                    }
+                }
+
+                if (spi_bus_initialized_) {
+                    esp_err_t err = spi_bus_free(spi_host_);
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "spi_bus_free failed: %s", esp_err_to_name(err));
+                    }
+                }
+            }
+
+            SdCard(const SdCard&) = delete;
+            SdCard& operator=(const SdCard&) = delete;
+
+            bool ok() const { return card_ != nullptr; }
+            esp_err_t err() const { return err_; }
+            sdmmc_card_t* card() const { return card_; }
+
+        private:
+            void mount_spi(const sdbench::BusConfig& cfg, const esp_vfs_fat_mount_config_t& mountConfig) {
                 sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-                host.max_freq_khz = freq_khz;
-                host_ = static_cast<spi_host_device_t>(host.slot);
+                host.max_freq_khz = cfg.freq_khz;
+                spi_host_ = static_cast<spi_host_device_t>(host.slot);
 
                 spi_bus_config_t bus = {
                     .mosi_io_num = kPinMosi,
@@ -60,57 +108,46 @@ namespace {
 
                 sdspi_device_config_t deviceConfig = SDSPI_DEVICE_CONFIG_DEFAULT();
                 deviceConfig.gpio_cs = kPinCs;
-                deviceConfig.host_id = host_;
+                deviceConfig.host_id = spi_host_;
 
-                err_ = spi_bus_initialize(host_, &bus, SPI_DMA_CH_AUTO);
+                err_ = spi_bus_initialize(spi_host_, &bus, SPI_DMA_CH_AUTO);
                 if (err_ != ESP_OK) {
-                    ESP_LOGE(TAG, "spi_bus_initialize: %s", esp_err_to_name(err_));
                     return;
                 }
-                bus_initialized_ = true;
-
-                esp_vfs_fat_sdmmc_mount_config_t mountConfig = {
-                    .format_if_mount_failed = false,
-                    .max_files = 2,
-                    .allocation_unit_size = 512,
-                    .disk_status_check_enable = false,
-                    .use_one_fat = false
-                };
+                spi_bus_initialized_ = true;
 
                 err_ = esp_vfs_fat_sdspi_mount(kMountPoint, &host, &deviceConfig, &mountConfig, &card_);
-                if (err_ != ESP_OK) {
-                    ESP_LOGE(TAG, "mount at %d kHz: %s", freq_khz, esp_err_to_name(err_));
-                    card_ = nullptr;
-                }
             }
 
-            ~SdCard() {
-                if (card_ != nullptr) {
-                    esp_err_t err = esp_vfs_fat_sdcard_unmount(kMountPoint, card_);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "unmount failed: %s", esp_err_to_name(err));
-                    }
-                }
+            // 1-bit SD mode through the GPIO matrix, on the same wires as SPI.
+            void mount_sdmmc(const sdbench::BusConfig& cfg, const esp_vfs_fat_mount_config_t& mountConfig) {
+                sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+                host.flags = SDMMC_HOST_FLAG_1BIT | SDMMC_HOST_FLAG_DEINIT_ARG;
+                host.max_freq_khz = cfg.freq_khz;
+                host.input_delay_phase = static_cast<sdmmc_delay_phase_t>(cfg.delay_phase);
 
-                if (bus_initialized_) {
-                    esp_err_t err = spi_bus_free(host_);
-                    if (err != ESP_OK) {
-                        ESP_LOGE(TAG, "spi_bus_free failed: %s", esp_err_to_name(err));
-                    }
-                }
+                sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+                slot.width = 1;
+                slot.clk = kPinSclk;
+                slot.cmd = kPinMosi;   // card DI  = CMD
+                slot.d0 = kPinMiso;    // card DO  = DAT0
+                slot.d1 = GPIO_NUM_NC;
+                slot.d2 = GPIO_NUM_NC;
+                slot.d3 = kPinCs;      // card CS  = DAT3; driver holds it high in 1-bit mode
+                slot.d4 = GPIO_NUM_NC;
+                slot.d5 = GPIO_NUM_NC;
+                slot.d6 = GPIO_NUM_NC;
+                slot.d7 = GPIO_NUM_NC;
+                // SD mode needs pull-ups on CMD/DAT; internal ones are weak but
+                // the board may have external ones.
+                slot.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+                err_ = esp_vfs_fat_sdmmc_mount(kMountPoint, &host, &slot, &mountConfig, &card_);
             }
 
-            SdCard(const SdCard&) = delete;
-            SdCard& operator=(const SdCard&) = delete;
-
-            bool ok() const { return card_ != nullptr; }
-            esp_err_t err() const { return err_; }
-            sdmmc_card_t* card() const { return card_; }
-
-        private:
             sdmmc_card_t* card_ = nullptr;
-            spi_host_device_t host_;
-            bool bus_initialized_ = false;
+            spi_host_device_t spi_host_ = SPI2_HOST;
+            bool spi_bus_initialized_ = false;
             esp_err_t err_ = ESP_OK;
     };
 
@@ -226,27 +263,37 @@ namespace sdbench {
     std::array<BenchResult, kNumResults> run() {
         std::array<BenchResult, kNumResults> results = {};
         std::size_t i = 0;
+        bool test_file_checked = false;
 
-        for (int freq : kFrequenciesKhz) {
-            SdCard sd{freq};
+        for (const BusConfig& cfg : kConfigs) {
+            const char* bus_name = cfg.bus == Bus::Spi ? "SPI" : "SD1";
+            SdCard sd{cfg};
+            int actual_khz = 0;
 
             if (sd.ok()) {
-                sdmmc_card_print_info(stdout, sd.card());
-                ESP_LOGI(TAG, "requested %d kHz, actual %d kHz", freq, sd.card()->real_freq_khz);
+                actual_khz = sd.card()->real_freq_khz;
+                ESP_LOGI(TAG, "%s requested %d kHz (phase %d), actual %d kHz", bus_name, cfg.freq_khz,
+                         cfg.delay_phase, actual_khz);
+                if (!test_file_checked) {
+                    sdmmc_card_print_info(stdout, sd.card());
+                }
             }
-            const bool have_file = sd.ok() && ensure_test_file();
+            bool have_file = sd.ok() && (test_file_checked || ensure_test_file());
+            test_file_checked = test_file_checked || have_file;
 
             for (std::size_t size : kBufferSizes) {
                 BenchResult& r = results[i++];
                 r.buffer_size = size;
-                r.frequency_khz = freq;
+                r.config = cfg;
+                r.actual_khz = actual_khz;
                 if (!have_file) {
                     continue;  // speeds stay 0 -> reported as failed
                 }
                 r.megabytes_per_sec = measure_file(size);
                 r.raw_megabytes_per_sec = measure_raw(sd.card(), size);
-                ESP_LOGI(TAG, "%5d kHz %3u KB: file %.2f MB/s, raw %.2f MB/s", freq,
-                         static_cast<unsigned>(size / 1024), r.megabytes_per_sec, r.raw_megabytes_per_sec);
+                ESP_LOGI(TAG, "%s %5d kHz p%d %3u KB: file %.2f MB/s, raw %.2f MB/s", bus_name, actual_khz,
+                         cfg.delay_phase, static_cast<unsigned>(size / 1024), r.megabytes_per_sec,
+                         r.raw_megabytes_per_sec);
             }
         }
 

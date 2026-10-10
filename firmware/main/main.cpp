@@ -31,14 +31,16 @@ extern "C" void app_main(void)
     M5.Display.println("SD read benchmark...");
     auto results = sdbench::run();
 
-    M5.Display.println(" MHz  buf   file   raw  MB/s");
+    M5.Display.println("bus   MHz p buf  file  raw MB/s");
     for (const auto& r : results) {
+        const char* bus = r.config.bus == sdbench::Bus::Spi ? "SPI" : "SD1";
+        M5.Display.printf("%s %5.2f %d %2uK ", bus, r.config.freq_khz / 1000.0f, r.config.delay_phase,
+                          (unsigned)(r.buffer_size / 1024));
         if (r.megabytes_per_sec == 0.0f) {
-            M5.Display.printf(" %3d %3uK  failed\n", r.frequency_khz / 1000, (unsigned)(r.buffer_size / 1024));
-            continue;
+            M5.Display.println(" failed");
+        } else {
+            M5.Display.printf("%5.2f %5.2f\n", r.megabytes_per_sec, r.raw_megabytes_per_sec);
         }
-        M5.Display.printf(" %3d %3uK %6.2f %5.2f\n", r.frequency_khz / 1000, (unsigned)(r.buffer_size / 1024),
-                          r.megabytes_per_sec, r.raw_megabytes_per_sec);
     }
 
     ESP_LOGI(TAG, "free heap: %u, largest block: %u",

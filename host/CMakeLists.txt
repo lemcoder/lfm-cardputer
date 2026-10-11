@@ -8,6 +8,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
+# Keep assert() on in every host build: CMake's Release/RelWithDebInfo add
+# -DNDEBUG, which compiles asserts away (and hides typos inside them).
+foreach(cfg RELEASE RELWITHDEBINFO MINSIZEREL)
+    string(REPLACE "-DNDEBUG" "" CMAKE_CXX_FLAGS_${cfg} "${CMAKE_CXX_FLAGS_${cfg}}")
+endforeach()
 
 add_subdirectory(../lfm lfm)
 

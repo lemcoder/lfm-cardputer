@@ -41,11 +41,10 @@ void matvec(std::span<float> out, MatRef w, std::span<const float> x) {
 
 void rmsnorm(std::span<float> out, std::span<const float> x,
              std::span<const float> weight, float eps) {
-  assert(weight.size() == d);
-  assert(out.size() >= d);
-
   // 1. Calculate the size of the input vector
   std::size_t d = x.size();
+  assert(weight.size() == d);
+  assert(out.size() >= d);
 
   // 2. Compute the sum of squares
   float sum_squares = 0;
@@ -72,7 +71,7 @@ void add(std::span<float> acc, std::span<const float> x) {
 
 void mul(std::span<float> out, std::span<const float> a,
          std::span<const float> b) {
-  assert(acc.size() == a.size() && a.size() == b.size());
+  assert(out.size() == a.size() && a.size() == b.size());
 
   for (std::size_t i = 0; i < a.size(); i++) {
     out[i] = a[i] * b[i];

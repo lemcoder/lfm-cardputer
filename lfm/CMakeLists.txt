@@ -1,13 +1,26 @@
 # Portable inference core. Built two ways:
 #   - as an ESP-IDF component (firmware/ pulls it in via EXTRA_COMPONENT_DIRS)
 #   - as a plain static library for the host reference build (host/)
-file(GLOB LFM_SRCS "${CMAKE_CURRENT_LIST_DIR}/src/*.cpp")
+file(GLOB_RECURSE LFM_SRCS "${CMAKE_CURRENT_LIST_DIR}/src/*.cpp")
 
 if(ESP_PLATFORM)
     idf_component_register(SRCS ${LFM_SRCS} INCLUDE_DIRS "include")
     target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC LFM_MATH_ESP32S3=1)
 else()
     add_library(lfm STATIC ${LFM_SRCS})
     target_include_directories(lfm PUBLIC include)
     target_compile_features(lfm PUBLIC cxx_std_20)
+
+    # Math backend. -DLFM_MATH_BACKEND=ref forces the scalar reference everywhere.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        set(LFM_MATH_BACKEND_DEFAULT neon)
+    else()
+        set(LFM_MATH_BACKEND_DEFAULT ref)
+    endif()
+    set(LFM_MATH_BACKEND ${LFM_MATH_BACKEND_DEFAULT} CACHE STRING "Math backend: ref | neon")
+    if(LFM_MATH_BACKEND STREQUAL "neon")
+        target_compile_definitions(lfm PUBLIC LFM_MATH_NEON=1)
+    endif()
+    message(STATUS "lfm math backend: ${LFM_MATH_BACKEND}")
 endif()

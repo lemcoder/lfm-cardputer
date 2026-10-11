@@ -41,6 +41,12 @@
     "save": "all"
   },
   {
+    "label": "host: test",
+    "command": "cmake -S host -B host/build -G Ninja && cmake --build host/build && ./host/build/lfm_tests",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "all"
+  },
+  {
     "label": "tools: golden dump",
     "command": "uv run tools/golden.py",
     "cwd": "$ZED_WORKTREE_ROOT"

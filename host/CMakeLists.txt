@@ -14,3 +14,10 @@ add_subdirectory(../lfm lfm)
 add_executable(lfm_host main.cpp)
 target_link_libraries(lfm_host PRIVATE lfm)
 target_compile_options(lfm_host PRIVATE -Wall -Wextra)
+
+add_executable(lfm_tests tests/main.cpp tests/test_math.cpp)
+target_link_libraries(lfm_tests PRIVATE lfm)
+target_compile_options(lfm_tests PRIVATE -Wall -Wextra)
+
+enable_testing()
+add_test(NAME lfm_tests COMMAND lfm_tests)

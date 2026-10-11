@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.25)
 project(lfm_host CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -15,9 +15,22 @@ add_executable(lfm_host main.cpp)
 target_link_libraries(lfm_host PRIVATE lfm)
 target_compile_options(lfm_host PRIVATE -Wall -Wextra)
 
-add_executable(lfm_tests tests/main.cpp tests/test_math.cpp)
-target_link_libraries(lfm_tests PRIVATE lfm)
+# Tests: GoogleTest, fetched at configure time (host only, never in firmware).
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    URL https://github.com/google/googletest/releases/download/v1.17.0/googletest-1.17.0.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SYSTEM  # treat gtest headers as system headers: no warnings from them
+)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+add_executable(lfm_tests tests/test_math.cpp)
+target_link_libraries(lfm_tests PRIVATE lfm GTest::gtest_main)
 target_compile_options(lfm_tests PRIVATE -Wall -Wextra)
 
 enable_testing()
-add_test(NAME lfm_tests COMMAND lfm_tests)
+include(GoogleTest)
+gtest_discover_tests(lfm_tests)

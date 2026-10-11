@@ -42,7 +42,7 @@
   },
   {
     "label": "host: test",
-    "command": "cmake -S host -B host/build -G Ninja && cmake --build host/build && ./host/build/lfm_tests",
+    "command": "cmake -S host -B host/build -G Ninja && cmake --build host/build && ./host/build/lfm_tests --gtest_brief=1",
     "cwd": "$ZED_WORKTREE_ROOT",
     "save": "all"
   },

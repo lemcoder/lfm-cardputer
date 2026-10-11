@@ -20,6 +20,8 @@ docs/       notes, measurements
 ```sh
 cmake -S host -B host/build -G Ninja && cmake --build host/build
 ./host/build/lfm_host
+./host/build/lfm_tests                                  # GoogleTest
+./host/build/lfm_tests --gtest_filter='MathRef.Rope*'    # one group
 ```
 
 ### Firmware (ESP-IDF v5.4.2, same as the Cardputer-Adv demo)

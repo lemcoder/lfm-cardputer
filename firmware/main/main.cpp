@@ -31,6 +31,7 @@
 #include "freertos/task.h"
 #include "lfm.hpp"
 #include "lfm/engine.hpp"
+#include "async_file.hpp"
 #include "sd_card.hpp"
 #include "usb_upload.hpp"
 
@@ -181,8 +182,8 @@ extern "C" void app_main(void) {
     set_phase(have_model ? "USB upload? (1.5 s)" : "waiting for USB upload");
     if (upload::serve(have_model ? 1500 : -1, &set_phase) > 0) text_begin();
 
-    static lfm::FileSource src(kModelPath);
-    if (!src.ok()) fatal("missing /lfm.lfm", "copy out/lfm-q8.lfm to the SD card as lfm.lfm");
+    static AsyncFile src(kModelPath);  // reads on core 1 while core 0 computes
+    if (!src.ok()) fatal("missing /lfm.lfm", "uv run tools/upload.py");
 
     const lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath};
     static lfm::Engine eng_storage;
@@ -234,9 +235,11 @@ extern "C" void app_main(void) {
             next = eng->forward(next, true);
             g_status.sec_per_tok = (esp_timer_get_time() - t_gen) / 1e6f / g_status.tokens;
             const double total = (esp_timer_get_time() - t0) / 1e6;
-            ESP_LOGI(TAG, "token %d: %.1f s/tok avg | so far %.1f s: SD wait %.1f s (%.0f%%), compute %.1f s, %.2f MB/s",
-                     g_status.tokens, g_status.sec_per_tok, total, src.io_seconds(),
-                     100.0 * src.io_seconds() / total, total - src.io_seconds(), src.bytes_read() / 1e6 / src.io_seconds());
+            ESP_LOGI(TAG, "token %d: %.1f s/tok avg | so far %.1f s: SD busy %.1f s (%.0f%%, %.2f MB/s), "
+                     "compute stalled on SD %.1f s (%.0f%%)",
+                     g_status.tokens, g_status.sec_per_tok, total, src.sd_busy_seconds(),
+                     100.0 * src.sd_busy_seconds() / total, src.bytes_read() / 1e6 / src.sd_busy_seconds(),
+                     src.stall_seconds(), 100.0 * src.stall_seconds() / total);
         }
         if (next == lfm::Engine::kIoError) fatal("SD read error", "check the card");
         set_phase(next == lfm::Engine::kContextFull ? "context full  G0: again" : "done  G0: again");

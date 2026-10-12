@@ -111,7 +111,7 @@ std::size_t Engine::ram_bytes(const EngineConfig& cfg) const {
     const Dims d(h_);
     const std::size_t kv = cfg.kv_path != nullptr ? 0
         : static_cast<std::size_t>(n_attn_) * static_cast<std::size_t>(cfg.max_ctx) * 2 * d.kv_dim * (cfg.kv_bf16 ? 2 : 4);
-    return cfg.io_bytes + (4 * d.dim + d.arena()) * sizeof(float)
+    return cfg.io_bytes * (cfg.double_buffer ? 2 : 1) + (4 * d.dim + d.arena()) * sizeof(float)
            + static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float) + kv;
 }
 
@@ -158,12 +158,14 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
         layer_slot_[i] = h_.layer_kind[i] == LayerKind::Conv ? n_conv_++ : n_attn_++;
     }
 
-    // Main block: io buffer, then x, xn, tmp, norm_w, arena.
+    // Main block: io buffer(s), then x, xn, tmp, norm_w, arena.
     const std::size_t floats = 4 * d.dim + d.arena();
-    mem_ = std::malloc(cfg.io_bytes + floats * sizeof(float));
+    const std::size_t io_total = cfg.io_bytes * (cfg.double_buffer ? 2 : 1);
+    mem_ = std::malloc(io_total + floats * sizeof(float));
     if (mem_ == nullptr) return Status::OutOfMemory;
     io_ = static_cast<std::byte*>(mem_);
-    x_ = reinterpret_cast<float*>(io_ + cfg.io_bytes);
+    io2_ = cfg.double_buffer ? io_ + cfg.io_bytes : io_;
+    x_ = reinterpret_cast<float*>(io_ + io_total);
     xn_ = x_ + d.dim;
     tmp_ = xn_ + d.dim;
     norm_w_ = tmp_ + d.dim;
@@ -205,20 +207,37 @@ bool Engine::read_f32(uint64_t offset, std::span<float> out) {
     return src_->read_at(offset, out.data(), out.size_bytes());
 }
 
-// out[r] = row r of the matrix at `offset` (out.size() rows, `cols` columns) · x.
-// Streams the matrix through io_ a whole number of rows at a time.
-bool Engine::matvec(std::span<float> out, uint64_t offset, Dtype dt, std::size_t cols, std::span<const float> x) {
-    assert(x.size() == cols);
-    const std::size_t rb = row_bytes(dt, cols);
-    const std::size_t rows_per_chunk = cfg_.io_bytes / rb;
-    for (std::size_t r0 = 0; r0 < out.size(); r0 += rows_per_chunk) {
-        const std::size_t n = std::min(rows_per_chunk, out.size() - r0);
-        if (!src_->read_at(offset + r0 * rb, io_, n * rb)) return false;
-        for (std::size_t i = 0; i < n; ++i) {
-            out[r0 + i] = dot_row(dt, io_ + i * rb, x);
+template <typename Fn>
+bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&& fn) {
+    const std::size_t per_chunk = cfg_.io_bytes / rb;
+    std::byte* buf[2] = {io_, io2_};
+    int cur = 0;
+    std::size_t n = std::min(per_chunk, rows);
+    src_->start_read(offset, buf[cur], n * rb);
+    for (std::size_t r0 = 0; r0 < rows;) {
+        if (!src_->wait()) return false;
+        const std::size_t next = r0 + n;
+        const std::size_t next_n = std::min(per_chunk, rows - std::min(rows, next));
+        // Without a second buffer the next read must wait until we're done.
+        const bool overlap = io2_ != io_ && next_n > 0;
+        if (overlap) src_->start_read(offset + next * rb, buf[cur ^ 1], next_n * rb);
+        for (std::size_t i = 0; i < n; ++i) fn(r0 + i, buf[cur] + i * rb);
+        if (!overlap && next_n > 0) {
+            src_->start_read(offset + next * rb, buf[cur], next_n * rb);
+        } else {
+            cur ^= 1;
         }
+        r0 = next;
+        n = next_n;
     }
     return true;
+}
+
+// out[r] = row r of the matrix at `offset` (out.size() rows, `cols` columns) · x.
+bool Engine::matvec(std::span<float> out, uint64_t offset, Dtype dt, std::size_t cols, std::span<const float> x) {
+    assert(x.size() == cols);
+    return stream_rows(offset, out.size(), row_bytes(dt, cols),
+                       [&](std::size_t r, const std::byte* row) { out[r] = dot_row(dt, row, x); });
 }
 
 // Tied LM head: logit[v] = embed row v · x, over the whole vocab, streamed.
@@ -233,7 +252,6 @@ int32_t Engine::lm_head(std::span<const float> x, float* logits) {
     const Dtype scan_dt = shortlist ? h_.lm_head_dtype : h_.embed_dtype;
     const uint64_t scan_off = shortlist ? h_.lm_head : h_.embed;
     const std::size_t rb = row_bytes(scan_dt, h_.dim);
-    const std::size_t rows_per_chunk = cfg_.io_bytes / rb;
 
     // Top-k by approximate score, kept sorted descending (k is small).
     const int k = shortlist ? static_cast<int>(h_.lm_head_candidates) : 1;
@@ -241,23 +259,20 @@ int32_t Engine::lm_head(std::span<const float> x, float* logits) {
     int32_t top_id[kMaxCandidates];
     int n_top = 0;
 
-    for (std::size_t r0 = 0; r0 < h_.vocab; r0 += rows_per_chunk) {
-        const std::size_t n = std::min<std::size_t>(rows_per_chunk, h_.vocab - r0);
-        if (!src_->read_at(scan_off + r0 * rb, io_, n * rb)) return kIoError;
-        for (std::size_t i = 0; i < n; ++i) {
-            const float v = dot_row(scan_dt, io_ + i * rb, x);
-            if (logits != nullptr) logits[r0 + i] = v;
-            if (n_top == k && v <= top_score[k - 1]) continue;
-            int pos = n_top < k ? n_top++ : k - 1;
-            while (pos > 0 && top_score[pos - 1] < v) {
-                top_score[pos] = top_score[pos - 1];
-                top_id[pos] = top_id[pos - 1];
-                --pos;
-            }
-            top_score[pos] = v;
-            top_id[pos] = static_cast<int32_t>(r0 + i);
+    const bool ok = stream_rows(scan_off, h_.vocab, rb, [&](std::size_t r, const std::byte* row) {
+        const float v = dot_row(scan_dt, row, x);
+        if (logits != nullptr) logits[r] = v;
+        if (n_top == k && v <= top_score[k - 1]) return;
+        int pos = n_top < k ? n_top++ : k - 1;
+        while (pos > 0 && top_score[pos - 1] < v) {
+            top_score[pos] = top_score[pos - 1];
+            top_id[pos] = top_id[pos - 1];
+            --pos;
         }
-    }
+        top_score[pos] = v;
+        top_id[pos] = static_cast<int32_t>(r);
+    });
+    if (!ok) return kIoError;
     if (!shortlist) return top_id[0];
 
     // Re-score the shortlist with the exact rows.

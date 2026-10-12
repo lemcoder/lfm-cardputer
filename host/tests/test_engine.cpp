@@ -7,6 +7,9 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -74,6 +77,71 @@ std::vector<int32_t> GenerateN(lfm::Engine& eng, const std::vector<int>& prompt,
     }
     return out;
 }
+
+// start_read() hands the read to a worker thread, like the firmware's reader
+// task does: exercises the engine's double buffering for real.
+class ThreadedSource final : public lfm::Source {
+public:
+    explicit ThreadedSource(const char* path) : file_(path), worker_([this] { run(); }) {}
+    ~ThreadedSource() override {
+        {
+            std::lock_guard lock(mu_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        worker_.join();
+    }
+    bool ok() const { return file_.ok(); }
+    int async_reads() const { return async_reads_; }
+
+    bool read_at(uint64_t offset, void* dst, std::size_t n) override {
+        std::lock_guard lock(mu_);
+        EXPECT_FALSE(busy_) << "read_at while an async read is in flight";
+        return file_.read_at(offset, dst, n);
+    }
+    void start_read(uint64_t offset, void* dst, std::size_t n) override {
+        std::lock_guard lock(mu_);
+        EXPECT_FALSE(busy_) << "two async reads in flight";
+        job_ = {offset, dst, n};
+        busy_ = true;
+        ++async_reads_;
+        cv_.notify_all();
+    }
+    bool wait() override {
+        std::unique_lock lock(mu_);
+        cv_.wait(lock, [this] { return !busy_; });
+        return result_;
+    }
+
+private:
+    struct Job {
+        uint64_t offset;
+        void* dst;
+        std::size_t n;
+    };
+    void run() {
+        std::unique_lock lock(mu_);
+        while (true) {
+            cv_.wait(lock, [this] { return quit_ || busy_; });
+            if (quit_) return;
+            const Job job = job_;
+            lock.unlock();
+            const bool ok = file_.read_at(job.offset, job.dst, job.n);
+            lock.lock();
+            result_ = ok;
+            busy_ = false;
+            cv_.notify_all();
+        }
+    }
+
+    lfm::FileSource file_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    Job job_{};
+    bool busy_ = false, quit_ = false, result_ = true;
+    int async_reads_ = 0;
+    std::thread worker_;
+};
 
 std::vector<int32_t> GoldenGenerated() { return golden::Manifest()["generated"].get<std::vector<int32_t>>(); }
 
@@ -316,4 +384,35 @@ TEST(EngineQ8, LmHeadShortlistGeneratesGolden) {
     lfm::Engine eng;
     ASSERT_EQ(eng.open(src, {.max_ctx = 64, .kv_bf16 = true, .kv_path = kKvPath.c_str()}), lfm::Status::Ok);
     EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
+}
+
+// ---------------------------------------------------------------- overlapped reads
+
+TEST(EngineBf16, AsyncReadsLogitsMatchGolden) {
+    MODEL_REQUIRED(kBf16Path);
+    ThreadedSource src(kBf16Path.c_str());
+    ASSERT_TRUE(src.ok());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.double_buffer = true}), lfm::Status::Ok);
+    const golden::Activation want = golden::Load("logits");
+    const std::vector<int> tokens = golden::Tokens();
+    std::vector<float> logits(lfm::kVocab);
+    for (std::size_t t = 0; t < tokens.size(); ++t) {
+        eng.forward(tokens[t], true, logits.data());
+        EXPECT_TRUE(golden::Near(logits, want.row(t), 1e-4f)) << "token " << t;
+    }
+    EXPECT_GT(src.async_reads(), 1000);
+}
+
+// Device setup: async reads, double buffer, KV file, LM head shortlist.
+TEST(EngineQ8, AsyncReadsDeviceConfigSameTokens) {
+    MODEL_REQUIRED(kQ8HeadPath);
+    lfm::FileSource sync_src(kQ8HeadPath.c_str());
+    ThreadedSource async_src(kQ8HeadPath.c_str());
+    lfm::Engine a, b;
+    const lfm::EngineConfig cfg{.max_ctx = 64, .kv_bf16 = true, .double_buffer = true, .kv_path = kKvPath.c_str()};
+    ASSERT_EQ(a.open(sync_src, {.max_ctx = 64, .kv_bf16 = true, .double_buffer = false}), lfm::Status::Ok);
+    ASSERT_EQ(b.open(async_src, cfg), lfm::Status::Ok);
+    const auto want = GenerateN(a, golden::Tokens(), 24);
+    EXPECT_EQ(GenerateN(b, golden::Tokens(), 24), want);
 }

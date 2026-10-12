@@ -12,6 +12,16 @@ public:
     virtual ~Source() = default;
     // Fill dst with exactly n bytes starting at offset. False on error / EOF.
     virtual bool read_at(uint64_t offset, void* dst, std::size_t n) = 0;
+
+    // Asynchronous read, so the engine can compute on one buffer while the
+    // next one loads. At most one in flight; every start_read() is followed
+    // by wait() before any other call. The default just reads synchronously;
+    // a platform overrides both to read on another thread / core.
+    virtual void start_read(uint64_t offset, void* dst, std::size_t n) { pending_ok_ = read_at(offset, dst, n); }
+    virtual bool wait() { return pending_ok_; }
+
+private:
+    bool pending_ok_ = true;
 };
 
 // A file accessed with POSIX open/lseek/read/write. Works on the Mac and on

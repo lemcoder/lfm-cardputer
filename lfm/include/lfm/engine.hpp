@@ -37,6 +37,9 @@ struct EngineConfig {
     int max_ctx = 128;              // KV cache capacity in tokens
     bool kv_bf16 = false;           // store K/V as bf16: half the size, ~3 digits of precision
     std::size_t io_bytes = 32768;   // weight / KV streaming buffer
+    // Two weight buffers: compute on one while the Source fills the other
+    // (only helps with a Source whose start_read() is really asynchronous).
+    bool double_buffer = true;
     // Keep the KV cache in this file (created / emptied on open) instead of
     // RAM. RAM use then doesn't depend on max_ctx. Each token appends
     // n_attn_layers * 2 * n_kv*head_dim values and attention reads them back.
@@ -88,6 +91,10 @@ public:
 private:
     bool read_f32(uint64_t offset, std::span<float> out);
     bool matvec(std::span<float> out, uint64_t offset, Dtype dt, std::size_t cols, std::span<const float> x);
+    // Stream `rows` rows of `rb` bytes from `offset`, calling fn(row index,
+    // row bytes) for each, with the next chunk's read overlapping fn's work.
+    template <typename Fn>
+    bool stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&& fn);
     int32_t lm_head(std::span<const float> x, float* logits);
 
     bool conv_op(int layer, std::span<float> out, std::span<const float> in);
@@ -115,6 +122,7 @@ private:
     // One allocation, carved up in open(). Layout in engine.cpp.
     void* mem_ = nullptr;
     std::byte* io_ = nullptr;
+    std::byte* io2_ = nullptr;   // second weight buffer (double_buffer), else == io_
     float* x_ = nullptr;         // residual stream [dim]
     float* xn_ = nullptr;        // normalised input [dim]
     float* tmp_ = nullptr;       // operator / mlp output [dim]

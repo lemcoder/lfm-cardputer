@@ -3,7 +3,7 @@
 //   ./host/build/lfm_host out/lfm-q8.lfm                  # prompt from out/prompt.txt
 //   ./host/build/lfm_host out/lfm-q8.lfm 1 1098 5706 ...  # explicit token ids
 //   options: --max-new N (default 32), --ctx N (default 128), --kv-bf16,
-//            --kv-file PATH (KV cache in a file, as on the device)
+//            --kv-file PATH (KV cache in a file, as on the device), --batch N (prompt batch)
 
 #include <chrono>
 #include <cstdio>
@@ -49,6 +49,8 @@ int main(int argc, char** argv) {
             cfg.max_ctx = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-file") == 0 && i + 1 < argc) {
             cfg.kv_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            cfg.max_batch = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-bf16") == 0) {
             cfg.kv_bf16 = true;
         } else {
@@ -76,11 +78,8 @@ int main(int argc, char** argv) {
 
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
-    int32_t next = lfm::Engine::kNoToken;
-    for (std::size_t i = 0; i < prompt.size(); ++i) {
-        print_token(eng, prompt[i]);
-        next = eng.forward(prompt[i], i + 1 == prompt.size());
-    }
+    for (int32_t t : prompt) print_token(eng, t);
+    int32_t next = eng.prefill(prompt, true);
     const auto t1 = clock::now();
 
     int generated = 0;

@@ -9,8 +9,8 @@
 //   lfm::FileSource src("/sdcard/lfm.lfm");
 //   lfm::Engine eng;
 //   eng.open(src, {.max_ctx = 1024, .kv_bf16 = true, .kv_path = "/sdcard/kv.bin"});
-//   for (prompt tokens except last) eng.forward(t, false);
-//   int32_t next = eng.forward(last, true);   // greedy next token
+//   int32_t next = eng.prefill(prompt, true);  // whole prompt, max_batch at a time
+//   next = eng.forward(next, true);            // then one token at a time
 
 #include <cstddef>
 #include <cstdint>
@@ -44,12 +44,17 @@ struct EngineConfig {
     // RAM. RAM use then doesn't depend on max_ctx. Each token appends
     // n_attn_layers * 2 * n_kv*head_dim values and attention reads them back.
     const char* kv_path = nullptr;
+    // prefill() runs up to this many tokens through each layer together, so
+    // each weight chunk is read once per batch instead of once per token.
+    // Costs ~(3*dim + max(3*dim, ff, 3*dim)) floats of RAM per extra token.
+    int max_batch = 1;
 };
 
 class Engine {
 public:
-    // Called after every layer with the residual stream (for tests/debugging).
-    using LayerHook = void (*)(void* ctx, int layer, std::span<const float> x);
+    // Called after every layer, for every token, with that token's residual
+    // stream (for tests/debugging). `pos` is the token's position.
+    using LayerHook = void (*)(void* ctx, int layer, int pos, std::span<const float> x);
     // Called as work progresses: `done` of `total` steps (layers + LM head).
     using ProgressHook = void (*)(void* ctx, int done, int total);
 
@@ -78,6 +83,11 @@ public:
     // (and, if `logits` is non-null, writes all vocab logits there).
     int32_t forward(int32_t token, bool want_next, float* logits = nullptr);
 
+    // Feed several tokens (e.g. the prompt), max_batch at a time; same result
+    // as calling forward() on each, but with fewer weight reads. With
+    // want_next, returns the greedy token after the last one.
+    int32_t prefill(std::span<const int32_t> tokens, bool want_next, float* logits = nullptr);
+
     // Bytes of token `id` (UTF-8 / raw bytes) into buf. Returns the length,
     // truncated to cap. Not NUL-terminated.
     std::size_t token_text(int32_t id, char* buf, std::size_t cap);
@@ -90,21 +100,27 @@ public:
 
 private:
     bool read_f32(uint64_t offset, std::span<float> out);
-    bool matvec(std::span<float> out, uint64_t offset, Dtype dt, std::size_t cols, std::span<const float> x);
+    // For each of n tokens b: out[b*out_stride + r] = row r · x[b*x_stride ..][0..cols).
+    bool matvec(float* out, std::size_t out_stride, std::size_t rows, uint64_t offset, Dtype dt, std::size_t cols,
+                const float* x, std::size_t x_stride, int n);
     // Stream `rows` rows of `rb` bytes from `offset`, calling fn(row index,
     // row bytes) for each, with the next chunk's read overlapping fn's work.
     template <typename Fn>
     bool stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&& fn);
     int32_t lm_head(std::span<const float> x, float* logits);
 
-    bool conv_op(int layer, std::span<float> out, std::span<const float> in);
-    bool attn_op(int layer, std::span<float> out, std::span<const float> in);
-    bool mlp(int layer, std::span<float> out, std::span<const float> in);
+    // n tokens at positions pos_ .. pos_+n-1: read xn_[b], write tmp_[b].
+    int32_t run_batch(const int32_t* tokens, int n, bool want_next, float* logits);
+    bool conv_op(int layer, int n);
+    bool attn_op(int layer, int n);
+    bool mlp(int layer, int n);
+    float* slot(int b) const { return arena_ + static_cast<std::size_t>(b) * slot_floats_; }
+    float* act(float* base, int b) const { return base + static_cast<std::size_t>(b) * h_.dim; }
 
     // KV cache: one row per (position, attention layer) = [K | V], each
     // n_kv*head_dim values of kv_bf16 ? bf16 : f32.
     std::size_t kv_row_bytes() const;
-    bool kv_put(int attn_idx, std::span<const float> k, std::span<const float> v);
+    bool kv_put(int attn_idx, int pos, std::span<const float> k, std::span<const float> v);
     bool kv_load(int attn_idx, int j0, int count, std::byte* dst);
 
     void progress(int done);
@@ -119,15 +135,21 @@ private:
     int n_attn_ = 0;
     int layer_slot_[kMaxLayers] = {};  // index among conv or attention layers
 
-    // One allocation, carved up in open(). Layout in engine.cpp.
-    void* mem_ = nullptr;
+    // Separate allocations (a fragmented heap has no single big block).
+    static constexpr int kMaxBlocks = 8;
+    void* blocks_[kMaxBlocks] = {};
+    int n_blocks_ = 0;
+    void* alloc(std::size_t bytes);
+
     std::byte* io_ = nullptr;
     std::byte* io2_ = nullptr;   // second weight buffer (double_buffer), else == io_
-    float* x_ = nullptr;         // residual stream [dim]
-    float* xn_ = nullptr;        // normalised input [dim]
-    float* tmp_ = nullptr;       // operator / mlp output [dim]
+    float* x_ = nullptr;         // residual stream [max_batch][dim]
+    float* xn_ = nullptr;        // normalised input [max_batch][dim]
+    float* tmp_ = nullptr;       // operator / mlp output [max_batch][dim]
     float* norm_w_ = nullptr;    // norm weights [dim]
-    float* arena_ = nullptr;     // per-op scratch
+    float* arena_ = nullptr;     // per-token op scratch [max_batch][slot_floats_]
+    float* shared_ = nullptr;    // per-op scratch shared by the batch
+    std::size_t slot_floats_ = 0;
     float* conv_state_ = nullptr;      // [n_conv][conv_l-1][dim], oldest first
     // KV cache, either in RAM: per attention layer [max_ctx] rows,
     // or in a file: rows appended position-major, (pos * n_attn + layer).

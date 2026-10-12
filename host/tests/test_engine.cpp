@@ -37,10 +37,15 @@ bool Exists(const std::string& path) { return lfm::FileSource(path.c_str()).ok()
 
 // Collects every layer's output for the current token.
 struct LayerCapture {
-    std::vector<std::vector<float>> out;
-    static void hook(void* ctx, int layer, std::span<const float> x) {
+    std::vector<std::vector<float>> out;              // [layer]: last token seen
+    std::vector<std::vector<std::vector<float>>> at;  // [pos][layer]
+    static void hook(void* ctx, int layer, int pos, std::span<const float> x) {
         auto* self = static_cast<LayerCapture*>(ctx);
         self->out[static_cast<std::size_t>(layer)].assign(x.begin(), x.end());
+        if (self->at.size() <= static_cast<std::size_t>(pos)) self->at.resize(static_cast<std::size_t>(pos) + 1);
+        auto& row = self->at[static_cast<std::size_t>(pos)];
+        if (row.size() <= static_cast<std::size_t>(layer)) row.resize(static_cast<std::size_t>(layer) + 1);
+        row[static_cast<std::size_t>(layer)].assign(x.begin(), x.end());
     }
 };
 
@@ -415,4 +420,63 @@ TEST(EngineQ8, AsyncReadsDeviceConfigSameTokens) {
     ASSERT_EQ(b.open(async_src, cfg), lfm::Status::Ok);
     const auto want = GenerateN(a, golden::Tokens(), 24);
     EXPECT_EQ(GenerateN(b, golden::Tokens(), 24), want);
+}
+
+// ---------------------------------------------------------------- batched prefill
+
+// The whole prompt through each layer at once matches PyTorch at every layer
+// and position.
+TEST(EngineBf16, BatchedPrefillEveryLayerMatchesGolden) {
+    MODEL_REQUIRED(kBf16Path);
+    lfm::FileSource src(kBf16Path.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_batch = 6}), lfm::Status::Ok);
+    LayerCapture cap;
+    cap.out.resize(lfm::kNumLayers);
+    eng.set_layer_hook(&LayerCapture::hook, &cap);
+
+    std::vector<int32_t> tokens;
+    for (int t : golden::Tokens()) tokens.push_back(t);
+    std::vector<float> logits(lfm::kVocab);
+    eng.prefill(tokens, true, logits.data());
+    ASSERT_EQ(cap.at.size(), tokens.size());
+    for (int i = 0; i < lfm::kNumLayers; ++i) {
+        const golden::Activation want = golden::Load("L" + std::to_string(i) + ".output");
+        for (std::size_t t = 0; t < tokens.size(); ++t) {
+            ASSERT_TRUE(golden::Near(cap.at[t][i], want.row(t), 1e-4f)) << "token " << t << " layer " << i;
+        }
+    }
+    EXPECT_TRUE(golden::Near(logits, golden::Load("logits").row(tokens.size() - 1), 1e-4f));
+}
+
+// Device setup with uneven batches (3 + 3, then 1 at a time), async reads,
+// KV file, LM head shortlist: same tokens as plain one-at-a-time.
+TEST(EngineQ8, BatchedPrefillDeviceConfigSameTokens) {
+    MODEL_REQUIRED(kQ8HeadPath);
+    lfm::FileSource sync_src(kQ8HeadPath.c_str());
+    ThreadedSource async_src(kQ8HeadPath.c_str());
+    lfm::Engine one, batched;
+    ASSERT_EQ(one.open(sync_src, {.max_ctx = 64, .kv_bf16 = true}), lfm::Status::Ok);
+    ASSERT_EQ(batched.open(async_src, {.max_ctx = 64, .kv_bf16 = true, .kv_path = kKvPath.c_str(), .max_batch = 4}),
+              lfm::Status::Ok);
+    const auto want = GenerateN(one, golden::Tokens(), 16);
+
+    std::vector<int32_t> prompt;
+    for (int t : golden::Tokens()) prompt.push_back(t);
+    std::vector<int32_t> got;
+    int32_t next = batched.prefill(prompt, true);
+    while (next >= 0 && got.size() < 16) {
+        got.push_back(next);
+        next = batched.forward(next, true);
+    }
+    EXPECT_EQ(got, want);
+}
+
+TEST(EngineQ8, PrefillContextFull) {
+    MODEL_REQUIRED(kQ8Path);
+    lfm::FileSource src(kQ8Path.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_ctx = 4, .max_batch = 3}), lfm::Status::Ok);
+    const std::vector<int32_t> prompt = {1, 1098, 5706, 803, 4481};
+    EXPECT_EQ(eng.prefill(prompt, true), lfm::Engine::kContextFull);
 }

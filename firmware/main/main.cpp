@@ -185,23 +185,33 @@ extern "C" void app_main(void) {
     static AsyncFile src(kModelPath);  // reads on core 1 while core 0 computes
     if (!src.ok()) fatal("missing /lfm.lfm", "uv run tools/upload.py");
 
-    const lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath};
-    static lfm::Engine eng_storage;
-    lfm::Engine* eng = &eng_storage;
-    if (lfm::Status st = eng->open(src, cfg); st != lfm::Status::Ok) {
+    // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
+    constexpr std::size_t kReserve = 24 * 1024;
+    lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath};
+    static lfm::Engine* eng = nullptr;
+    lfm::Status status = lfm::Status::OutOfMemory;
+    for (int batch = 6; batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {
+        void* reserve = std::malloc(kReserve);
+        cfg.max_batch = batch;
+        delete eng;
+        eng = new lfm::Engine();
+        status = eng->open(src, cfg);
+        std::free(reserve);
+    }
+    if (status != lfm::Status::Ok) {
         // Narrow it down in the log: header readable? KV file creatable?
         char magic[8] = {};
         const bool hdr = src.read_at(0, magic, sizeof(magic));
         errno = 0;
         const int fd = open(kKvPath, O_RDWR | O_CREAT | O_TRUNC, 0644);
         ESP_LOGE(TAG, "open: %s | header read %s, magic %.7s | kv open fd %d errno %d (%s) | size %ld",
-                 lfm::to_string(st), hdr ? "ok" : "FAILED", magic, fd, errno, std::strerror(errno), (long)st_size(kModelPath));
+                 lfm::to_string(status), hdr ? "ok" : "FAILED", magic, fd, errno, std::strerror(errno), (long)st_size(kModelPath));
         if (fd >= 0) close(fd);
-        fatal("engine open failed", lfm::to_string(st));
+        fatal("engine open failed", lfm::to_string(status));
     }
     eng->set_progress_hook(&on_progress, nullptr);
-    ESP_LOGI(TAG, "engine: ctx %d, %u KB RAM; heap free %u, largest %u", eng->max_ctx(),
-             (unsigned)(eng->ram_bytes(cfg) / 1024), (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+    ESP_LOGI(TAG, "engine: ctx %d, prompt batch %d, %u KB RAM; heap free %u, largest %u", eng->max_ctx(),
+             cfg.max_batch, (unsigned)(eng->ram_bytes(cfg) / 1024), (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     static int32_t prompt[kMaxPrompt];
@@ -213,15 +223,17 @@ extern "C" void app_main(void) {
         text_begin();
         for (int i = 0; i < n_prompt; ++i) show_token(*eng, prompt[i], TFT_LIGHTGREY);
 
-        // Prefill: every prompt token goes through the layers; only the last
-        // one needs the LM head.
+        // Prefill: the prompt goes through the layers max_batch tokens at a
+        // time (one weight read per batch); only the last needs the LM head.
         int64_t t0 = esp_timer_get_time();
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
-        for (int i = 0; i < n_prompt && i < eng->max_ctx(); ++i) {
-            std::snprintf(phase, sizeof(phase), "prefill %d/%d", i + 1, n_prompt);
+        for (int i = 0; i < n_prompt && next >= lfm::Engine::kNoToken;) {
+            const int n = n_prompt - i < cfg.max_batch ? n_prompt - i : cfg.max_batch;
+            std::snprintf(phase, sizeof(phase), "prefill %d-%d/%d", i + 1, i + n, n_prompt);
             set_phase(phase);
-            next = eng->forward(prompt[i], i + 1 == n_prompt);
+            next = eng->prefill({prompt + i, static_cast<std::size_t>(n)}, i + n == n_prompt);
+            i += n;
         }
         ESP_LOGI(TAG, "prefill %d tokens: %.1f s", n_prompt, (esp_timer_get_time() - t0) / 1e6);
 

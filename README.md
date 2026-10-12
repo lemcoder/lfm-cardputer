@@ -103,6 +103,9 @@ uv run tools/export.py --dtype bf16    # out/lfm-bf16.lfm (460 MB), exact weight
 
 On the device: copy `out/lfm-q8.lfm` to the SD card root as `lfm.lfm` and
 `out/prompt.txt` as `prompt.txt`, then Zed task **fw: flash + monitor**.
+No card reader: flash first, then `uv run tools/upload.py` sends both files
+over the USB cable (~0.4 MB/s, ~10 min for the model; `--prompt-only` for
+just the prompt). The firmware listens for it for 1.5 s after every boot.
 G0 runs the prompt again. Change the prompt with
 `uv run tools/export.py --prompt "..."` (rewrites prompt.txt; the model file
 is rewritten too, same content).

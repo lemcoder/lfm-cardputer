@@ -5,6 +5,10 @@
 //   /prompt.txt    out/prompt.txt  (token ids; optional, defaults below)
 //   /kv.bin        created at boot: the KV cache lives on the card, not in RAM
 //
+// No card reader? `uv run tools/upload.py` sends the files over the USB cable
+// (the firmware listens for it for 1.5 s after boot, or until it arrives if
+// /lfm.lfm is missing).
+//
 // Screen: prompt + generated text, status line with tokens, s/token and a
 // per-layer progress bar. Press G0 (BtnA) to run again.
 
@@ -12,6 +16,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+
+#include <sys/stat.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -21,6 +27,7 @@
 #include "lfm.hpp"
 #include "lfm/engine.hpp"
 #include "sd_card.hpp"
+#include "usb_upload.hpp"
 
 namespace {
 
@@ -46,7 +53,7 @@ auto& lcd = M5.Display;
 struct Status {
     int tokens = 0;        // generated so far
     float sec_per_tok = 0;
-    const char* phase = "";
+    char phase[40] = "";   // copied: callers pass temporary strings
 };
 Status g_status;
 
@@ -56,7 +63,7 @@ void draw_status_text() {
     lcd.clearScrollRect();
     lcd.fillRect(0, kH - kStatusH, kW, kStatusH - 3, TFT_BLACK);
     lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    char line[48];
+    char line[96];  // wider than the screen; drawString clips
     if (g_status.tokens > 0) {
         std::snprintf(line, sizeof(line), "%s  %d tok  %.1f s/tok", g_status.phase, g_status.tokens, g_status.sec_per_tok);
     } else {
@@ -104,7 +111,7 @@ void show_token(lfm::Engine& eng, int32_t id, uint16_t color) {
 
 void set_phase(const char* phase) {
     const int x = lcd.getCursorX(), y = lcd.getCursorY();
-    g_status.phase = phase;
+    std::snprintf(g_status.phase, sizeof(g_status.phase), "%s", phase);
     draw_status_text();
     lcd.setCursor(x, y);
 }
@@ -153,6 +160,16 @@ extern "C" void app_main(void) {
     set_phase("mounting SD");
     static SdCard card(40'000);
     if (!card.ok()) fatal("SD mount failed", esp_err_to_name(card.err()));
+
+    struct stat st;
+    const bool have_model = stat(kModelPath, &st) == 0;
+    if (!have_model) {
+        lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+        lcd.println("No /lfm.lfm on the SD card.\nOn the Mac run:\n  uv run tools/upload.py\n");
+        lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+    set_phase(have_model ? "USB upload? (1.5 s)" : "waiting for USB upload");
+    if (upload::serve(have_model ? 1500 : -1, &set_phase) > 0) text_begin();
 
     static lfm::FileSource src(kModelPath);
     if (!src.ok()) fatal("missing /lfm.lfm", "copy out/lfm-q8.lfm to the SD card as lfm.lfm");

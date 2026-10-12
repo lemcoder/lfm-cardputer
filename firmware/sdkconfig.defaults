@@ -11,3 +11,5 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # FATFS: allow long filenames, bigger sector cache for sequential reads
 CONFIG_FATFS_LFN_HEAP=y
+# FATFS: seek inside the 245 MB model file without walking the FAT chain
+CONFIG_FATFS_USE_FASTSEEK=y

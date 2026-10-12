@@ -93,6 +93,24 @@ Semantics the C++ must match:
 - Layer: `h = x + op(operator_norm(x)); out = h + mlp(ffn_norm(h))`.
 - Head: `logits = embed_tokens @ embedding_norm(h)` (tied).
 
+## Running the model
+
+```
+uv run tools/export.py                 # out/lfm-q8.lfm (245 MB) + out/prompt.txt
+uv run tools/export.py --dtype bf16    # out/lfm-bf16.lfm (460 MB), exact weights for host tests
+./host/build/lfm_host out/lfm-q8.lfm   # same engine on the Mac
+```
+
+On the device: copy `out/lfm-q8.lfm` to the SD card root as `lfm.lfm` and
+`out/prompt.txt` as `prompt.txt`, then Zed task **fw: flash + monitor**.
+G0 runs the prompt again. Change the prompt with
+`uv run tools/export.py --prompt "..."` (rewrites prompt.txt; the model file
+is rewritten too, same content).
+
+Engine (`lfm/engine.hpp`): one token at a time, every weight streamed from the
+file through one 32 KB buffer. RAM = buffers + conv state + KV cache; the
+firmware picks the largest context that fits.
+
 ## Milestones
 
 0. [x] tools: dump golden per-layer activations + logits from HF transformers

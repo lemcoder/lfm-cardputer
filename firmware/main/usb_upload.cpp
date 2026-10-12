@@ -12,13 +12,19 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "lfm/source.hpp"
 #include "sd_card.hpp"
 
 namespace upload {
 namespace {
 
-constexpr std::size_t kChunk = 32 * 1024;
+// Receiving (USB, core 0) and writing (SD + CRC, core 1) overlap: the
+// receiver fills one block while the writer drains another.
+constexpr int kBlocks = 3;
+constexpr std::size_t kBlockSize = 64 * 1024;
 constexpr uint32_t kProgressEvery = 1024 * 1024;
 constexpr TickType_t kDataTimeout = pdMS_TO_TICKS(10'000);
 
@@ -62,34 +68,94 @@ bool read_line(char* buf, std::size_t cap, int64_t deadline_us) {
 void ensure_driver() {
     if (usb_serial_jtag_is_driver_installed()) return;
     usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
-    cfg.rx_buffer_size = 16 * 1024;
+    cfg.rx_buffer_size = 32 * 1024;
     cfg.tx_buffer_size = 1024;
     usb_serial_jtag_driver_install(&cfg);
     usb_serial_jtag_vfs_use_driver();  // logs now go through the driver too
 }
 
+// ---------------------------------------------------------------- writer task
+
+struct Writer {
+    uint8_t* block[kBlocks] = {};
+    uint32_t len[kBlocks] = {};
+    QueueHandle_t free_q = nullptr;  // block indices the receiver may fill
+    QueueHandle_t full_q = nullptr;  // block indices waiting to be written; -1 = stop
+    SemaphoreHandle_t stopped = nullptr;
+    lfm::FileSource* out = nullptr;
+    uint32_t offset = 0;
+    uint32_t crc = 0;
+    bool failed = false;
+    int64_t busy_us = 0;  // time spent writing + CRC
+};
+
+void writer_task(void* arg) {
+    auto* w = static_cast<Writer*>(arg);
+    while (true) {
+        int idx;
+        xQueueReceive(w->full_q, &idx, portMAX_DELAY);
+        if (idx < 0) break;
+        const int64_t t0 = esp_timer_get_time();
+        w->crc = crc_update(w->crc, w->block[idx], w->len[idx]);
+        if (!w->failed && !w->out->write_at(w->offset, w->block[idx], w->len[idx])) w->failed = true;
+        w->offset += w->len[idx];
+        w->busy_us += esp_timer_get_time() - t0;
+        xQueueSend(w->free_q, &idx, portMAX_DELAY);
+    }
+    xSemaphoreGive(w->stopped);
+    vTaskDelete(nullptr);
+}
+
+// ---------------------------------------------------------------- one file
+
 // Receive `size` bytes from USB into `tmp`. The file is closed on return
 // (FileSource's destructor), which is what makes FATFS record its size.
-const char* receive_to(const char* tmp, const char* name, uint32_t size, uint32_t want_crc, uint8_t* buf,
+const char* receive_to(Writer& w, const char* tmp, const char* name, uint32_t size, uint32_t want_crc,
                        StatusFn status) {
     lfm::FileSource out(tmp, lfm::FileSource::Mode::ReadWrite);
     if (!out.ok()) return "can't create file";
-    send("UP:READY\n");
 
+    w.out = &out;
+    w.offset = 0;
+    w.crc = 0;
+    w.failed = false;
+    w.busy_us = 0;
+    xQueueReset(w.free_q);
+    xQueueReset(w.full_q);
+    for (int i = 0; i < kBlocks; ++i) xQueueSend(w.free_q, &i, 0);
+    xTaskCreatePinnedToCore(writer_task, "sd_writer", 4096, &w, 5, nullptr, 1);
+
+    send("UP:READY\n");
     const int64_t t0 = esp_timer_get_time();
-    uint32_t done = 0, crc = 0, next_progress = kProgressEvery;
+    int64_t wait_us = 0;  // receiver blocked on the writer (SD is the bottleneck)
+    uint32_t done = 0, next_progress = kProgressEvery;
+    const char* err = nullptr;
     char line[160];
     while (done < size) {
-        const uint32_t want = size - done < kChunk ? size - done : kChunk;
+        int idx;
+        const int64_t tw = esp_timer_get_time();
+        xQueueReceive(w.free_q, &idx, portMAX_DELAY);
+        wait_us += esp_timer_get_time() - tw;
+        if (w.failed) {
+            err = "SD write failed";
+            break;
+        }
+
+        const uint32_t want = size - done < kBlockSize ? size - done : kBlockSize;
         uint32_t fill = 0;
         while (fill < want) {
-            const int got = usb_serial_jtag_read_bytes(buf + fill, want - fill, kDataTimeout);
-            if (got <= 0) return "timeout waiting for data";
+            const int got = usb_serial_jtag_read_bytes(w.block[idx] + fill, want - fill, kDataTimeout);
+            if (got <= 0) break;
             fill += static_cast<uint32_t>(got);
         }
-        crc = crc_update(crc, buf, fill);
-        if (!out.write_at(done, buf, fill)) return "SD write failed";
+        if (fill < want) {
+            err = "timeout waiting for data";
+            break;
+        }
+        w.len[idx] = fill;
+        xQueueSend(w.full_q, &idx, portMAX_DELAY);
         done += fill;
+
         if (done >= next_progress || done == size) {
             next_progress += kProgressEvery;
             std::snprintf(line, sizeof(line), "UP:PROG %lu\n", static_cast<unsigned long>(done));
@@ -100,7 +166,21 @@ const char* receive_to(const char* tmp, const char* name, uint32_t size, uint32_
             status(line);
         }
     }
-    return crc == want_crc ? nullptr : "CRC mismatch (USB)";
+
+    // Stop the writer (it finishes queued blocks first).
+    const int stop = -1;
+    xQueueSend(w.full_q, &stop, portMAX_DELAY);
+    xSemaphoreTake(w.stopped, portMAX_DELAY);
+    w.out = nullptr;
+
+    const double total = (esp_timer_get_time() - t0) / 1e6;
+    std::snprintf(line, sizeof(line), "UP:STAT %.1f s, %.2f MB/s, waited on SD %.1f s, SD+CRC busy %.1f s\n", total,
+                  done / 1e6 / total, wait_us / 1e6, w.busy_us / 1e6);
+    send(line);
+
+    if (err != nullptr) return err;
+    if (w.failed) return "SD write failed";
+    return w.crc == want_crc ? nullptr : "CRC mismatch (USB)";
 }
 
 // Read the file back from the card and check size and CRC.
@@ -112,8 +192,8 @@ const char* verify(const char* path, uint32_t size, uint32_t want_crc, uint8_t* 
     lfm::FileSource in(path);
     if (!in.ok()) return "can't reopen file";
     uint32_t crc = 0;
-    for (uint32_t off = 0; off < size; off += kChunk) {
-        const uint32_t n = size - off < kChunk ? size - off : kChunk;
+    for (uint32_t off = 0; off < size; off += kBlockSize) {
+        const uint32_t n = size - off < kBlockSize ? size - off : kBlockSize;
         if (!in.read_at(off, buf, n)) return "read-back failed";
         crc = crc_update(crc, buf, n);
     }
@@ -121,18 +201,18 @@ const char* verify(const char* path, uint32_t size, uint32_t want_crc, uint8_t* 
 }
 
 // Receive one file. Returns an error string, or nullptr on success.
-const char* receive_file(const char* name, uint32_t size, uint32_t want_crc, uint8_t* buf, StatusFn status) {
+const char* receive_file(Writer& w, const char* name, uint32_t size, uint32_t want_crc, StatusFn status) {
     char path[96], tmp[100];
     std::snprintf(path, sizeof(path), "%s/%s", SdCard::kMountPoint, name);
     std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 
-    if (const char* err = receive_to(tmp, name, size, want_crc, buf, status)) return err;
+    if (const char* err = receive_to(w, tmp, name, size, want_crc, status)) return err;
 
     // Only rename closed files. FATFS rename doesn't overwrite.
     struct stat st;
     if (stat(path, &st) == 0) unlink(path);
     if (rename(tmp, path) != 0) return "rename failed";
-    return verify(path, size, want_crc, buf, status);
+    return verify(path, size, want_crc, w.block[0], status);
 }
 
 }  // namespace
@@ -152,40 +232,54 @@ int serve(int wait_ms, StatusFn status) {
     send("UP:HELLO\n");
     status("USB upload: connected");
 
-    auto* buf = static_cast<uint8_t*>(heap_caps_malloc(kChunk, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
-    if (buf == nullptr) {
-        send("UP:ERR out of memory\n");
-        return 0;
+    // Only allocated once the host is here: the model needs this RAM later.
+    Writer w;
+    bool ok = true;
+    for (auto& b : w.block) {
+        b = static_cast<uint8_t*>(heap_caps_malloc(kBlockSize, MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
+        ok = ok && b != nullptr;
     }
+    w.free_q = xQueueCreate(kBlocks, sizeof(int));
+    w.full_q = xQueueCreate(kBlocks + 1, sizeof(int));
+    w.stopped = xSemaphoreCreateBinary();
+    ok = ok && w.free_q && w.full_q && w.stopped;
 
     int files = 0;
-    while (read_line(line, sizeof(line), -1)) {
-        if (std::strcmp(line, "LFMUP HELLO") == 0) {
-            send("UP:HELLO\n");
-            continue;
-        }
-        if (std::strcmp(line, "LFMUP END") == 0) {
-            send("UP:BYE\n");
-            break;
-        }
-        char name[64];
-        unsigned long size = 0, crc = 0;
-        if (std::sscanf(line, "LFMUP FILE %63s %lu %lu", name, &size, &crc) != 3) continue;
-        if (std::strchr(name, '/') != nullptr) {  // card root only
-            send("UP:ERR bad name\n");
-            continue;
-        }
-        const char* err = receive_file(name, static_cast<uint32_t>(size), static_cast<uint32_t>(crc), buf, status);
-        if (err == nullptr) {
-            ++files;
-            send("UP:OK\n");
-        } else {
-            std::snprintf(line, sizeof(line), "UP:ERR %s\n", err);
-            send(line);
-            status(err);
+    if (!ok) {
+        send("UP:ERR out of memory\n");
+    } else {
+        while (read_line(line, sizeof(line), -1)) {
+            if (std::strcmp(line, "LFMUP HELLO") == 0) {
+                send("UP:HELLO\n");
+                continue;
+            }
+            if (std::strcmp(line, "LFMUP END") == 0) {
+                send("UP:BYE\n");
+                break;
+            }
+            char name[64];
+            unsigned long size = 0, crc = 0;
+            if (std::sscanf(line, "LFMUP FILE %63s %lu %lu", name, &size, &crc) != 3) continue;
+            if (std::strchr(name, '/') != nullptr) {  // card root only
+                send("UP:ERR bad name\n");
+                continue;
+            }
+            const char* err = receive_file(w, name, static_cast<uint32_t>(size), static_cast<uint32_t>(crc), status);
+            if (err == nullptr) {
+                ++files;
+                send("UP:OK\n");
+            } else {
+                std::snprintf(line, sizeof(line), "UP:ERR %s\n", err);
+                send(line);
+                status(err);
+            }
         }
     }
-    heap_caps_free(buf);
+
+    for (auto* b : w.block) heap_caps_free(b);
+    if (w.free_q) vQueueDelete(w.free_q);
+    if (w.full_q) vQueueDelete(w.full_q);
+    if (w.stopped) vSemaphoreDelete(w.stopped);
     return files;
 }
 

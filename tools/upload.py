@@ -102,18 +102,26 @@ def send_file(dev: Device, src: Path, name: str) -> None:
         sys.exit(f"{name}: {reply}")
 
     t0 = time.time()
+    stat = ""
     for off in range(0, len(data), CHUNK):
         dev.s.write(data[off:off + CHUNK])  # blocks while the device is busy: USB flow control
         for line in dev.lines():
             if line.startswith("UP:ERR"):
                 sys.exit(f"\n{name}: {line}")
+            if line.startswith("UP:STAT"):
+                stat = line
         done = min(off + CHUNK, len(data))
         rate = done / 1e6 / max(time.time() - t0, 1e-6)
         eta = (len(data) - done) / 1e6 / max(rate, 1e-6)
         print(f"\r{name}: {done / 1e6:7.1f}/{len(data) / 1e6:.1f} MB  {rate:4.2f} MB/s  eta {eta:4.0f} s",
               end="", flush=True)
     print(f"\r{name}: sent, device verifying the copy on the card ..." + " " * 30, end="", flush=True)
-    reply = dev.wait_for(("UP:OK", "UP:ERR"), 300)  # read-back: ~50 s for the model
+    reply = dev.wait_for(("UP:OK", "UP:ERR", "UP:STAT"), 300)  # read-back: ~50 s for the model
+    if reply.startswith("UP:STAT"):
+        stat = reply
+        reply = dev.wait_for(("UP:OK", "UP:ERR"), 300)
+    if stat:
+        print(f"\r{name}: device {stat[len('UP:STAT '):]}" + " " * 20)
     print(f"\r{name}: {len(data) / 1e6:.1f} MB in {time.time() - t0:.0f} s  {reply}" + " " * 20)
     if reply.startswith("UP:ERR"):
         sys.exit(1)

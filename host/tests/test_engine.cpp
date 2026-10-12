@@ -19,6 +19,7 @@ namespace {
 
 const std::string kBf16Path = std::string(LFM_REPO_ROOT) + "/out/lfm-bf16.lfm";
 const std::string kQ8Path = std::string(LFM_REPO_ROOT) + "/out/lfm-q8.lfm";
+const std::string kKvPath = std::string(LFM_REPO_ROOT) + "/out/test-kv.bin";
 
 bool Exists(const std::string& path) { return lfm::FileSource(path.c_str()).ok(); }
 
@@ -54,6 +55,18 @@ std::vector<int32_t> Generate(lfm::Engine& eng, const std::vector<int>& prompt, 
     while (next >= 0 && static_cast<int>(out.size()) < max_new) {
         out.push_back(next);
         if (next == lfm::kEosId) break;
+        next = eng.forward(next, true);
+    }
+    return out;
+}
+
+// Exactly n greedy tokens, ignoring EOS: long runs cross several KV chunks.
+std::vector<int32_t> GenerateN(lfm::Engine& eng, const std::vector<int>& prompt, int n) {
+    int32_t next = lfm::Engine::kNoToken;
+    for (std::size_t i = 0; i < prompt.size(); ++i) next = eng.forward(prompt[i], i + 1 == prompt.size());
+    std::vector<int32_t> out;
+    while (next >= 0 && static_cast<int>(out.size()) < n) {
+        out.push_back(next);
         next = eng.forward(next, true);
     }
     return out;
@@ -213,4 +226,58 @@ TEST(EngineQ8, LayerErrorIsBounded) {
     }
     RecordProperty("worst_rel_err", std::to_string(worst));
     EXPECT_LT(worst, 0.05f);
+}
+
+// ---------------------------------------------------------------- KV cache in a file
+
+TEST(EngineBf16, KvFileLogitsMatchGolden) {
+    MODEL_REQUIRED(kBf16Path);
+    lfm::FileSource src(kBf16Path.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.kv_path = kKvPath.c_str()}), lfm::Status::Ok);
+    const golden::Activation want = golden::Load("logits");
+    const std::vector<int> tokens = golden::Tokens();
+
+    std::vector<float> logits(lfm::kVocab);
+    for (std::size_t t = 0; t < tokens.size(); ++t) {
+        eng.forward(tokens[t], true, logits.data());
+        EXPECT_TRUE(golden::Near(logits, want.row(t), 1e-4f)) << "token " << t;
+    }
+}
+
+// Same numbers whether K/V live in RAM or in a file, over a run long enough
+// to need several chunks of the KV stream (16 positions per 32 KB at bf16).
+class KvFileVsRam : public ::testing::TestWithParam<bool> {};
+
+TEST_P(KvFileVsRam, SameTokens) {
+    MODEL_REQUIRED(kQ8Path);
+    const bool bf16 = GetParam();
+    lfm::FileSource src_ram(kQ8Path.c_str()), src_file(kQ8Path.c_str());
+    lfm::Engine ram, file;
+    ASSERT_EQ(ram.open(src_ram, {.max_ctx = 64, .kv_bf16 = bf16}), lfm::Status::Ok);
+    ASSERT_EQ(file.open(src_file, {.max_ctx = 64, .kv_bf16 = bf16, .kv_path = kKvPath.c_str()}), lfm::Status::Ok);
+    const auto want = GenerateN(ram, golden::Tokens(), 40);
+    ASSERT_EQ(want.size(), 40u);
+    EXPECT_EQ(GenerateN(file, golden::Tokens(), 40), want);
+}
+
+INSTANTIATE_TEST_SUITE_P(Kv, KvFileVsRam, ::testing::Values(false, true),
+                         [](const auto& info) { return info.param ? "Bf16" : "F32"; });
+
+// Context is no longer bounded by RAM: reset and reuse work with the file too.
+TEST(EngineQ8, KvFileResetAndRerun) {
+    MODEL_REQUIRED(kQ8Path);
+    lfm::FileSource src(kQ8Path.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_ctx = 512, .kv_bf16 = true, .kv_path = kKvPath.c_str()}), lfm::Status::Ok);
+    EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
+    eng.reset();
+    EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
+}
+
+TEST(Engine, KvFileUnwritablePathIsIoError) {
+    MODEL_REQUIRED(kQ8Path);
+    lfm::FileSource src(kQ8Path.c_str());
+    lfm::Engine eng;
+    EXPECT_EQ(eng.open(src, {.kv_path = "/nonexistent-dir/kv.bin"}), lfm::Status::IoError);
 }

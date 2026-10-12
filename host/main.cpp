@@ -2,7 +2,8 @@
 //
 //   ./host/build/lfm_host out/lfm-q8.lfm                  # prompt from out/prompt.txt
 //   ./host/build/lfm_host out/lfm-q8.lfm 1 1098 5706 ...  # explicit token ids
-//   options: --max-new N (default 32), --ctx N (default 128), --kv-bf16
+//   options: --max-new N (default 32), --ctx N (default 128), --kv-bf16,
+//            --kv-file PATH (KV cache in a file, as on the device)
 
 #include <chrono>
 #include <cstdio>
@@ -35,7 +36,7 @@ std::vector<int32_t> read_prompt(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s model.lfm [--max-new N] [--ctx N] [--kv-bf16] [token ids...]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s model.lfm [--max-new N] [--ctx N] [--kv-bf16] [--kv-file PATH] [token ids...]\n", argv[0]);
         return 2;
     }
     lfm::EngineConfig cfg;
@@ -46,6 +47,8 @@ int main(int argc, char** argv) {
             max_new = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--ctx") == 0 && i + 1 < argc) {
             cfg.max_ctx = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--kv-file") == 0 && i + 1 < argc) {
+            cfg.kv_path = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-bf16") == 0) {
             cfg.kv_bf16 = true;
         } else {
@@ -68,8 +71,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "open: %s\n", lfm::to_string(s));
         return 1;
     }
-    std::fprintf(stderr, "engine RAM: %zu KB, ctx %d, kv %s\n", eng.ram_bytes(cfg) / 1024, cfg.max_ctx,
-                 cfg.kv_bf16 ? "bf16" : "f32");
+    std::fprintf(stderr, "engine RAM: %zu KB, ctx %d, kv %s in %s\n", eng.ram_bytes(cfg) / 1024, cfg.max_ctx,
+                 cfg.kv_bf16 ? "bf16" : "f32", cfg.kv_path ? cfg.kv_path : "RAM");
 
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();

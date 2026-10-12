@@ -108,8 +108,9 @@ G0 runs the prompt again. Change the prompt with
 is rewritten too, same content).
 
 Engine (`lfm/engine.hpp`): one token at a time, every weight streamed from the
-file through one 32 KB buffer. RAM = buffers + conv state + KV cache; the
-firmware picks the largest context that fits.
+file through one 32 KB buffer. On the device the KV cache is a file too
+(`/kv.bin`, 12 KB per token, read back with an online softmax), so RAM is a
+fixed ~136 KB and the context is limited to 1024 tokens by config only.
 
 ## Milestones
 

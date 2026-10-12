@@ -14,22 +14,31 @@ public:
     virtual bool read_at(uint64_t offset, void* dst, std::size_t n) = 0;
 };
 
-// A file read with POSIX open/lseek/read. Works on the Mac and on ESP-IDF
-// (FATFS on the SD card). Skips the lseek when reads are sequential.
+// A file accessed with POSIX open/lseek/read/write. Works on the Mac and on
+// ESP-IDF (FATFS on the SD card). Skips the lseek when access is sequential.
 class FileSource final : public Source {
 public:
-    explicit FileSource(const char* path);
+    enum class Mode : uint8_t {
+        Read,       // existing file, read-only
+        ReadWrite,  // created (or emptied) on open; read_at and write_at
+    };
+
+    explicit FileSource(const char* path, Mode mode = Mode::Read);
     ~FileSource() override;
     FileSource(const FileSource&) = delete;
     FileSource& operator=(const FileSource&) = delete;
 
     bool ok() const { return fd_ >= 0; }
     bool read_at(uint64_t offset, void* dst, std::size_t n) override;
+    // Mode::ReadWrite only. Writing past the end grows the file.
+    bool write_at(uint64_t offset, const void* src, std::size_t n);
 
     // Total bytes read so far (for throughput stats).
     uint64_t bytes_read() const { return bytes_read_; }
 
 private:
+    bool seek(uint64_t offset);
+
     int fd_ = -1;
     uint64_t pos_ = 0;
     uint64_t bytes_read_ = 0;

@@ -35,13 +35,14 @@ struct Dims {
         : dim(h.dim), ff(h.ff_dim), heads(h.n_heads), kv_heads(h.n_kv_heads), head_dim(h.head_dim),
           q_dim(h.n_heads * h.head_dim), kv_dim(h.n_kv_heads * h.head_dim), conv_l(h.conv_l), vocab(h.vocab) {}
 
-    // Scratch shared by the ops (only one runs at a time).
-    std::size_t arena(int max_ctx) const {
-        const std::size_t conv = 3 * dim + dim * conv_l;                   // proj + kernel
-        const std::size_t mlp = 2 * ff;                                    // gate + up
-        const std::size_t attn = q_dim + 2 * kv_dim + q_dim               // q, k, v, ctx
-                                 + static_cast<std::size_t>(max_ctx)       // scores
-                                 + 3 * head_dim;                           // q_norm, k_norm, kv row
+    // Scratch shared by the ops (only one runs at a time). Independent of
+    // the context length: attention streams the KV cache (online softmax).
+    std::size_t arena() const {
+        const std::size_t conv = 3 * dim + dim * conv_l;  // proj + kernel
+        const std::size_t mlp = 2 * ff;                   // gate + up
+        const std::size_t attn = q_dim + 2 * kv_dim       // q, k, v
+                                 + q_dim + 2 * heads      // ctx accumulators, running max and sum
+                                 + 4 * head_dim;          // q_norm, k_norm, one K and one V row
         std::size_t a = conv > mlp ? conv : mlp;
         return a > attn ? a : attn;
     }
@@ -74,15 +75,16 @@ void dequant_row(Dtype dt, const std::byte* row, std::span<float> out) {
 Engine::~Engine() {
     std::free(mem_);
     std::free(conv_state_);
-    for (void* p : kv_) std::free(p);
+    for (std::byte* p : kv_ram_) std::free(p);
+    delete kv_file_;
 }
 
 std::size_t Engine::ram_bytes(const EngineConfig& cfg) const {
     const Dims d(h_);
-    const std::size_t kv_elem = cfg.kv_bf16 ? 2 : 4;
-    return cfg.io_bytes + (4 * d.dim + d.arena(cfg.max_ctx)) * sizeof(float)
-           + static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float)
-           + static_cast<std::size_t>(n_attn_) * 2 * static_cast<std::size_t>(cfg.max_ctx) * d.kv_dim * kv_elem;
+    const std::size_t kv = cfg.kv_path != nullptr ? 0
+        : static_cast<std::size_t>(n_attn_) * static_cast<std::size_t>(cfg.max_ctx) * 2 * d.kv_dim * (cfg.kv_bf16 ? 2 : 4);
+    return cfg.io_bytes + (4 * d.dim + d.arena()) * sizeof(float)
+           + static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float) + kv;
 }
 
 Status Engine::open(Source& src, const EngineConfig& cfg) {
@@ -99,7 +101,8 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
                     h_.n_layers >= 1 && h_.n_layers <= static_cast<uint32_t>(kMaxLayers) &&
                     d.dim % kQ8BlockSize == 0 && d.ff % kQ8BlockSize == 0 && d.q_dim % kQ8BlockSize == 0 &&
                     d.heads % d.kv_heads == 0 && d.head_dim % 2 == 0 && d.conv_l >= 2 &&
-                    row_bytes(h_.matrix_dtype, d.ff) <= cfg.io_bytes && cfg.max_ctx >= 1;
+                    row_bytes(h_.matrix_dtype, d.ff) <= cfg.io_bytes &&
+                    2 * d.kv_dim * sizeof(float) <= cfg.io_bytes && cfg.max_ctx >= 1;
     if (!ok) return Status::Unsupported;
 
     n_conv_ = n_attn_ = 0;
@@ -108,7 +111,7 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     }
 
     // Main block: io buffer, then x, xn, tmp, norm_w, arena.
-    const std::size_t floats = 4 * d.dim + d.arena(cfg.max_ctx);
+    const std::size_t floats = 4 * d.dim + d.arena();
     mem_ = std::malloc(cfg.io_bytes + floats * sizeof(float));
     if (mem_ == nullptr) return Status::OutOfMemory;
     io_ = static_cast<std::byte*>(mem_);
@@ -122,11 +125,15 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
         conv_state_ = static_cast<float*>(std::malloc(n_conv_ * (d.conv_l - 1) * d.dim * sizeof(float)));
         if (conv_state_ == nullptr) return Status::OutOfMemory;
     }
-    // One block per attention layer: smaller allocations fit a fragmented heap.
-    const std::size_t kv_bytes = 2 * static_cast<std::size_t>(cfg.max_ctx) * d.kv_dim * (cfg.kv_bf16 ? 2 : 4);
-    for (int i = 0; i < n_attn_; ++i) {
-        kv_[i] = std::malloc(kv_bytes);
-        if (kv_[i] == nullptr) return Status::OutOfMemory;
+    if (cfg.kv_path != nullptr) {
+        kv_file_ = new FileSource(cfg.kv_path, FileSource::Mode::ReadWrite);
+        if (!kv_file_->ok()) return Status::IoError;
+    } else {
+        // One block per attention layer: smaller allocations fit a fragmented heap.
+        for (int i = 0; i < n_attn_; ++i) {
+            kv_ram_[i] = static_cast<std::byte*>(std::malloc(static_cast<std::size_t>(cfg.max_ctx) * kv_row_bytes()));
+            if (kv_ram_[i] == nullptr) return Status::OutOfMemory;
+        }
     }
 
     reset();
@@ -231,32 +238,52 @@ bool Engine::conv_op(int layer, std::span<float> out, std::span<const float> in)
     return matvec(out, L.conv_out, d.dim, {B, d.dim});
 }
 
-std::span<const float> Engine::kv_row(int attn_idx, bool value, int j, int kv_head, std::span<float> tmp) const {
-    const Dims d(h_);
-    const std::size_t idx = ((value ? 1 : 0) * static_cast<std::size_t>(cfg_.max_ctx) + static_cast<std::size_t>(j)) * d.kv_dim
-                            + static_cast<std::size_t>(kv_head) * d.head_dim;
-    if (!cfg_.kv_bf16) {
-        return {static_cast<const float*>(kv_[attn_idx]) + idx, d.head_dim};
-    }
-    const uint16_t* src = static_cast<const uint16_t*>(kv_[attn_idx]) + idx;
-    m::bf16_to_f32(tmp.first(d.head_dim), {src, d.head_dim});
-    return tmp.first(d.head_dim);
+std::size_t Engine::kv_row_bytes() const {
+    return 2 * static_cast<std::size_t>(h_.n_kv_heads) * h_.head_dim * (cfg_.kv_bf16 ? 2 : 4);
 }
 
-void Engine::kv_store(int attn_idx, bool value, std::span<const float> row) {
-    const std::size_t idx = ((value ? 1 : 0) * static_cast<std::size_t>(cfg_.max_ctx) + static_cast<std::size_t>(pos_)) * row.size();
-    if (!cfg_.kv_bf16) {
-        std::memcpy(static_cast<float*>(kv_[attn_idx]) + idx, row.data(), row.size_bytes());
-        return;
+// Append this position's K and V for one attention layer. Staged in io_.
+bool Engine::kv_put(int attn_idx, std::span<const float> k, std::span<const float> v) {
+    const std::size_t rb = kv_row_bytes();
+    if (cfg_.kv_bf16) {
+        auto* dst = reinterpret_cast<uint16_t*>(io_);
+        for (std::size_t i = 0; i < k.size(); ++i) dst[i] = m::f32_to_bf16(k[i]);
+        for (std::size_t i = 0; i < v.size(); ++i) dst[k.size() + i] = m::f32_to_bf16(v[i]);
+    } else {
+        std::memcpy(io_, k.data(), k.size_bytes());
+        std::memcpy(io_ + k.size_bytes(), v.data(), v.size_bytes());
     }
-    uint16_t* dst = static_cast<uint16_t*>(kv_[attn_idx]) + idx;
-    for (std::size_t i = 0; i < row.size(); ++i) dst[i] = m::f32_to_bf16(row[i]);
+    if (kv_file_ != nullptr) {
+        const uint64_t row = static_cast<uint64_t>(pos_) * static_cast<uint64_t>(n_attn_) + static_cast<uint64_t>(attn_idx);
+        return kv_file_->write_at(row * rb, io_, rb);
+    }
+    std::memcpy(kv_ram_[attn_idx] + static_cast<std::size_t>(pos_) * rb, io_, rb);
+    return true;
+}
+
+// Rows j0 .. j0+count-1 of one attention layer into dst.
+bool Engine::kv_load(int attn_idx, int j0, int count, std::byte* dst) {
+    const std::size_t rb = kv_row_bytes();
+    if (kv_file_ == nullptr) {
+        std::memcpy(dst, kv_ram_[attn_idx] + static_cast<std::size_t>(j0) * rb, static_cast<std::size_t>(count) * rb);
+        return true;
+    }
+    for (int j = 0; j < count; ++j) {
+        const uint64_t row = static_cast<uint64_t>(j0 + j) * static_cast<uint64_t>(n_attn_) + static_cast<uint64_t>(attn_idx);
+        if (!kv_file_->read_at(row * rb, dst + static_cast<std::size_t>(j) * rb, rb)) return false;
+    }
+    return true;
 }
 
 // Grouped-query attention with per-head RMSNorm on q and k, then RoPE:
 //   q, k, v = proj(in);  q, k = rope(norm(q)), rope(norm(k))
 //   ctx_h = softmax(q_h · K_g^T / sqrt(head_dim)) · V_g      (g = kv head of h)
 //   out = o_proj · ctx
+//
+// K/V rows are streamed through io_ a chunk of positions at a time, so the
+// softmax is computed online: per head keep the running max `mx`, the running
+// sum of exp(score - mx) `sum`, and ctx accumulated with the same weights;
+// when a new max appears, rescale what's accumulated so far.
 bool Engine::attn_op(int layer, std::span<float> out, std::span<const float> in) {
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
@@ -267,10 +294,12 @@ bool Engine::attn_op(int layer, std::span<float> out, std::span<const float> in)
     float* k = q + d.q_dim;
     float* v = k + d.kv_dim;
     float* ctx = v + d.kv_dim;
-    float* scores = ctx + d.q_dim;
-    float* q_norm = scores + cfg_.max_ctx;
+    float* mx = ctx + d.q_dim;
+    float* sum = mx + d.heads;
+    float* q_norm = sum + d.heads;
     float* k_norm = q_norm + d.head_dim;
-    float* row_tmp = k_norm + d.head_dim;
+    float* k_row = k_norm + d.head_dim;
+    float* v_row = k_row + d.head_dim;
 
     if (!matvec({q, d.q_dim}, L.q, d.dim, in)) return false;
     if (!matvec({k, d.kv_dim}, L.k, d.dim, in)) return false;
@@ -288,26 +317,55 @@ bool Engine::attn_op(int layer, std::span<float> out, std::span<const float> in)
     }
     m::rope({q, d.q_dim}, d.head_dim, static_cast<std::size_t>(pos_), h_.rope_theta);
     m::rope({k, d.kv_dim}, d.head_dim, static_cast<std::size_t>(pos_), h_.rope_theta);
-    kv_store(ai, false, {k, d.kv_dim});
-    kv_store(ai, true, {v, d.kv_dim});
+    if (!kv_put(ai, {k, d.kv_dim}, {v, d.kv_dim})) return false;
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(d.head_dim));
     const std::size_t group = d.heads / d.kv_heads;
-    std::span<float> tmp{row_tmp, d.head_dim};
-    for (std::size_t hh = 0; hh < d.heads; ++hh) {
-        const int g = static_cast<int>(hh / group);
-        std::span<const float> qh{q + hh * d.head_dim, d.head_dim};
-        for (int j = 0; j < n; ++j) {
-            scores[j] = m::dot(qh, kv_row(ai, false, j, g, tmp)) * scale;
-        }
-        m::softmax({scores, static_cast<std::size_t>(n)});
+    const std::size_t rb = kv_row_bytes();
+    const std::size_t elem = cfg_.kv_bf16 ? 2 : 4;
+    const int chunk = static_cast<int>(cfg_.io_bytes / rb);
 
-        float* ch = ctx + hh * d.head_dim;
-        std::memset(ch, 0, d.head_dim * sizeof(float));
-        for (int j = 0; j < n; ++j) {
-            std::span<const float> vr = kv_row(ai, true, j, g, tmp);
-            for (std::size_t i = 0; i < d.head_dim; ++i) ch[i] += scores[j] * vr[i];
+    std::memset(ctx, 0, d.q_dim * sizeof(float));
+    for (std::size_t hh = 0; hh < d.heads; ++hh) {
+        mx[hh] = -INFINITY;
+        sum[hh] = 0.0f;
+    }
+
+    // One K or V head slice of a loaded row, as floats.
+    auto slice = [&](const std::byte* row, bool value, std::size_t g, float* tmp) -> const float* {
+        const std::byte* p = row + ((value ? d.kv_dim : 0) + g * d.head_dim) * elem;
+        if (!cfg_.kv_bf16) return reinterpret_cast<const float*>(p);
+        m::bf16_to_f32({tmp, d.head_dim}, {reinterpret_cast<const uint16_t*>(p), d.head_dim});
+        return tmp;
+    };
+
+    for (int j0 = 0; j0 < n; j0 += chunk) {
+        const int count = std::min(chunk, n - j0);
+        if (!kv_load(ai, j0, count, io_)) return false;
+        for (int jj = 0; jj < count; ++jj) {
+            const std::byte* row = io_ + static_cast<std::size_t>(jj) * rb;
+            for (std::size_t g = 0; g < d.kv_heads; ++g) {
+                const float* kr = slice(row, false, g, k_row);
+                const float* vr = slice(row, true, g, v_row);
+                for (std::size_t hh = g * group; hh < (g + 1) * group; ++hh) {
+                    const float s = m::dot({q + hh * d.head_dim, d.head_dim}, {kr, d.head_dim}) * scale;
+                    float* ch = ctx + hh * d.head_dim;
+                    if (s > mx[hh]) {
+                        const float c = std::exp(mx[hh] - s);  // 0 on the first position
+                        sum[hh] *= c;
+                        for (std::size_t i = 0; i < d.head_dim; ++i) ch[i] *= c;
+                        mx[hh] = s;
+                    }
+                    const float p = std::exp(s - mx[hh]);
+                    sum[hh] += p;
+                    for (std::size_t i = 0; i < d.head_dim; ++i) ch[i] += p * vr[i];
+                }
+            }
         }
+    }
+    for (std::size_t hh = 0; hh < d.heads; ++hh) {
+        const float inv = 1.0f / sum[hh];
+        for (std::size_t i = 0; i < d.head_dim; ++i) ctx[hh * d.head_dim + i] *= inv;
     }
     return matvec(out, L.o, d.q_dim, {ctx, d.q_dim});
 }

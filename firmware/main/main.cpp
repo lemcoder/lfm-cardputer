@@ -3,6 +3,7 @@
 // SD card contents (from tools/export.py):
 //   /lfm.lfm       out/lfm-q8.lfm
 //   /prompt.txt    out/prompt.txt  (token ids; optional, defaults below)
+//   /kv.bin        created at boot: the KV cache lives on the card, not in RAM
 //
 // Screen: prompt + generated text, status line with tokens, s/token and a
 // per-layer progress bar. Press G0 (BtnA) to run again.
@@ -11,7 +12,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -27,6 +27,8 @@ namespace {
 constexpr const char* TAG = "lfm";
 constexpr const char* kModelPath = "/sdcard/lfm.lfm";
 constexpr const char* kPromptPath = "/sdcard/prompt.txt";
+constexpr const char* kKvPath = "/sdcard/kv.bin";
+constexpr int kMaxCtx = 1024;  // KV file grows 12 KB per token: 12 MB at most
 constexpr int32_t kDefaultPrompt[] = {1, 1098, 5706, 803, 4481, 856};  // "The capital of France is"
 constexpr int kMaxPrompt = 64;
 
@@ -132,20 +134,6 @@ int read_prompt(int32_t* out, int cap) {
     return n;
 }
 
-// Largest context that fits, keeping `reserve` bytes free for everything else.
-std::unique_ptr<lfm::Engine> open_engine(lfm::Source& src, lfm::EngineConfig cfg, std::size_t reserve, lfm::Status* st) {
-    void* hold = std::malloc(reserve);
-    std::unique_ptr<lfm::Engine> eng;
-    for (int ctx = 64; ctx >= 4; ctx -= 2) {
-        cfg.max_ctx = ctx;
-        eng = std::make_unique<lfm::Engine>();
-        *st = eng->open(src, cfg);
-        if (*st != lfm::Status::OutOfMemory) break;
-    }
-    std::free(hold);
-    return eng;
-}
-
 }  // namespace
 
 extern "C" void app_main(void) {
@@ -169,14 +157,13 @@ extern "C" void app_main(void) {
     static lfm::FileSource src(kModelPath);
     if (!src.ok()) fatal("missing /lfm.lfm", "copy out/lfm-q8.lfm to the SD card as lfm.lfm");
 
-    const lfm::EngineConfig base{.kv_bf16 = true, .io_bytes = 32 * 1024};
-    lfm::Status st;
-    std::unique_ptr<lfm::Engine> eng = open_engine(src, base, 24 * 1024, &st);
-    if (st != lfm::Status::Ok) fatal("engine open failed", lfm::to_string(st));
+    const lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath};
+    static lfm::Engine eng_storage;
+    lfm::Engine* eng = &eng_storage;
+    if (lfm::Status st = eng->open(src, cfg); st != lfm::Status::Ok) fatal("engine open failed", lfm::to_string(st));
     eng->set_progress_hook(&on_progress, nullptr);
-    ESP_LOGI(TAG, "engine: ctx %d, %u KB; heap free %u, largest %u", eng->max_ctx(),
-             (unsigned)(eng->ram_bytes({.max_ctx = eng->max_ctx(), .kv_bf16 = true, .io_bytes = base.io_bytes}) / 1024),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+    ESP_LOGI(TAG, "engine: ctx %d, %u KB RAM; heap free %u, largest %u", eng->max_ctx(),
+             (unsigned)(eng->ram_bytes(cfg) / 1024), (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     static int32_t prompt[kMaxPrompt];

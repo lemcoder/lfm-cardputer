@@ -64,4 +64,7 @@ float dot_bf16(const std::byte* row, std::span<const float> x);
 // Row of Q8_0 blocks: x.size() / 32 blocks of {f16 scale, int8[32]}.
 float dot_q8_0(const std::byte* row, std::span<const float> x);
 
+// Row of Q4_0 blocks: x.size() / 32 blocks of {f16 scale, uint8[16]}.
+float dot_q4_0(const std::byte* row, std::span<const float> x);
+
 }  // namespace lfm::math::ref

@@ -206,4 +206,23 @@ float dot_q8_0(const std::byte* row, std::span<const float> x) {
     return sum;
 }
 
+float dot_q4_0(const std::byte* row, std::span<const float> x) {
+    assert(x.size() % 32 == 0);
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < x.size() / 32; ++b) {
+        const std::byte* block = row + b * 18;
+        uint16_t scale_bits;
+        std::memcpy(&scale_bits, block, 2);
+        const auto* q = reinterpret_cast<const uint8_t*>(block + 2);
+        const float* xb = x.data() + b * 32;
+        float acc = 0.0f;
+        for (std::size_t j = 0; j < 16; ++j) {
+            acc += static_cast<float>(static_cast<int>(q[j] & 0x0F) - 8) * xb[j];
+            acc += static_cast<float>(static_cast<int>(q[j] >> 4) - 8) * xb[j + 16];
+        }
+        sum += f16_to_f32(scale_bits) * acc;
+    }
+    return sum;
+}
+
 } // namespace lfm::math::ref

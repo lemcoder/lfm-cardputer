@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,8 @@ namespace {
 
 const std::string kBf16Path = std::string(LFM_REPO_ROOT) + "/out/lfm-bf16.lfm";
 const std::string kQ8Path = std::string(LFM_REPO_ROOT) + "/out/lfm-q8.lfm";
+const std::string kQ8HeadPath = std::string(LFM_REPO_ROOT) + "/out/lfm-q8-head-q4.lfm";
+const std::string kEvalPath = std::string(LFM_REPO_ROOT) + "/out/eval.txt";
 const std::string kKvPath = std::string(LFM_REPO_ROOT) + "/out/test-kv.bin";
 
 bool Exists(const std::string& path) { return lfm::FileSource(path.c_str()).ok(); }
@@ -98,7 +101,7 @@ TEST(Engine, HeaderMatchesModelConstants) {
     lfm::Engine eng;
     ASSERT_EQ(eng.open(src, {}), lfm::Status::Ok);
     const lfm::FileHeader& h = eng.header();
-    EXPECT_EQ(h.matrix_dtype, lfm::Dtype::Q8_0);
+    EXPECT_EQ(h.embed_dtype, lfm::Dtype::Q8_0);
     EXPECT_EQ(h.dim, static_cast<uint32_t>(lfm::kDim));
     EXPECT_EQ(h.ff_dim, static_cast<uint32_t>(lfm::kFfDim));
     EXPECT_EQ(h.n_layers, static_cast<uint32_t>(lfm::kNumLayers));
@@ -280,4 +283,37 @@ TEST(Engine, KvFileUnwritablePathIsKvFileError) {
     lfm::FileSource src(kQ8Path.c_str());
     lfm::Engine eng;
     EXPECT_EQ(eng.open(src, {.kv_path = "/nonexistent-dir/kv.bin"}), lfm::Status::KvFileError);
+}
+
+// ---------------------------------------------------------------- LM head shortlist
+
+// The Q4 shortlist + exact re-score picks the same next token as scanning the
+// exact Q8 head, teacher-forced over real text (tools/eval_text.py).
+TEST(EngineQ8, LmHeadShortlistSameTokens) {
+    MODEL_REQUIRED(kQ8HeadPath);
+    MODEL_REQUIRED(kQ8Path);
+    std::vector<int32_t> text;
+    {
+        std::ifstream f(kEvalPath);
+        int32_t id;
+        while (f >> id && text.size() < 96) text.push_back(id);
+    }
+    if (text.size() < 2) GTEST_SKIP() << kEvalPath << " missing: uv run tools/eval_text.py";
+
+    lfm::FileSource src_full(kQ8Path.c_str()), src_short(kQ8HeadPath.c_str());
+    lfm::Engine full, shortlist;
+    ASSERT_EQ(full.open(src_full, {.max_ctx = 128}), lfm::Status::Ok);
+    ASSERT_EQ(shortlist.open(src_short, {.max_ctx = 128}), lfm::Status::Ok);
+    ASSERT_NE(shortlist.header().lm_head, 0u);
+    for (std::size_t t = 0; t + 1 < text.size(); ++t) {
+        ASSERT_EQ(shortlist.forward(text[t], true), full.forward(text[t], true)) << "position " << t;
+    }
+}
+
+TEST(EngineQ8, LmHeadShortlistGeneratesGolden) {
+    MODEL_REQUIRED(kQ8HeadPath);
+    lfm::FileSource src(kQ8HeadPath.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_ctx = 64, .kv_bf16 = true, .kv_path = kKvPath.c_str()}), lfm::Status::Ok);
+    EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
 }

@@ -49,12 +49,39 @@ struct Dims {
     }
 };
 
+bool is_matrix_dtype(Dtype dt) {
+    return dt == Dtype::BF16 || dt == Dtype::Q8_0 || dt == Dtype::Q4_0;
+}
+
+float dot_row(Dtype dt, const std::byte* row, std::span<const float> x) {
+    switch (dt) {
+        case Dtype::Q8_0: return m::dot_q8_0(row, x);
+        case Dtype::Q4_0: return m::dot_q4_0(row, x);
+        default: return m::dot_bf16(row, x);
+    }
+}
+
 void dequant_row(Dtype dt, const std::byte* row, std::span<float> out) {
     if (dt == Dtype::BF16) {
         for (std::size_t i = 0; i < out.size(); ++i) {
             uint16_t h;
             std::memcpy(&h, row + 2 * i, 2);
             out[i] = std::bit_cast<float>(static_cast<uint32_t>(h) << 16);
+        }
+        return;
+    }
+    if (dt == Dtype::Q4_0) {
+        for (std::size_t b = 0; b < out.size() / kQ4BlockSize; ++b) {
+            const std::byte* block = row + b * kQ4BlockBytes;
+            uint16_t scale_bits;
+            std::memcpy(&scale_bits, block, 2);
+            const float scale = m::f16_to_f32(scale_bits);
+            const auto* q = reinterpret_cast<const uint8_t*>(block + 2);
+            float* o = out.data() + b * kQ4BlockSize;
+            for (std::size_t j = 0; j < kQ4BlockSize / 2; ++j) {
+                o[j] = scale * static_cast<float>(static_cast<int>(q[j] & 0x0F) - 8);
+                o[j + kQ4BlockSize / 2] = scale * static_cast<float>(static_cast<int>(q[j] >> 4) - 8);
+            }
         }
         return;
     }
@@ -95,15 +122,35 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
 
     if (!src.read_at(0, &h_, sizeof(h_))) return Status::IoError;
     if (std::memcmp(h_.magic, kMagic, sizeof(kMagic)) != 0) return Status::BadMagic;
-    if (h_.version != kFormatVersion) return Status::BadVersion;
+    if (h_.version == 1) {
+        // v1: one encoding for every matrix (in the field v2 calls embed_dtype);
+        // the per-matrix table and LM head shortlist didn't exist (padding).
+        for (auto& row : h_.layer_dtype) {
+            for (auto& dt : row) dt = static_cast<uint8_t>(h_.embed_dtype);
+        }
+        h_.lm_head = 0;
+    } else if (h_.version != kFormatVersion) {
+        return Status::BadVersion;
+    }
 
     const Dims d(h_);
-    const bool ok = (h_.matrix_dtype == Dtype::BF16 || h_.matrix_dtype == Dtype::Q8_0) &&
-                    h_.n_layers >= 1 && h_.n_layers <= static_cast<uint32_t>(kMaxLayers) &&
-                    d.dim % kQ8BlockSize == 0 && d.ff % kQ8BlockSize == 0 && d.q_dim % kQ8BlockSize == 0 &&
-                    d.heads % d.kv_heads == 0 && d.head_dim % 2 == 0 && d.conv_l >= 2 &&
-                    row_bytes(h_.matrix_dtype, d.ff) <= cfg.io_bytes &&
-                    2 * d.kv_dim * sizeof(float) <= cfg.io_bytes && cfg.max_ctx >= 1;
+    bool ok = is_matrix_dtype(h_.embed_dtype) &&
+              (h_.lm_head == 0 || (is_matrix_dtype(h_.lm_head_dtype) && h_.lm_head_candidates >= 1 &&
+                                   h_.lm_head_candidates <= kMaxCandidates)) &&
+              h_.n_layers >= 1 && h_.n_layers <= static_cast<uint32_t>(kMaxLayers) &&
+              d.dim % kQ8BlockSize == 0 && d.ff % kQ8BlockSize == 0 && d.q_dim % kQ8BlockSize == 0 &&
+              d.heads % d.kv_heads == 0 && d.head_dim % 2 == 0 && d.conv_l >= 2 &&
+              row_bytes(Dtype::BF16, d.ff) <= cfg.io_bytes &&  // widest row we stream
+              2 * d.kv_dim * sizeof(float) <= cfg.io_bytes && cfg.max_ctx >= 1;
+    for (uint32_t i = 0; ok && i < h_.n_layers; ++i) {
+        const bool conv = h_.layer_kind[i] == LayerKind::Conv;
+        for (LayerField f : {kW1, kW2, kW3}) ok = ok && is_matrix_dtype(h_.dtype(i, f));
+        if (conv) {
+            for (LayerField f : {kConvIn, kConvOut}) ok = ok && is_matrix_dtype(h_.dtype(i, f));
+        } else {
+            for (LayerField f : {kQ, kK, kV, kO}) ok = ok && is_matrix_dtype(h_.dtype(i, f));
+        }
+    }
     if (!ok) return Status::Unsupported;
 
     n_conv_ = n_attn_ = 0;
@@ -158,43 +205,71 @@ bool Engine::read_f32(uint64_t offset, std::span<float> out) {
     return src_->read_at(offset, out.data(), out.size_bytes());
 }
 
-float Engine::dot_row(const std::byte* row, std::span<const float> x) const {
-    return h_.matrix_dtype == Dtype::Q8_0 ? m::dot_q8_0(row, x) : m::dot_bf16(row, x);
-}
-
 // out[r] = row r of the matrix at `offset` (out.size() rows, `cols` columns) · x.
 // Streams the matrix through io_ a whole number of rows at a time.
-bool Engine::matvec(std::span<float> out, uint64_t offset, std::size_t cols, std::span<const float> x) {
+bool Engine::matvec(std::span<float> out, uint64_t offset, Dtype dt, std::size_t cols, std::span<const float> x) {
     assert(x.size() == cols);
-    const std::size_t rb = row_bytes(h_.matrix_dtype, cols);
+    const std::size_t rb = row_bytes(dt, cols);
     const std::size_t rows_per_chunk = cfg_.io_bytes / rb;
     for (std::size_t r0 = 0; r0 < out.size(); r0 += rows_per_chunk) {
         const std::size_t n = std::min(rows_per_chunk, out.size() - r0);
         if (!src_->read_at(offset + r0 * rb, io_, n * rb)) return false;
         for (std::size_t i = 0; i < n; ++i) {
-            out[r0 + i] = dot_row(io_ + i * rb, x);
+            out[r0 + i] = dot_row(dt, io_ + i * rb, x);
         }
     }
     return true;
 }
 
-// Tied LM head: logit[v] = embed row v · x. Streams all vocab rows, keeps
-// only the running argmax (the logits array would be 256 KB).
+// Tied LM head: logit[v] = embed row v · x, over the whole vocab, streamed.
+// Without `logits`, only the argmax is kept (all logits would be 256 KB).
+//
+// If the file has a low-precision copy (h_.lm_head), it is scanned instead
+// and only its top `lm_head_candidates` are re-scored with the exact rows:
+// same top-1 (unless the true winner falls outside the shortlist), about half
+// the bytes. With `logits` requested, the exact full scan is used.
 int32_t Engine::lm_head(std::span<const float> x, float* logits) {
-    const std::size_t rb = row_bytes(h_.matrix_dtype, h_.dim);
+    const bool shortlist = h_.lm_head != 0 && logits == nullptr;
+    const Dtype scan_dt = shortlist ? h_.lm_head_dtype : h_.embed_dtype;
+    const uint64_t scan_off = shortlist ? h_.lm_head : h_.embed;
+    const std::size_t rb = row_bytes(scan_dt, h_.dim);
     const std::size_t rows_per_chunk = cfg_.io_bytes / rb;
-    float best = -INFINITY;
-    int32_t best_id = 0;
+
+    // Top-k by approximate score, kept sorted descending (k is small).
+    const int k = shortlist ? static_cast<int>(h_.lm_head_candidates) : 1;
+    float top_score[kMaxCandidates];
+    int32_t top_id[kMaxCandidates];
+    int n_top = 0;
+
     for (std::size_t r0 = 0; r0 < h_.vocab; r0 += rows_per_chunk) {
         const std::size_t n = std::min<std::size_t>(rows_per_chunk, h_.vocab - r0);
-        if (!src_->read_at(h_.embed + r0 * rb, io_, n * rb)) return kIoError;
+        if (!src_->read_at(scan_off + r0 * rb, io_, n * rb)) return kIoError;
         for (std::size_t i = 0; i < n; ++i) {
-            const float v = dot_row(io_ + i * rb, x);
+            const float v = dot_row(scan_dt, io_ + i * rb, x);
             if (logits != nullptr) logits[r0 + i] = v;
-            if (v > best) {
-                best = v;
-                best_id = static_cast<int32_t>(r0 + i);
+            if (n_top == k && v <= top_score[k - 1]) continue;
+            int pos = n_top < k ? n_top++ : k - 1;
+            while (pos > 0 && top_score[pos - 1] < v) {
+                top_score[pos] = top_score[pos - 1];
+                top_id[pos] = top_id[pos - 1];
+                --pos;
             }
+            top_score[pos] = v;
+            top_id[pos] = static_cast<int32_t>(r0 + i);
+        }
+    }
+    if (!shortlist) return top_id[0];
+
+    // Re-score the shortlist with the exact rows.
+    const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
+    float best = -INFINITY;
+    int32_t best_id = top_id[0];
+    for (int i = 0; i < n_top; ++i) {
+        if (!src_->read_at(h_.embed + static_cast<uint64_t>(top_id[i]) * erb, io_, erb)) return kIoError;
+        const float v = dot_row(h_.embed_dtype, io_, x);
+        if (v > best || (v == best && top_id[i] < best_id)) {
+            best = v;
+            best_id = top_id[i];
         }
     }
     return best_id;
@@ -213,7 +288,7 @@ bool Engine::conv_op(int layer, std::span<float> out, std::span<const float> in)
     float* proj = arena_;                 // [3*dim]
     float* kernel = arena_ + 3 * d.dim;   // [dim * conv_l]
 
-    if (!matvec({proj, 3 * d.dim}, L.conv_in, d.dim, in)) return false;
+    if (!matvec({proj, 3 * d.dim}, L.conv_in, h_.dtype(layer, kConvIn), d.dim, in)) return false;
     if (!read_f32(L.conv_kernel, {kernel, d.dim * d.conv_l})) return false;
 
     float* B = proj;
@@ -236,7 +311,7 @@ bool Engine::conv_op(int layer, std::span<float> out, std::span<const float> in)
         state[(hist - 1) * d.dim + c] = bx;
         B[c] = C[c] * y;  // B is no longer needed: reuse it for out_proj's input
     }
-    return matvec(out, L.conv_out, d.dim, {B, d.dim});
+    return matvec(out, L.conv_out, h_.dtype(layer, kConvOut), d.dim, {B, d.dim});
 }
 
 std::size_t Engine::kv_row_bytes() const {
@@ -302,9 +377,9 @@ bool Engine::attn_op(int layer, std::span<float> out, std::span<const float> in)
     float* k_row = k_norm + d.head_dim;
     float* v_row = k_row + d.head_dim;
 
-    if (!matvec({q, d.q_dim}, L.q, d.dim, in)) return false;
-    if (!matvec({k, d.kv_dim}, L.k, d.dim, in)) return false;
-    if (!matvec({v, d.kv_dim}, L.v, d.dim, in)) return false;
+    if (!matvec({q, d.q_dim}, L.q, h_.dtype(layer, kQ), d.dim, in)) return false;
+    if (!matvec({k, d.kv_dim}, L.k, h_.dtype(layer, kK), d.dim, in)) return false;
+    if (!matvec({v, d.kv_dim}, L.v, h_.dtype(layer, kV), d.dim, in)) return false;
     if (!read_f32(L.q_norm, {q_norm, d.head_dim})) return false;
     if (!read_f32(L.k_norm, {k_norm, d.head_dim})) return false;
 
@@ -368,7 +443,7 @@ bool Engine::attn_op(int layer, std::span<float> out, std::span<const float> in)
         const float inv = 1.0f / sum[hh];
         for (std::size_t i = 0; i < d.head_dim; ++i) ctx[hh * d.head_dim + i] *= inv;
     }
-    return matvec(out, L.o, d.q_dim, {ctx, d.q_dim});
+    return matvec(out, L.o, h_.dtype(layer, kO), d.q_dim, {ctx, d.q_dim});
 }
 
 // SwiGLU: out = w2 · (silu(w1 · in) * (w3 · in))
@@ -377,10 +452,10 @@ bool Engine::mlp(int layer, std::span<float> out, std::span<const float> in) {
     const LayerOffsets& L = h_.layers[layer];
     std::span<float> gate{arena_, d.ff};
     std::span<float> up{arena_ + d.ff, d.ff};
-    if (!matvec(gate, L.w1, d.dim, in)) return false;
-    if (!matvec(up, L.w3, d.dim, in)) return false;
+    if (!matvec(gate, L.w1, h_.dtype(layer, kW1), d.dim, in)) return false;
+    if (!matvec(up, L.w3, h_.dtype(layer, kW3), d.dim, in)) return false;
     m::swiglu(gate, gate, up);
-    return matvec(out, L.w2, d.ff, gate);
+    return matvec(out, L.w2, h_.dtype(layer, kW2), d.ff, gate);
 }
 
 // ---------------------------------------------------------------- forward
@@ -391,10 +466,10 @@ int32_t Engine::forward(int32_t token, bool want_next, float* logits) {
     std::span<float> x{x_, d.dim}, xn{xn_, d.dim}, tmp{tmp_, d.dim}, norm_w{norm_w_, d.dim};
 
     // Embedding lookup: one row of the (quantized) table.
-    const std::size_t rb = row_bytes(h_.matrix_dtype, d.dim);
+    const std::size_t rb = row_bytes(h_.embed_dtype, d.dim);
     if (token < 0 || static_cast<std::size_t>(token) >= d.vocab) token = 0;
     if (!src_->read_at(h_.embed + static_cast<uint64_t>(token) * rb, io_, rb)) return kIoError;
-    dequant_row(h_.matrix_dtype, io_, x);
+    dequant_row(h_.embed_dtype, io_, x);
 
     for (int i = 0; i < static_cast<int>(h_.n_layers); ++i) {
         const LayerOffsets& L = h_.layers[i];

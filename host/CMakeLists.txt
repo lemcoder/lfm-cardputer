@@ -58,3 +58,8 @@ target_compile_options(lfm_tests PRIVATE -Wall -Wextra)
 enable_testing()
 include(GoogleTest)
 gtest_discover_tests(lfm_tests)
+
+# Quantization quality: perplexity / agreement of .lfm variants vs a reference.
+add_executable(lfm_eval eval.cpp)
+target_link_libraries(lfm_eval PRIVATE lfm)
+target_compile_options(lfm_eval PRIVATE -Wall -Wextra)

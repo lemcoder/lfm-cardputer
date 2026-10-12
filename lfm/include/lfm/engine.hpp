@@ -87,9 +87,8 @@ public:
 
 private:
     bool read_f32(uint64_t offset, std::span<float> out);
-    bool matvec(std::span<float> out, uint64_t offset, std::size_t cols, std::span<const float> x);
+    bool matvec(std::span<float> out, uint64_t offset, Dtype dt, std::size_t cols, std::span<const float> x);
     int32_t lm_head(std::span<const float> x, float* logits);
-    float dot_row(const std::byte* row, std::span<const float> x) const;
 
     bool conv_op(int layer, std::span<float> out, std::span<const float> in);
     bool attn_op(int layer, std::span<float> out, std::span<const float> in);
@@ -102,6 +101,8 @@ private:
     bool kv_load(int attn_idx, int j0, int count, std::byte* dst);
 
     void progress(int done);
+
+    static constexpr int kMaxCandidates = 64;  // LM head shortlist cap
 
     Source* src_ = nullptr;
     FileHeader h_{};

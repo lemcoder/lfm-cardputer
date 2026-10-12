@@ -21,6 +21,7 @@ const char* to_string(Status s) {
         case Status::BadVersion: return "unsupported .lfm version";
         case Status::Unsupported: return "unsupported model config";
         case Status::OutOfMemory: return "out of memory";
+        case Status::KvFileError: return "can't create KV cache file";
     }
     return "?";
 }
@@ -127,7 +128,7 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     }
     if (cfg.kv_path != nullptr) {
         kv_file_ = new FileSource(cfg.kv_path, FileSource::Mode::ReadWrite);
-        if (!kv_file_->ok()) return Status::IoError;
+        if (!kv_file_->ok()) return Status::KvFileError;
     } else {
         // One block per attention layer: smaller allocations fit a fragmented heap.
         for (int i = 0; i < n_attn_; ++i) {

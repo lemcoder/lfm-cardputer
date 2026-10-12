@@ -112,7 +112,8 @@ def send_file(dev: Device, src: Path, name: str) -> None:
         eta = (len(data) - done) / 1e6 / max(rate, 1e-6)
         print(f"\r{name}: {done / 1e6:7.1f}/{len(data) / 1e6:.1f} MB  {rate:4.2f} MB/s  eta {eta:4.0f} s",
               end="", flush=True)
-    reply = dev.wait_for(("UP:OK", "UP:ERR"), 60)
+    print(f"\r{name}: sent, device verifying the copy on the card ..." + " " * 30, end="", flush=True)
+    reply = dev.wait_for(("UP:OK", "UP:ERR"), 300)  # read-back: ~50 s for the model
     print(f"\r{name}: {len(data) / 1e6:.1f} MB in {time.time() - t0:.0f} s  {reply}" + " " * 20)
     if reply.startswith("UP:ERR"):
         sys.exit(1)

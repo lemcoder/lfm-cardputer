@@ -68,12 +68,10 @@ void ensure_driver() {
     usb_serial_jtag_vfs_use_driver();  // logs now go through the driver too
 }
 
-// Receive one file. Returns an error string, or nullptr on success.
-const char* receive_file(const char* name, uint32_t size, uint32_t want_crc, uint8_t* buf, StatusFn status) {
-    char path[96], tmp[100];
-    std::snprintf(path, sizeof(path), "%s/%s", SdCard::kMountPoint, name);
-    std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-
+// Receive `size` bytes from USB into `tmp`. The file is closed on return
+// (FileSource's destructor), which is what makes FATFS record its size.
+const char* receive_to(const char* tmp, const char* name, uint32_t size, uint32_t want_crc, uint8_t* buf,
+                       StatusFn status) {
     lfm::FileSource out(tmp, lfm::FileSource::Mode::ReadWrite);
     if (!out.ok()) return "can't create file";
     send("UP:READY\n");
@@ -102,13 +100,39 @@ const char* receive_file(const char* name, uint32_t size, uint32_t want_crc, uin
             status(line);
         }
     }
-    if (crc != want_crc) return "CRC mismatch";
+    return crc == want_crc ? nullptr : "CRC mismatch (USB)";
+}
 
-    // FATFS rename doesn't overwrite.
+// Read the file back from the card and check size and CRC.
+const char* verify(const char* path, uint32_t size, uint32_t want_crc, uint8_t* buf, StatusFn status) {
+    struct stat st;
+    if (stat(path, &st) != 0) return "file missing after rename";
+    if (static_cast<uint32_t>(st.st_size) != size) return "wrong size on card";
+    status("verifying on card...");
+    lfm::FileSource in(path);
+    if (!in.ok()) return "can't reopen file";
+    uint32_t crc = 0;
+    for (uint32_t off = 0; off < size; off += kChunk) {
+        const uint32_t n = size - off < kChunk ? size - off : kChunk;
+        if (!in.read_at(off, buf, n)) return "read-back failed";
+        crc = crc_update(crc, buf, n);
+    }
+    return crc == want_crc ? nullptr : "CRC mismatch (card)";
+}
+
+// Receive one file. Returns an error string, or nullptr on success.
+const char* receive_file(const char* name, uint32_t size, uint32_t want_crc, uint8_t* buf, StatusFn status) {
+    char path[96], tmp[100];
+    std::snprintf(path, sizeof(path), "%s/%s", SdCard::kMountPoint, name);
+    std::snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    if (const char* err = receive_to(tmp, name, size, want_crc, buf, status)) return err;
+
+    // Only rename closed files. FATFS rename doesn't overwrite.
     struct stat st;
     if (stat(path, &st) == 0) unlink(path);
     if (rename(tmp, path) != 0) return "rename failed";
-    return nullptr;
+    return verify(path, size, want_crc, buf, status);
 }
 
 }  // namespace

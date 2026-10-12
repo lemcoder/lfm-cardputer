@@ -17,7 +17,12 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -116,6 +121,11 @@ void set_phase(const char* phase) {
     lcd.setCursor(x, y);
 }
 
+long st_size(const char* path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? static_cast<long>(st.st_size) : -1;
+}
+
 [[noreturn]] void fatal(const char* what, const char* detail) {
     ESP_LOGE(TAG, "%s: %s", what, detail);
     lcd.setTextColor(TFT_RED, TFT_BLACK);
@@ -177,7 +187,17 @@ extern "C" void app_main(void) {
     const lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath};
     static lfm::Engine eng_storage;
     lfm::Engine* eng = &eng_storage;
-    if (lfm::Status st = eng->open(src, cfg); st != lfm::Status::Ok) fatal("engine open failed", lfm::to_string(st));
+    if (lfm::Status st = eng->open(src, cfg); st != lfm::Status::Ok) {
+        // Narrow it down in the log: header readable? KV file creatable?
+        char magic[8] = {};
+        const bool hdr = src.read_at(0, magic, sizeof(magic));
+        errno = 0;
+        const int fd = open(kKvPath, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        ESP_LOGE(TAG, "open: %s | header read %s, magic %.7s | kv open fd %d errno %d (%s) | size %ld",
+                 lfm::to_string(st), hdr ? "ok" : "FAILED", magic, fd, errno, std::strerror(errno), (long)st_size(kModelPath));
+        if (fd >= 0) close(fd);
+        fatal("engine open failed", lfm::to_string(st));
+    }
     eng->set_progress_hook(&on_progress, nullptr);
     ESP_LOGI(TAG, "engine: ctx %d, %u KB RAM; heap free %u, largest %u", eng->max_ctx(),
              (unsigned)(eng->ram_bytes(cfg) / 1024), (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),

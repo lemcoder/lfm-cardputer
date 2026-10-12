@@ -275,9 +275,9 @@ TEST(EngineQ8, KvFileResetAndRerun) {
     EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
 }
 
-TEST(Engine, KvFileUnwritablePathIsIoError) {
+TEST(Engine, KvFileUnwritablePathIsKvFileError) {
     MODEL_REQUIRED(kQ8Path);
     lfm::FileSource src(kQ8Path.c_str());
     lfm::Engine eng;
-    EXPECT_EQ(eng.open(src, {.kv_path = "/nonexistent-dir/kv.bin"}), lfm::Status::IoError);
+    EXPECT_EQ(eng.open(src, {.kv_path = "/nonexistent-dir/kv.bin"}), lfm::Status::KvFileError);
 }

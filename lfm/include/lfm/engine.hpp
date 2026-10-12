@@ -28,6 +28,7 @@ enum class Status : uint8_t {
     BadVersion,
     Unsupported,  // header describes a model this engine can't run
     OutOfMemory,
+    KvFileError,  // couldn't create / open EngineConfig::kv_path
 };
 
 const char* to_string(Status s);

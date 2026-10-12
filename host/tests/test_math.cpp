@@ -6,7 +6,9 @@
 
 #include <gtest/gtest.h>
 
+#include <bit>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <random>
 #include <span>
@@ -178,3 +180,45 @@ TEST_P(MathBackend, MatvecMatchesRef) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Sizes, MathBackend, ::testing::Values(1, 3, 4, 17, 1024, 1027, 2560));
+
+// ------------------------------------------------- storage formats
+
+TEST(MathRef, F16ToF32) {
+    EXPECT_EQ(m::ref::f16_to_f32(0x3C00), 1.0f);
+    EXPECT_EQ(m::ref::f16_to_f32(0xC000), -2.0f);
+    EXPECT_EQ(m::ref::f16_to_f32(0x3555), 0.333251953125f);
+    EXPECT_EQ(m::ref::f16_to_f32(0x7BFF), 65504.0f);              // largest normal
+    EXPECT_EQ(m::ref::f16_to_f32(0x0001), 5.9604644775390625e-8f);  // smallest subnormal
+    EXPECT_EQ(m::ref::f16_to_f32(0x8000), -0.0f);
+    EXPECT_TRUE(std::isinf(m::ref::f16_to_f32(0x7C00)));
+    EXPECT_TRUE(std::isnan(m::ref::f16_to_f32(0x7E00)));
+}
+
+TEST(MathRef, F32ToBf16RoundsToNearestEven) {
+    EXPECT_EQ(m::ref::f32_to_bf16(1.0f), 0x3F80);
+    EXPECT_EQ(m::ref::f32_to_bf16(-2.0f), 0xC000);
+    EXPECT_EQ(m::ref::f32_to_bf16(3.14159265f), 0x4049);         // 3.140625 is nearest
+    EXPECT_EQ(m::ref::f32_to_bf16(std::bit_cast<float>(0x3F808000u)), 0x3F80);  // tie -> even
+    EXPECT_EQ(m::ref::f32_to_bf16(std::bit_cast<float>(0x3F818000u)), 0x3F82);  // tie -> even (up)
+    EXPECT_TRUE(std::isnan(std::bit_cast<float>(uint32_t{m::ref::f32_to_bf16(NAN)} << 16)));
+}
+
+TEST(MathRef, DotBf16) {
+    const uint16_t row[3] = {0x3F80, 0xC000, 0x4040};  // 1, -2, 3
+    EXPECT_FLOAT_EQ(m::ref::dot_bf16(reinterpret_cast<const std::byte*>(row), Vec{1, 1, 2}), 1 - 2 + 6);
+}
+
+TEST(MathRef, DotQ8_0) {
+    // Two blocks: scale 0.5 with q = i, scale 2 with q = -1.
+    std::vector<std::byte> row(2 * 34);
+    const uint16_t half = 0x3800, two = 0x4000;
+    std::memcpy(row.data(), &half, 2);
+    std::memcpy(row.data() + 34, &two, 2);
+    for (int i = 0; i < 32; ++i) {
+        row[2 + i] = static_cast<std::byte>(static_cast<int8_t>(i));
+        row[36 + i] = static_cast<std::byte>(static_cast<int8_t>(-1));
+    }
+    const Vec x(64, 1.0f);
+    // 0.5 * (0 + 1 + ... + 31) + 2 * (-32) = 248 - 64
+    EXPECT_FLOAT_EQ(m::ref::dot_q8_0(row.data(), x), 184.0f);
+}

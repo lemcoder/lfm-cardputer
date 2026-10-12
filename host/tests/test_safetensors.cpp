@@ -121,3 +121,20 @@ TEST_F(SafetensorsTest, EmbeddingRowsMatchGolden) {
         }
     }
 }
+
+TEST_F(SafetensorsTest, ToF32ConvertsWholeTensor) {
+    const lfm::io::Tensor* t = st_->find("model.embedding_norm.weight");
+    ASSERT_NE(t, nullptr);
+    const std::vector<float> v = lfm::io::to_f32(*t);
+    ASSERT_EQ(v.size(), t->numel());
+
+    // Expected: each 2-byte BF16 value becomes the top half of a float.
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        uint16_t bf16;
+        std::memcpy(&bf16, t->data.data() + 2 * i, 2);
+        const uint32_t bits = uint32_t{bf16} << 16;
+        float want;
+        std::memcpy(&want, &bits, 4);
+        ASSERT_EQ(v[i], want) << "[" << i << "]";
+    }
+}

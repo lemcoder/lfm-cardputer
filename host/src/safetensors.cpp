@@ -6,9 +6,12 @@
 #include <unistd.h>    // close
 
 #include <cstdint>
+#include <cassert>
 #include <cstring>  // memcpy
 
 #include <nlohmann/json.hpp>
+
+#include "lfm/math/ops.hpp"  // bf16_to_f32
 
 namespace lfm::io {
 
@@ -85,6 +88,15 @@ const Tensor* Safetensors::find(std::string_view name) const {
         if (t.name == name) return &t;
     }
     return nullptr;
+}
+
+std::vector<float> to_f32(const Tensor& t) {
+    assert(t.dtype == "BF16");
+    std::vector<uint16_t> bf16(t.numel());
+    std::memcpy(bf16.data(), t.data.data(), bf16.size() * sizeof(uint16_t));
+    std::vector<float> out(bf16.size());
+    lfm::math::bf16_to_f32(out, bf16);
+    return out;
 }
 
 }  // namespace lfm::io

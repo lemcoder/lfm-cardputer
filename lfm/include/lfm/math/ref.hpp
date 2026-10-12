@@ -47,4 +47,21 @@ void bf16_to_f32(std::span<float> out, std::span<const uint16_t> in);
 // Index of the largest element (first one on ties). Greedy sampling.
 std::size_t argmax(std::span<const float> x);
 
+// ---- scalar conversions
+
+// IEEE half -> float. Handles zeros, subnormals, inf/NaN.
+float f16_to_f32(uint16_t h);
+
+// float -> bf16 with round-to-nearest-even (NaN stays NaN).
+uint16_t f32_to_bf16(float f);
+
+// ---- dot product of one stored weight row with a float vector
+// `row` points at raw file bytes (no alignment assumed); x.size() == cols.
+
+// Row of bf16 values.
+float dot_bf16(const std::byte* row, std::span<const float> x);
+
+// Row of Q8_0 blocks: x.size() / 32 blocks of {f16 scale, int8[32]}.
+float dot_q8_0(const std::byte* row, std::span<const float> x);
+
 }  // namespace lfm::math::ref

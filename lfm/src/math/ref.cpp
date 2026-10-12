@@ -157,4 +157,53 @@ std::size_t argmax(std::span<const float> x) {
   return best;
 }
 
+float f16_to_f32(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t mant = h & 0x3FFu;
+    if (exp == 0) {
+        // Zero or subnormal: value = mant * 2^-24.
+        const float v = static_cast<float>(mant) * 5.9604644775390625e-8f;
+        return sign ? -v : v;
+    }
+    const uint32_t bits = exp == 0x1F ? sign | 0x7F800000u | (mant << 13)       // inf / NaN
+                                      : sign | ((exp + 112) << 23) | (mant << 13);  // rebias 15 -> 127
+    return std::bit_cast<float>(bits);
+}
+
+uint16_t f32_to_bf16(float f) {
+    const uint32_t bits = std::bit_cast<uint32_t>(f);
+    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) return static_cast<uint16_t>((bits >> 16) | 0x40);  // quiet NaN
+    const uint32_t rounding = 0x7FFFu + ((bits >> 16) & 1u);  // to nearest, ties to even
+    return static_cast<uint16_t>((bits + rounding) >> 16);
+}
+
+float dot_bf16(const std::byte* row, std::span<const float> x) {
+    float sum = 0.0f;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        uint16_t h;
+        std::memcpy(&h, row + 2 * i, 2);
+        sum += std::bit_cast<float>(static_cast<uint32_t>(h) << 16) * x[i];
+    }
+    return sum;
+}
+
+float dot_q8_0(const std::byte* row, std::span<const float> x) {
+    assert(x.size() % 32 == 0);
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < x.size() / 32; ++b) {
+        const std::byte* block = row + b * 34;
+        uint16_t scale_bits;
+        std::memcpy(&scale_bits, block, 2);
+        const auto* q = reinterpret_cast<const int8_t*>(block + 2);  // byte types may alias anything
+        const float* xb = x.data() + b * 32;
+        float acc = 0.0f;
+        for (std::size_t i = 0; i < 32; ++i) {
+            acc += static_cast<float>(q[i]) * xb[i];
+        }
+        sum += f16_to_f32(scale_bits) * acc;
+    }
+    return sum;
+}
+
 } // namespace lfm::math::ref

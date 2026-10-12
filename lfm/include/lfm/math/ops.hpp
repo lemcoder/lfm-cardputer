@@ -46,6 +46,10 @@ inline void matvec(std::span<float> out, MatRef w, std::span<const float> x) {
 using ref::add;
 using ref::argmax;
 using ref::bf16_to_f32;
+using ref::dot_bf16;
+using ref::dot_q8_0;
+using ref::f16_to_f32;
+using ref::f32_to_bf16;
 using ref::mul;
 using ref::rmsnorm;
 using ref::rope;

@@ -43,4 +43,8 @@ private:
   std::vector<Tensor> tensors_;
 };
 
-}
+// Whole tensor as float32 (host convenience; weights are loaded once).
+// Supports BF16 only for now: that's all LFM2.5 ships.
+std::vector<float> to_f32(const Tensor &t);
+
+}  // namespace lfm::io

@@ -3,7 +3,24 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <chrono>
+
 namespace lfm {
+
+namespace {
+
+// Adds the lifetime of this object to `total` (seconds).
+class IoTimer {
+public:
+    explicit IoTimer(double& total) : total_(total), t0_(std::chrono::steady_clock::now()) {}
+    ~IoTimer() { total_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count(); }
+
+private:
+    double& total_;
+    std::chrono::steady_clock::time_point t0_;
+};
+
+}  // namespace
 
 FileSource::FileSource(const char* path, Mode mode) {
     fd_ = mode == Mode::Read ? open(path, O_RDONLY) : open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -24,6 +41,7 @@ bool FileSource::seek(uint64_t offset) {
 }
 
 bool FileSource::read_at(uint64_t offset, void* dst, std::size_t n) {
+    IoTimer timer(io_seconds_);
     if (fd_ < 0 || !seek(offset)) return false;
     auto* out = static_cast<unsigned char*>(dst);
     std::size_t done = 0;
@@ -41,6 +59,7 @@ bool FileSource::read_at(uint64_t offset, void* dst, std::size_t n) {
 }
 
 bool FileSource::write_at(uint64_t offset, const void* src, std::size_t n) {
+    IoTimer timer(io_seconds_);
     if (fd_ < 0 || !seek(offset)) return false;
     const auto* in = static_cast<const unsigned char*>(src);
     std::size_t done = 0;

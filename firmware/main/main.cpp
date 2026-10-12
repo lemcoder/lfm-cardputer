@@ -196,7 +196,10 @@ extern "C" void app_main(void) {
             if (next == lfm::kEosId) break;
             next = eng->forward(next, true);
             g_status.sec_per_tok = (esp_timer_get_time() - t_gen) / 1e6f / g_status.tokens;
-            ESP_LOGI(TAG, "token %d: %.1f s/tok avg", g_status.tokens, g_status.sec_per_tok);
+            const double total = (esp_timer_get_time() - t0) / 1e6;
+            ESP_LOGI(TAG, "token %d: %.1f s/tok avg | so far %.1f s: SD wait %.1f s (%.0f%%), compute %.1f s, %.2f MB/s",
+                     g_status.tokens, g_status.sec_per_tok, total, src.io_seconds(),
+                     100.0 * src.io_seconds() / total, total - src.io_seconds(), src.bytes_read() / 1e6 / src.io_seconds());
         }
         if (next == lfm::Engine::kIoError) fatal("SD read error", "check the card");
         set_phase(next == lfm::Engine::kContextFull ? "context full  G0: again" : "done  G0: again");

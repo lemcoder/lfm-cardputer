@@ -33,8 +33,10 @@ public:
     // Mode::ReadWrite only. Writing past the end grows the file.
     bool write_at(uint64_t offset, const void* src, std::size_t n);
 
-    // Total bytes read so far (for throughput stats).
+    // Totals so far, for throughput stats: bytes read, and wall time spent
+    // inside read_at / write_at (waiting on the disk / SD card).
     uint64_t bytes_read() const { return bytes_read_; }
+    double io_seconds() const { return io_seconds_; }
 
 private:
     bool seek(uint64_t offset);
@@ -42,6 +44,7 @@ private:
     int fd_ = -1;
     uint64_t pos_ = 0;
     uint64_t bytes_read_ = 0;
+    double io_seconds_ = 0.0;
 };
 
 }  // namespace lfm

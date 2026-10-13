@@ -27,12 +27,12 @@ struct Case {
 };
 
 constexpr Case kCases[] = {
-    {"53M  p1      ", {3, 1, -1}},  // current setting: reference CRC
-    {"80M  p0      ", {2, 0, -1}},
-    {"80M  p1      ", {2, 1, -1}},
-    {"80M  p2      ", {2, 2, -1}},
-    {"80M  p3      ", {2, 3, -1}},
-    {"53M  p1 again", {3, 1, -1}},  // card still fine afterwards?
+    {"80M  p2      ", {2, 2, -1}},  // current setting: reference CRC
+    {"160M p0      ", {1, 0, 0}},   // divider 1: straight from the 160 MHz PLL, if the generator allows it
+    {"160M p1      ", {1, 1, 0}},
+    {"160M p2      ", {1, 2, 0}},
+    {"160M p3      ", {1, 3, 0}},
+    {"80M  p2 again", {2, 2, -1}},  // card still fine afterwards?
 };
 
 }  // namespace

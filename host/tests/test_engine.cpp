@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -593,4 +594,35 @@ TEST(EngineQ4, LowRankHeadDeviceConfigGeneratesGolden) {
                              .int8_activations = true, .speculative = true}),
               lfm::Status::Ok);
     EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
+}
+
+// ---------------------------------------------------------------- LM head table in (flash) memory
+
+TEST(EngineQ4, FlashHeadAgreesWithFullScan) {
+    const std::string head_path = std::string(LFM_REPO_ROOT) + "/out/lmhead.bin";
+    MODEL_REQUIRED(kQ4LowRank);
+    MODEL_REQUIRED(kQ4Path);
+    std::ifstream hf(head_path, std::ios::binary);
+    if (!hf) GTEST_SKIP() << "uv run tools/flash_head.py";
+    const std::vector<char> head((std::istreambuf_iterator<char>(hf)), {});
+    std::vector<int32_t> text;
+    {
+        std::ifstream f(kEvalPath);
+        for (int32_t id; f >> id;) text.push_back(id);
+    }
+    if (text.size() < 2) GTEST_SKIP();
+
+    lfm::FileSource src_full(kQ4Path.c_str()), src_fh(kQ4LowRank.c_str());
+    lfm::Engine full, fh;
+    const lfm::EngineConfig cfg{.max_ctx = 512, .int8_activations = true};
+    ASSERT_EQ(full.open(src_full, cfg), lfm::Status::Ok);
+    ASSERT_EQ(fh.open(src_fh, cfg), lfm::Status::Ok);
+    ASSERT_TRUE(fh.set_flash_head(head.data(), head.size()));
+    int agree = 0, total = 0;
+    for (std::size_t t = 0; t + 1 < text.size(); ++t) {
+        agree += fh.forward(text[t], true) == full.forward(text[t], true);
+        ++total;
+    }
+    RecordProperty("agreement", std::to_string(static_cast<double>(agree) / total));
+    EXPECT_GE(agree, total * 98 / 100) << agree << " / " << total;
 }

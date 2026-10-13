@@ -271,4 +271,10 @@ float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, s
     return sum;
 }
 
+void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq, const float* xscale,
+                  float* out) {
+    const std::size_t rb = n / 32 * 18;
+    for (std::size_t r = 0; r < n_rows; ++r) out[r] = dot_q4_0_q8(rows + r * rb, xq, xscale, n);
+}
+
 } // namespace lfm::math::ref

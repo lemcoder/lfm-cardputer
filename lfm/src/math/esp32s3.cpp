@@ -8,6 +8,7 @@
 extern "C" {
 void lfm_s3_q4_q8_sums(const std::byte* row, const int8_t* xq, int32_t* sums, int nb);
 void lfm_s3_q8_q8_sums(const std::byte* row, const int8_t* xq, int32_t* sums, int nb);
+void lfm_s3_q4_q8_rows(const std::byte* blocks, const int8_t* xq, int32_t* sums, int rows, int nb);
 }
 
 namespace lfm::math::esp32s3 {
@@ -53,6 +54,20 @@ float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, s
     int32_t sums[kMaxBlocks];
     lfm_s3_q4_q8_sums(row, xq, sums, static_cast<int>(nb));
     return combine(row, 18, xscale, sums, nb);
+}
+
+void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq, const float* xscale,
+                  float* out) {
+    const std::size_t nb = n / 32;
+    assert(nb <= 8 && (reinterpret_cast<uintptr_t>(xq) & 15) == 0);
+    constexpr std::size_t kChunk = 64;  // rows per kernel call
+    int32_t sums[kChunk * 8];
+    for (std::size_t r0 = 0; r0 < n_rows; r0 += kChunk) {
+        const std::size_t cnt = n_rows - r0 < kChunk ? n_rows - r0 : kChunk;
+        const std::byte* base = rows + r0 * nb * 18;
+        lfm_s3_q4_q8_rows(base, xq, sums, static_cast<int>(cnt), static_cast<int>(nb));
+        for (std::size_t r = 0; r < cnt; ++r) out[r0 + r] = combine(base + r * nb * 18, 18, xscale, sums + r * nb, nb);
+    }
 }
 
 }  // namespace lfm::math::esp32s3

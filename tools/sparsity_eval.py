@@ -142,6 +142,38 @@ def lowrank_eval(model, ids, device):
                     print(f"{name:>6} {r:4d} {S:5d} {hit:7.1%} {mb:6.2f}")
 
 
+# ------------------------------------------------------------------ D. flash-sized shortlist
+
+def flash_head_eval(model, ids, device):
+    """Smaller low-rank tables (to fit the internal flash) with longer shortlists."""
+    V = torch.from_numpy(np.load(ROOT / "out" / "lm_basis.npy")).to(device)   # [1024, 256], ordered
+    with torch.no_grad():
+        E = model.model.embed_tokens.weight
+        h = model.model(ids).last_hidden_state[0]
+        truth = (h @ E.T).argmax(1)
+
+        def q8(t):
+            sc = t.abs().amax(1, keepdim=True) / 127
+            return (t / sc).round().clamp(-127, 127) * sc
+
+        def q4(t):  # Q4_0 blocks of 32
+            b = t.reshape(t.shape[0], -1, 32)
+            sc = b.abs().amax(-1, keepdim=True) / 7.5
+            return ((b / sc).round().clamp(-8, 7) * sc).reshape(t.shape)
+
+        print(f"\nD. flash-sized low-rank shortlist ({h.shape[0]} positions)")
+        print(f"{'rank':>5} {'quant':>5} {'MB':>6} {'S':>5} {'hit':>7}")
+        for r in (64, 96, 128):
+            Vr = V[:, :r]
+            T = E @ Vr
+            for name, fn, bpe in (("q8", q8, 1 + 2 / 32), ("q4", q4, 0.5 + 2 / 32)):
+                approx = (h @ Vr) @ fn(T).T
+                rank = (approx.argsort(1, descending=True) == truth.unsqueeze(1)).float().argmax(1)
+                mb = E.shape[0] * r * bpe / 1e6
+                for S in (256, 512, 1024, 2048):
+                    print(f"{r:5d} {name:>5} {mb:6.2f} {S:5d} {(rank < S).float().mean().item():7.1%}")
+
+
 # ------------------------------------------------------------------ B. MLP sparsity
 
 def keep_blocks(t: torch.Tensor, keep: float) -> torch.Tensor:
@@ -201,11 +233,15 @@ def main():
     ap.add_argument("--skip-head", action="store_true")
     ap.add_argument("--skip-mlp", action="store_true")
     ap.add_argument("--lowrank", action="store_true", help="only part C")
+    ap.add_argument("--flashhead", action="store_true", help="only part D")
     args = ap.parse_args()
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     model, ids = load(device)
     if args.lowrank:
         lowrank_eval(model, ids, device)
+        return
+    if args.flashhead:
+        flash_head_eval(model, ids, device)
         return
     if not args.skip_head:
         lm_head_eval(model, ids, device)

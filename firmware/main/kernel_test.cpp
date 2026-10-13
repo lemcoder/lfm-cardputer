@@ -1,5 +1,6 @@
 #include "kernel_test.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -86,7 +87,68 @@ bool kernel_test(PrintFn print) {
             ESP_LOGI(TAG, "%s", line);
         }
     }
+    // Row scan (LM head table): many 4-block rows against one activation.
+    {
+        constexpr std::size_t kRows = 1000, kCols = 128, kRb = kCols / 32 * 18;
+        auto* table = static_cast<std::byte*>(heap_caps_malloc(kRows * kRb + 32, MALLOC_CAP_8BIT));
+        esp_fill_random(table, kRows * kRb);
+        for (std::size_t b = 0; b < kRows * kCols / 32; ++b) {
+            const uint16_t sc = static_cast<uint16_t>(0x2000 + (esp_random() & 0x0FFF));
+            std::memcpy(table + b * 18, &sc, 2);
+        }
+        esp_fill_random(xq, kCols);
+        static float pie_out[kRows], ref_out[kRows];
+        const uint32_t t0 = esp_cpu_get_cycle_count();
+        m::esp32s3::scan_q4_0_q8(table, kRows, kCols, xq, xs, pie_out);
+        const uint32_t cyc = esp_cpu_get_cycle_count() - t0;
+        m::ref::scan_q4_0_q8(table, kRows, kCols, xq, xs, ref_out);
+        int bad = 0;
+        for (std::size_t r = 0; r < kRows; ++r) bad += pie_out[r] != ref_out[r];
+        all_ok = all_ok && bad == 0;
+        std::snprintf(line, sizeof(line), "scan q4 rows=%u %s, %lu cyc/row", (unsigned)kRows, bad ? "BAD" : "OK",
+                      (unsigned long)(cyc / kRows));
+        print(line);
+        ESP_LOGI(TAG, "%s", line);
+        heap_caps_free(table);
+    }
     heap_caps_free(raw);
     heap_caps_free(xq);
     return all_ok;
+}
+
+#include "esp_partition.h"
+#include "esp_timer.h"
+#include "lfm/format.hpp"
+
+// Flash table scan: memory bandwidth vs compute (one position).
+void flash_scan_bench(PrintFn print) {
+    const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "lmhead");
+    const void* ptr = nullptr;
+    esp_partition_mmap_handle_t h;
+    if (part == nullptr || esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA, &ptr, &h) != ESP_OK) return;
+    lfm::FlashHeadHeader fh;
+    std::memcpy(&fh, ptr, sizeof(fh));
+    const auto* table = static_cast<const std::byte*>(ptr) + fh.table_offset;
+    const std::size_t rb = fh.rank / 32 * 18, bytes = static_cast<std::size_t>(fh.vocab) * rb;
+    char line[96];
+
+    int64_t t0 = esp_timer_get_time();
+    uint32_t acc = 0;
+    const auto* w = reinterpret_cast<const uint32_t*>(table);
+    for (std::size_t i = 0; i < bytes / 4; i += 8) acc += w[i];  // one load per 32-byte cache line
+    const double read_s = (esp_timer_get_time() - t0) / 1e6;
+
+    auto* xq = static_cast<int8_t*>(heap_caps_aligned_alloc(16, fh.rank, MALLOC_CAP_8BIT));
+    float xs[16];
+    for (std::size_t i = 0; i < fh.rank; ++i) xq[i] = static_cast<int8_t>(i);
+    for (float& f : xs) f = 0.01f;
+    t0 = esp_timer_get_time();
+    float best = -1e30f;
+    for (uint32_t v = 0; v < fh.vocab; ++v) best = std::max(best, m::esp32s3::dot_q4_0_q8(table + v * rb, xq, xs, fh.rank));
+    const double scan_s = (esp_timer_get_time() - t0) / 1e6;
+    std::snprintf(line, sizeof(line), "flash: read %.2f MB in %.3f s (%.1f MB/s), scan 1 pos %.3f s [%u %.0f]",
+                  bytes / 1e6, read_s, bytes / 1e6 / read_s, scan_s, (unsigned)acc, best);
+    print(line);
+    ESP_LOGI(TAG, "%s", line);
+    heap_caps_free(xq);
 }

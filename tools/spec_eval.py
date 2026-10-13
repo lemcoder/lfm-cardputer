@@ -64,8 +64,8 @@ def tokenize_corpus(tok: Tokenizer, split: str, limit_mb: int) -> np.ndarray:
     return arr
 
 
-def top_next(keys: np.ndarray, nxt: np.ndarray):
-    """For each distinct key: most frequent next token and its count."""
+def top_next(keys: np.ndarray, nxt: np.ndarray, with_prob: bool = False):
+    """For each distinct key: most frequent next token and its count (and its share of the key's count)."""
     pair = (keys.astype(np.uint64) << np.uint64(17)) | nxt.astype(np.uint64)
     uniq, counts = np.unique(pair, return_counts=True)
     k = (uniq >> np.uint64(17)).astype(np.uint64)
@@ -74,7 +74,11 @@ def top_next(keys: np.ndarray, nxt: np.ndarray):
     k, v, counts = k[order], v[order], counts[order]
     first = np.ones(len(k), dtype=bool)
     first[1:] = k[1:] != k[:-1]
-    return k[first], v[first], counts[first]
+    if not with_prob:
+        return k[first], v[first], counts[first]
+    group = np.cumsum(first) - 1
+    totals = np.bincount(group, weights=counts)
+    return k[first], v[first], counts[first], counts[first] / totals
 
 
 def build_ngram(corpus: np.ndarray, budget_mb: float):
@@ -86,18 +90,56 @@ def build_ngram(corpus: np.ndarray, budget_mb: float):
     bigram[bk.astype(np.int64)] = bv
     # trigram: keep the contexts with the most top-1 hits that fit the budget
     ok3 = (c[:-2] >= 0) & (c[1:-1] >= 0) & (c[2:] >= 0)
-    tk, tv, tc = top_next((c[:-2] * 65536 + c[1:-1])[ok3], c[2:][ok3])
+    tk, tv, tc, tp = top_next((c[:-2] * 65536 + c[1:-1])[ok3], c[2:][ok3], with_prob=True)
     budget = int((budget_mb * 1e6 - 65536 * 2) / TRI_ENTRY_BYTES)
     keep = np.argsort(-tc)[:budget]
     trigram = dict(zip(tk[keep].tolist(), tv[keep].tolist()))
+    global TRI_PROB, BI_PROB
+    TRI_PROB = dict(zip(tk[keep].tolist(), tp[keep].tolist()))
+    global TRI_COUNT
+    TRI_COUNT = dict(zip(tk[keep].tolist(), tc[keep].tolist()))
+    _, _, _, bp = top_next(c[:-1][ok2], c[1:][ok2], with_prob=True)
+    BI_PROB = np.zeros(65536)
+    BI_PROB[bk.astype(np.int64)] = bp
     return bigram, trigram
 
 
-def write_table(path: Path, bigram: np.ndarray, trigram: dict, load: float = 0.6) -> None:
-    """Binary table read by lfm::Drafter (layout in lfm/include/lfm/draft.hpp)."""
+TRI_PROB: dict = {}
+TRI_COUNT: dict = {}
+BI_PROB = np.zeros(65536)
+
+
+def draft_confident(ctx, k, bigram, trigram, min_tri: float, min_bi: float) -> list[int]:
+    """Like draft_ngram, but stop at the first prediction below the confidence threshold."""
+    out, c = [], list(ctx[-2:])
+    for _ in range(k):
+        key = c[-2] * 65536 + c[-1] if len(c) >= 2 else -1
+        d = trigram.get(key, -1)
+        if d >= 0:
+            if TRI_PROB.get(key, 0) < min_tri:
+                break
+        else:
+            d = int(bigram[c[-1]])
+            if d < 0 or BI_PROB[c[-1]] < min_bi:
+                break
+        out.append(d)
+        c.append(d)
+    return out
+
+
+def write_table(path: Path, bigram: np.ndarray, trigram: dict, max_bytes: int = 0x140000, max_load: float = 0.75) -> None:
+    """Binary table read by lfm::Drafter (layout in lfm/include/lfm/draft.hpp).
+
+    Sized to fit the flash partition: the largest power-of-two slot count
+    that fits, and at most max_load of it filled (the most frequent trigrams).
+    """
+    fixed = 24 + 65536 * 2
     slots = 1
-    while slots * load < len(trigram):
+    while fixed + slots * 2 * 8 <= max_bytes:
         slots *= 2
+    if len(trigram) > slots * max_load:
+        keep = sorted(trigram, key=lambda k: -TRI_COUNT.get(k, 0))[: int(slots * max_load)]
+        trigram = {k: trigram[k] for k in keep}
     bits = slots.bit_length() - 1
     keys = np.zeros(slots, dtype="<u4")
     nexts = np.full(slots, 0xFFFF, dtype="<u2")
@@ -141,12 +183,13 @@ def draft_lookup(ctx: list[int], k: int, n: int = 2) -> list[int]:
     return []
 
 
-def simulate(seqs, prompt_lens, draft_fn, k: int):
-    passes = tokens = 0
+def simulate(seqs, prompt_lens, draft_fn, k: int, stats=None):
+    passes = tokens = drafted = 0
     for s, p in zip(seqs, prompt_lens):
         i = p
         while i < len(s):
             drafts = draft_fn(s[:i], k)
+            drafted += len(drafts)
             acc = 0
             while acc < len(drafts) and i + acc < len(s) and drafts[acc] == s[i + acc]:
                 acc += 1
@@ -154,7 +197,15 @@ def simulate(seqs, prompt_lens, draft_fn, k: int):
             tokens += step
             passes += 1
             i += step
+    if stats is not None:
+        stats.update(passes=passes, tokens=tokens, drafted=drafted)
     return tokens / passes
+
+
+# Device cost model, measured (docs/experiments.md): a pass costs ~12.75 s
+# plus ~0.32 s per draft verified alongside.
+def device_s_per_tok(st):
+    return (12.75 * st["passes"] + 0.32 * st["drafted"]) / st["tokens"]
 
 
 # Clean, held-out prompts (not WikiText: its pre-tokenized artifacts would
@@ -247,6 +298,14 @@ def main():
         row2 = " ".join(f"{simulate(seqs, plens, both, k):6.2f}" for k in (1, 2, 3))
         print(f"{f'ngram {mb} MB ({len(trigram) / 1e3:.0f}K tri)':<26} {row}")
         print(f"{f'lookup, else ngram {mb} MB':<26} {row2}   [{time.time() - t0:.0f} s]")
+        print(f"   confident drafts (lookup else n-gram above thresholds), modelled device s/token:")
+        for k in (2, 3):
+            for mt, mb_ in ((0, 0), (0.2, 0.3), (0.3, 0.5), (0.4, 0.6), (0.5, 0.7), (0.6, 0.8)):
+                fn = lambda ctx, kk, mt=mt, mb_=mb_: draft_lookup(ctx, kk) or draft_confident(ctx, kk, bigram, trigram, mt, mb_)
+                st = {}
+                tpp = simulate(seqs, plens, fn, k, st)
+                print(f"   k={k} min_tri={mt:.1f} min_bi={mb_:.1f}: {tpp:.2f} tok/pass, "
+                      f"{st['drafted'] / st['passes']:.2f} drafts/pass -> {device_s_per_tok(st):.2f} s/token")
 
 
 if __name__ == "__main__":

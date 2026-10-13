@@ -82,4 +82,9 @@ float dot_q8_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, s
 // Q4_0 weight row (18-byte blocks) . quantized activation.
 float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n);
 
+// rows Q4_0 rows of n columns, stored back to back, each dotted with the
+// same quantized activation: out[r]. (An LM head table scan.)
+void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq, const float* xscale,
+                  float* out);
+
 }  // namespace lfm::math::ref

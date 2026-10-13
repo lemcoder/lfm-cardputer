@@ -17,8 +17,11 @@ namespace lfm::math::esp32s3 {
 // aligned and up to 16 bytes past the row may be read.
 float dot_q8_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n);
 float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n);
+void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq, const float* xscale,
+                  float* out);
 
 }  // namespace lfm::math::esp32s3
 
 #define LFM_ESP32S3_HAS_DOT_Q8_Q8 1
 #define LFM_ESP32S3_HAS_DOT_Q4_Q8 1
+#define LFM_ESP32S3_HAS_SCAN_Q4_Q8 1

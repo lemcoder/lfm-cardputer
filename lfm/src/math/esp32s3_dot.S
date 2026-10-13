@@ -79,3 +79,51 @@ lfm_s3_q8_q8_sums:
 .Lq8_end:
     retw.n
     .size   lfm_s3_q8_q8_sums, . - lfm_s3_q8_q8_sums
+
+// void lfm_s3_q4_q8_rows(const uint8_t* blocks, const int8_t* xq, int32_t* sums, int rows, int nb)
+//
+// Many short Q4_0 rows (nb blocks each, stored back to back, e.g. a [vocab, 128]
+// table) against one activation vector of nb*32 int8: sums[r*nb + b]. One call
+// for a whole chunk of rows instead of one per row, whose fixed cost dominated
+// for 4-block rows.
+    .align  4
+    .global lfm_s3_q4_q8_rows
+    .type   lfm_s3_q4_q8_rows, @function
+lfm_s3_q4_q8_rows:
+    entry   a1, 32
+    movi    a9, 0x0F
+    s8i     a9, a1, 0
+    movi    a9, 8
+    s8i     a9, a1, 1
+    mov     a10, a1
+    ee.vldbc.8.ip   q7, a10, 1
+    ee.vldbc.8.ip   q6, a10, 0
+    ssai    4
+.Lrows_row:
+    beqz    a5, .Lrows_end
+    mov     a7, a3                      // activations restart for every row
+    loopnez a6, .Lrows_blk_end
+        addi    a8, a2, 2
+        ee.ld.128.usar.ip   q0, a8, 16
+        ee.vld.128.ip       q1, a8, 0
+        ee.src.q            q0, q0, q1
+        ee.andq             q1, q0, q7
+        ee.vsr.32           q2, q0
+        ee.andq             q2, q2, q7
+        ee.vsubs.s8         q1, q1, q6
+        ee.vsubs.s8         q2, q2, q6
+        ee.vld.128.ip       q3, a7, 16
+        ee.vld.128.ip       q4, a7, 16
+        ee.zero.accx
+        ee.vmulas.s8.accx   q1, q3
+        ee.vmulas.s8.accx   q2, q4
+        rur.accx_0          a9
+        s32i    a9, a4, 0
+        addi    a4, a4, 4
+        addi    a2, a2, 18
+.Lrows_blk_end:
+    addi    a5, a5, -1
+    j       .Lrows_row
+.Lrows_end:
+    retw.n
+    .size   lfm_s3_q4_q8_rows, . - lfm_s3_q4_q8_rows

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
@@ -360,8 +361,217 @@ bool Engine::matvec(const Ptrs& out, std::size_t rows, uint64_t offset, Dtype dt
 // and only its top `lm_head_candidates` are re-scored with the exact rows:
 // same top-1 (unless the true winner falls outside the shortlist), about half
 // the bytes. With `logits` requested, the exact full scan is used.
+bool Engine::set_flash_head(const void* data, std::size_t size) {
+    fh_proj_ = fh_table_ = nullptr;
+    if (data == nullptr || size < sizeof(FlashHeadHeader)) return false;
+    std::memcpy(&fh_, data, sizeof(fh_));
+    const bool ok = std::memcmp(fh_.magic, kFlashHeadMagic, sizeof(kFlashHeadMagic)) == 0 && fh_.version == 2 &&
+                    fh_.vocab == h_.vocab && fh_.dim == h_.dim && fh_.rank % 32 == 0 &&
+                    fh_.rank <= kTopKOffset && fh_.candidates >= 1 && fh_.candidates <= kMaxCandidates &&
+                    is_matrix_dtype(fh_.proj_dtype) && is_matrix_dtype(fh_.table_dtype) &&
+                    fh_.proj_offset + fh_.rank * row_bytes(fh_.proj_dtype, fh_.dim) <= size &&
+                    fh_.table_offset + static_cast<uint64_t>(fh_.vocab) * row_bytes(fh_.table_dtype, fh_.rank) <= size &&
+                    (fh_.cache_rows == 0 ||
+                     (fh_.cache_dtype == h_.embed_dtype && fh_.cache_rows <= fh_.vocab &&
+                      fh_.cache_offset + static_cast<uint64_t>(fh_.cache_rows) * row_bytes(fh_.cache_dtype, fh_.dim) <= size));
+    if (!ok) return false;
+    fh_cache_ = fh_.cache_rows > 0 ? static_cast<const std::byte*>(data) + fh_.cache_offset : nullptr;
+    fh_proj_ = static_cast<const std::byte*>(data) + fh_.proj_offset;
+    fh_table_ = static_cast<const std::byte*>(data) + fh_.table_offset;
+    return true;
+}
+
+// Integer path helpers shared by the LM head variants.
+void Engine::quantize_inputs(const Ptrs& in, int n, std::size_t cols) {
+    for (int b = 0; b < n; ++b) m::quantize_q8({in.p[b], cols}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
+}
+
+float Engine::score_row(int b, Dtype dt, const std::byte* row, const float* in, std::size_t cols) const {
+    const int8_t* q = xq_ + b * xq_cols_;
+    const float* sc = xs_ + b * (xq_cols_ / 32);
+    if (xq_ != nullptr && dt == Dtype::Q8_0) return m::dot_q8_0_q8(row, q, sc, cols);
+    if (xq_ != nullptr && dt == Dtype::Q4_0) return m::dot_q4_0_q8(row, q, sc, cols);
+    return dot_row(dt, row, {in, cols});
+}
+
+// Exact re-score of the shortlists ids[b][0..count[b]) from the embedding.
+// The lists are merged into one ascending, de-duplicated list (in io2_, idle
+// during the LM head); every row read is scored for every token, so each
+// token takes the best over the union. Nearby rows are fetched together in
+// one sector-aligned read: a separate small read costs ~0.5 ms (rows straddle
+// 512-byte sectors), about the same as reading 4 KB more. xs must be quantized.
+bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out) {
+    const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
+    constexpr uint64_t kSector = 512;
+    constexpr uint64_t kMaxGap = 4096;  // bytes worth reading through instead of a new command (16 KB measured worse)
+
+    // Sort each list, then merge into the union.
+    int head[kMaxBatch] = {};
+    for (int b = 0; b < n; ++b) {
+        int32_t* id = ids[b];
+        for (int i = 1; i < count[b]; ++i) {
+            const int32_t v = id[i];
+            int j = i;
+            for (; j > 0 && id[j - 1] > v; --j) id[j] = id[j - 1];
+            id[j] = v;
+        }
+    }
+    auto* uni = reinterpret_cast<int32_t*>(io2_ != io_ ? io2_ : carry_);
+    const int cap = static_cast<int>((io2_ != io_ ? cfg_.io_bytes : row_bytes(Dtype::BF16, h_.ff_dim)) / sizeof(int32_t));
+    int n_uni = 0;
+    while (n_uni < cap) {
+        int32_t next = INT32_MAX;
+        for (int b = 0; b < n; ++b) {
+            if (head[b] < count[b] && ids[b][head[b]] < next) next = ids[b][head[b]];
+        }
+        if (next == INT32_MAX) break;
+        for (int b = 0; b < n; ++b) {
+            if (head[b] < count[b] && ids[b][head[b]] == next) ++head[b];
+        }
+        uni[n_uni++] = next;
+    }
+
+    float best[kMaxBatch];
+    for (int b = 0; b < n; ++b) {
+        best[b] = -INFINITY;
+        out[b] = n_uni > 0 ? uni[0] : 0;
+    }
+    auto row_off = [&](int32_t id) { return h_.embed + static_cast<uint64_t>(id) * erb; };
+    auto score_all = [&](const std::byte* row, int32_t id) {
+        for (int b = 0; b < n; ++b) {
+            const float v = score_row(b, h_.embed_dtype, row, xs.p[b], h_.dim);
+            if (v > best[b]) {  // ascending ids: strict > keeps the lowest id on ties
+                best[b] = v;
+                out[b] = id;
+            }
+        }
+    };
+    int i = 0;
+    // Frequent tokens: exact rows cached in the flash head, no SD read.
+    for (; i < n_uni && fh_cache_ != nullptr && static_cast<uint32_t>(uni[i]) < fh_.cache_rows; ++i) {
+        score_all(fh_cache_ + static_cast<std::size_t>(uni[i]) * erb, uni[i]);
+    }
+    while (i < n_uni) {
+        // Span [start, end): sector-aligned, as many following rows as fit
+        // in io_ without a gap over kMaxGap.
+        const uint64_t start = row_off(uni[i]) / kSector * kSector;
+        uint64_t end = (row_off(uni[i]) + erb + kSector - 1) / kSector * kSector;
+        int j = i + 1;
+        for (; j < n_uni; ++j) {
+            const uint64_t e = (row_off(uni[j]) + erb + kSector - 1) / kSector * kSector;
+            if (e - start > cfg_.io_bytes || row_off(uni[j]) > end + kMaxGap) break;
+            end = e;
+        }
+        if (!src_->read_at(start, io_, static_cast<std::size_t>(end - start))) return false;
+        ++stats_.rescore_reads;
+        for (; i < j; ++i) score_all(io_ + (row_off(uni[i]) - start), uni[i]);
+    }
+    return true;
+}
+
+// Top-k of (score, id) as a min-heap: the root is the worst kept entry, so a
+// new candidate costs one compare, and an insert O(log k). (A sorted array
+// cost ~0.13 s per 65536-row scan at k = 1024.) Lower score is worse; on equal
+// scores the higher id is worse, so ties keep the lower id, like argmax.
+// The result is unordered: callers sort ids or take the single best.
+static inline bool topk_worse(float a, int32_t ai, float b, int32_t bi) { return a < b || (a == b && ai > bi); }
+
+static inline void topk_insert(float* hs, int32_t* hi, int& size, int k, float v, int32_t id) {
+    int i;
+    if (size < k) {
+        i = size++;
+        while (i > 0) {  // sift up
+            const int p = (i - 1) / 2;
+            if (!topk_worse(v, id, hs[p], hi[p])) break;
+            hs[i] = hs[p];
+            hi[i] = hi[p];
+            i = p;
+        }
+    } else {
+        if (!topk_worse(hs[0], hi[0], v, id)) return;  // not better than the worst kept
+        i = 0;
+        while (true) {  // sift down from the root
+            int c = 2 * i + 1;
+            if (c >= size) break;
+            if (c + 1 < size && topk_worse(hs[c + 1], hi[c + 1], hs[c], hi[c])) ++c;
+            if (!topk_worse(hs[c], hi[c], v, id)) break;
+            hs[i] = hs[c];
+            hi[i] = hi[c];
+            i = c;
+        }
+    }
+    hs[i] = v;
+    hi[i] = id;
+}
+
+// LM head from the memory-mapped flash table: no SD reads except the
+// exact re-score of the shortlist.
+bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out) {
+    const std::size_t rank = fh_.rank;
+    const std::size_t prb = row_bytes(fh_.proj_dtype, h_.dim);
+    const std::size_t trb = row_bytes(fh_.table_dtype, rank);
+    const int k = static_cast<int>(fh_.candidates);
+
+    const auto t_scan = std::chrono::steady_clock::now();
+    Ptrs z = slots(0);  // z at the start of each token's slot, top-k after kTopKOffset
+    if (xq_ != nullptr) quantize_inputs(xs, n, h_.dim);
+    for (std::size_t r = 0; r < rank; ++r) {
+        const std::byte* row = fh_proj_ + r * prb;
+        for (int b = 0; b < n; ++b) z.p[b][r] = score_row(b, fh_.proj_dtype, row, xs.p[b], h_.dim);
+    }
+
+    float* ts[kMaxBatch];
+    int32_t* ti[kMaxBatch];
+    int n_top[kMaxBatch] = {};
+    for (int b = 0; b < n; ++b) {
+        ts[b] = slots_[b] + kTopKOffset;
+        ti[b] = reinterpret_cast<int32_t*>(slots_[b] + kTopKOffset + kMaxCandidates);
+    }
+    const auto t_proj_done = std::chrono::steady_clock::now();
+    stats_.flash_proj_s += std::chrono::duration<double>(t_proj_done - t_scan).count();
+    double topk_s = 0;
+    if (xq_ != nullptr) quantize_inputs(z, n, rank);
+    if (xq_ != nullptr && fh_.table_dtype == Dtype::Q4_0) {
+        // Chunks of rows through the scan kernel (one call per chunk, not per row).
+        constexpr std::size_t kChunk = 256;
+        float scores[kChunk];
+        for (uint32_t v0 = 0; v0 < h_.vocab; v0 += kChunk) {
+            const std::size_t cnt = std::min<std::size_t>(kChunk, h_.vocab - v0);
+            for (int b = 0; b < n; ++b) {
+                m::scan_q4_0_q8(fh_table_ + static_cast<std::size_t>(v0) * trb, cnt, rank, xq_ + b * xq_cols_,
+                                xs_ + b * (xq_cols_ / 32), scores);
+                const auto tk = std::chrono::steady_clock::now();
+                for (std::size_t r = 0; r < cnt; ++r) {
+                    topk_insert(ts[b], ti[b], n_top[b], k, scores[r], static_cast<int32_t>(v0 + r));
+                }
+                topk_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tk).count();
+            }
+        }
+    } else {
+        for (uint32_t v = 0; v < h_.vocab; ++v) {
+            const std::byte* row = fh_table_ + static_cast<std::size_t>(v) * trb;
+            for (int b = 0; b < n; ++b) {
+                topk_insert(ts[b], ti[b], n_top[b], k, score_row(b, fh_.table_dtype, row, z.p[b], rank),
+                            static_cast<int32_t>(v));
+            }
+        }
+    }
+    stats_.flash_scan_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_scan).count();
+    stats_.topk_s += topk_s;
+    if (xq_ != nullptr) quantize_inputs(xs, n, h_.dim);
+    return rescore(xs, n, ti, n_top, out);
+}
+
 bool Engine::lm_head(const Ptrs& xs, int n, int32_t* out, float* logits) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = lm_head_impl(xs, n, out, logits);
+    stats_.lm_head_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return ok;
+}
+
+bool Engine::lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits) {
     assert(n >= 1 && n <= cfg_.max_batch && (logits == nullptr || n == 1));
+    if (fh_table_ != nullptr && logits == nullptr) return lm_head_flash(xs, n, out);
     const bool shortlist = h_.lm_head != 0 && logits == nullptr;
     const bool lowrank = shortlist && h_.lm_rank > 0;
     const Dtype scan_dt = shortlist ? h_.lm_head_dtype : h_.embed_dtype;
@@ -698,6 +908,10 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
 
     for (int i = 0; i < static_cast<int>(h_.n_layers); ++i) {
         const LayerOffsets& L = h_.layers[i];
+        if (cfg_.skip_layers & (1u << i)) {
+            progress(i + 1);
+            continue;
+        }
 
         // h = x + op(operator_norm(x))
         if (!norm_all(L.operator_norm)) return kIoError;

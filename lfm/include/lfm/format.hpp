@@ -106,4 +106,32 @@ static_assert(sizeof(LayerOffsets) == kNumLayerFields * 8);
 static_assert(offsetof(FileHeader, embed) == 128, "must match export.py HEADER_HEAD");
 static_assert(sizeof(FileHeader) == 160 + kMaxLayers * (sizeof(LayerOffsets) + 16) + 32, "must match export.py HEADER_SIZE");
 
+// LM head shortlist table for memory-mapped storage (the ESP32's internal
+// flash), written by tools/flash_head.py. The engine scores every vocab row
+// approximately from it (no SD reads) and re-scores the top `candidates`
+// exactly from the .lfm embedding:
+//   z = proj . h                (proj: [rank, dim], proj_dtype)
+//   approx logit[v] = table row v . z   (table: [vocab, rank], table_dtype)
+struct FlashHeadHeader {
+    char magic[8];          // "LFMHEAD\0"
+    uint32_t version;       // 1
+    uint32_t vocab;
+    uint32_t dim;
+    uint32_t rank;
+    uint32_t candidates;
+    Dtype proj_dtype;
+    Dtype table_dtype;
+    uint32_t reserved;
+    uint64_t proj_offset;   // from the start of the header
+    uint64_t table_offset;
+    // v2: exact embedding rows of tokens 0 .. cache_rows-1 (the most frequent:
+    // the vocab is frequency-ordered), byte-identical to the .lfm embedding,
+    // so the re-score can skip the SD card for them.
+    uint64_t cache_offset;
+    uint32_t cache_rows;
+    Dtype cache_dtype;
+};
+static_assert(sizeof(FlashHeadHeader) == 72);
+inline constexpr char kFlashHeadMagic[8] = {'L', 'F', 'M', 'H', 'E', 'A', 'D', '\0'};
+
 }  // namespace lfm

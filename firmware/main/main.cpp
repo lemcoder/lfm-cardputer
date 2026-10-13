@@ -8,8 +8,9 @@
 //   /cstate.bin    created at boot: the conv layers' state (frees 64 KB of RAM)
 //   /cfg.txt       optional experiment knobs, key=value per line (RunConfig)
 //
-// Flash partition "weights": the n-gram draft table (tools/flash_ngram.sh).
-// Without it, speculative decoding still runs with prompt-lookup drafts.
+// Flash partitions (tools/flash_part.sh), both optional:
+//   ngram   the speculative-decoding n-gram draft table (else lookup drafts only)
+//   lmhead  the LM head shortlist table (else the .lfm file's LM head, from SD)
 //
 // No card reader? `uv run tools/upload.py` sends the files over the USB cable
 // (the firmware listens for it for 1.5 s after boot, or until it arrives if
@@ -164,6 +165,7 @@ struct RunConfig {
     int ignore_eos = 0;   // keep generating past EOS (with gen > 0)
     int progress = 1;     // LCD progress bar per layer
     int runs = 1;         // run the prompt this many times without waiting for G0
+    int flash_head = 1;   // use the LM head table in flash (if flashed)
 };
 
 RunConfig read_run_config() {
@@ -181,6 +183,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "ignore_eos")) rc.ignore_eos = value;
         else if (!std::strcmp(key, "progress")) rc.progress = value;
         else if (!std::strcmp(key, "runs")) rc.runs = value;
+        else if (!std::strcmp(key, "flash_head")) rc.flash_head = value;
     }
     std::fclose(f);
     return rc;
@@ -219,6 +222,7 @@ extern "C" void app_main(void) {
     if (kKernelTest) {
         set_phase("SIMD kernel test");
         vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log after flashing
+        flash_scan_bench([](const char* line) { lcd.println(line); });
         const bool ok = kernel_test([](const char* line) { lcd.println(line); });
         set_phase(ok ? "SIMD kernels OK" : "SIMD kernels MISMATCH");
         while (true) vTaskDelay(pdMS_TO_TICKS(1000));
@@ -297,15 +301,23 @@ extern "C" void app_main(void) {
     // n-gram table memory-mapped from flash (if flashed).
     static int32_t draft_hist[kMaxCtx];
     static lfm::Drafter drafter(draft_hist, kMaxCtx);
-    if (const esp_partition_t* part = esp_partition_find_first(
-            ESP_PARTITION_TYPE_DATA, static_cast<esp_partition_subtype_t>(0x40), "weights")) {
-        const void* table = nullptr;
+    auto map_partition = [](const char* name, std::size_t* size) -> const void* {
+        const esp_partition_t* part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, name);
+        const void* ptr = nullptr;
         esp_partition_mmap_handle_t handle;
-        if (esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA, &table, &handle) == ESP_OK) {
-            const bool ok = drafter.set_ngram(table, part->size);
-            ESP_LOGI(TAG, "n-gram draft table: %s", ok ? "loaded from flash" : "not flashed (lookup only)");
+        if (part == nullptr || esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA, &ptr, &handle) != ESP_OK) {
+            return nullptr;
         }
-    }
+        *size = part->size;
+        return ptr;
+    };
+    std::size_t ngram_size = 0, head_size = 0;
+    const void* ngram = map_partition("ngram", &ngram_size);
+    const bool ngram_ok = drafter.set_ngram(ngram, ngram_size);
+    ESP_LOGI(TAG, "n-gram draft table: %s", ngram_ok ? "loaded from flash" : "not flashed (lookup only)");
+    const void* head = map_partition("lmhead", &head_size);
+    const bool head_ok = rc.flash_head && eng->set_flash_head(head, head_size);
+    ESP_LOGI(TAG, "LM head table: %s", head_ok ? "from flash" : "from the SD card");
     const int max_draft = rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
 
     for (int run = 0;; ++run) {
@@ -319,6 +331,10 @@ extern "C" void app_main(void) {
         int64_t t0 = esp_timer_get_time();
         const double sd0 = src.sd_busy_seconds(), stall0 = src.stall_seconds();
         const uint64_t read0 = src.bytes_read();
+        const double head0 = eng->stats().lm_head_s;
+        const long rescore0 = eng->stats().rescore_reads;
+        const double scan0 = eng->stats().flash_scan_s;
+        const double proj0 = eng->stats().flash_proj_s, topk0 = eng->stats().topk_s;
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
         for (int i = 0; i < n_prompt && next >= lfm::Engine::kNoToken;) {
@@ -385,12 +401,15 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "done: %d tokens, %.1f s total, read %.0f MB", g_status.tokens, total_s, src.bytes_read() / 1e6);
         // One machine-readable line per run (tools/bench.py).
         ESP_LOGI(TAG, "RESULT run=%d prompt_tokens=%d prefill_s=%.2f gen_tokens=%d gen_s=%.2f s_per_tok=%.3f "
-                 "total_s=%.2f passes=%d drafted=%d accepted=%d batch=%d read_mb=%.1f sd_busy=%.3f stall=%.3f heap_free=%u",
+                 "total_s=%.2f passes=%d drafted=%d accepted=%d batch=%d read_mb=%.1f sd_busy=%.3f stall=%.3f heap_free=%u "
+                 "lm_head_s=%.2f rescore_reads=%ld flash_scan_s=%.2f proj_s=%.2f topk_s=%.2f",
                  run, n_prompt, prefill_s, g_status.tokens, gen_s,
                  g_status.tokens > 1 ? gen_s / (g_status.tokens - 1) : 0.0, total_s, spec.passes, spec.drafted,
                  spec.accepted, cfg.max_batch, (src.bytes_read() - read0) / 1e6, (src.sd_busy_seconds() - sd0) / total_s,
                  (src.stall_seconds() - stall0) / total_s,
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), eng->stats().lm_head_s - head0,
+                 eng->stats().rescore_reads - rescore0, eng->stats().flash_scan_s - scan0,
+                 eng->stats().flash_proj_s - proj0, eng->stats().topk_s - topk0);
 
         if (run + 1 < rc.runs) continue;
         do {

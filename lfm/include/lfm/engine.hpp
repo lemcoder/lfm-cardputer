@@ -62,6 +62,9 @@ struct EngineConfig {
     // reads and writes its 8 KB once per pass: ~128 KB of I/O per pass,
     // traded for RAM that a bigger prompt batch can use.
     const char* conv_state_path = nullptr;
+    // Layers to leave out entirely (bit i = layer i): their weights are never
+    // read. Lossy; for experiments (docs/experiments.md).
+    uint32_t skip_layers = 0;
 };
 
 class Engine {
@@ -122,6 +125,21 @@ public:
     // Bytes of RAM open() allocates for a given config (header must be read).
     std::size_t ram_bytes(const EngineConfig& cfg) const;
 
+    // LM head shortlist table in memory (the device: memory-mapped internal
+    // flash; tools/flash_head.py). Used instead of the file's LM head for
+    // greedy tokens. False (and not used) if it doesn't match the model.
+    bool set_flash_head(const void* data, std::size_t size);
+
+    // Counters for experiments (since open()).
+    struct Stats {
+        double lm_head_s = 0;   // wall time in the LM head (scan + re-score)
+        long rescore_reads = 0; // embedding rows read to re-score shortlists
+        double flash_scan_s = 0; // part of lm_head_s: projection + flash table scan
+        double flash_proj_s = 0; // part of flash_scan_s: the projection
+        double topk_s = 0;       // part of flash_scan_s: top-k inserts
+    };
+    const Stats& stats() const { return stats_; }
+
     void set_layer_hook(LayerHook fn, void* ctx) { layer_hook_ = fn; layer_ctx_ = ctx; }
     void set_progress_hook(ProgressHook fn, void* ctx) { progress_hook_ = fn; progress_ctx_ = ctx; }
 
@@ -142,6 +160,11 @@ private:
     // Greedy next token for each of n normalised vectors (one shared scan);
     // logits (n == 1 only) gets every vocab score.
     bool lm_head(const Ptrs& xs, int n, int32_t* out, float* logits);
+    bool lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits);
+    bool lm_head_flash(const Ptrs& xs, int n, int32_t* out);
+    void quantize_inputs(const Ptrs& in, int n, std::size_t cols);
+    float score_row(int b, Dtype dt, const std::byte* row, const float* in, std::size_t cols) const;
+    bool rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out);
 
     // n tokens at positions pos_ .. pos_+n-1: read xn_[b], write tmp_[b].
     // preds != nullptr: next token after every position (verify).
@@ -165,7 +188,7 @@ private:
 
     void progress(int done);
 
-    static constexpr int kMaxCandidates = 256;  // LM head shortlist cap
+    static constexpr int kMaxCandidates = 1024;  // LM head shortlist cap
     // LM head scratch inside each token's slot: z (low-rank projection, up
     // to kTopKOffset floats), then the top-k scores and ids.
     static constexpr std::size_t kTopKOffset = 512;
@@ -206,10 +229,16 @@ private:
     float* hist_ram_ = nullptr;
     FileSource* hist_file_ = nullptr;
     FileSource* state_file_ = nullptr;
+    // Memory-mapped LM head shortlist table (set_flash_head).
+    FlashHeadHeader fh_{};
+    const std::byte* fh_proj_ = nullptr;
+    const std::byte* fh_table_ = nullptr;
+    const std::byte* fh_cache_ = nullptr;
     bool recording_ = false;
     int pending_start_ = 0;
     int pending_n_ = 0;
 
+    Stats stats_;
     LayerHook layer_hook_ = nullptr;
     void* layer_ctx_ = nullptr;
     ProgressHook progress_hook_ = nullptr;

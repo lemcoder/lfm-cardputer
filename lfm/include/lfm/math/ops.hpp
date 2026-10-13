@@ -57,6 +57,15 @@ inline float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xs
 #endif
 }
 
+inline void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq,
+                         const float* xscale, float* out) {
+#if defined(LFM_ESP32S3_HAS_SCAN_Q4_Q8)
+    esp32s3::scan_q4_0_q8(rows, n_rows, n, xq, xscale, out);
+#else
+    ref::scan_q4_0_q8(rows, n_rows, n, xq, xscale, out);
+#endif
+}
+
 // Ops below are cheap (O(n), not O(n^2)); they only get a backend if profiling
 // says so. Add the same #if pattern when you vectorize one.
 using ref::add;

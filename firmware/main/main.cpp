@@ -1,7 +1,7 @@
 // LFM2.5-230M on the Cardputer-Adv: weights streamed from the SD card.
 //
 // SD card contents (from tools/export.py):
-//   /lfm.lfm       out/lfm-q8.lfm
+//   /lfm.lfm       out/lfm-q4-head-lr256.lfm
 //   /prompt.txt    out/prompt.txt  (token ids; optional, defaults below)
 //   /kv.bin        created at boot: the KV cache lives on the card, not in RAM
 //   /conv.bin      created at boot: conv state history for speculative rollback
@@ -534,7 +534,7 @@ extern "C" void app_main(void) {
     lcd.setTextScroll(true);
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_CYAN, TFT_BLACK);
-    lcd.drawString("LFM2.5-230M  Q8  weights from SD", 0, 0);
+    lcd.drawString("LFM2.5-230M  Q4  weights from SD", 0, 0);
     lcd.drawFastHLine(0, kTitleH, kW, TFT_DARKGREY);
     text_begin();
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);

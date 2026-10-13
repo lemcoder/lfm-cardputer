@@ -114,4 +114,38 @@ int speculative_step(Engine& eng, Drafter& drafter, int32_t fed, int max_draft, 
     return n_out;
 }
 
+int speculative_prefill(Engine& eng, Drafter& drafter, std::span<const int32_t> prompt, int max_batch, int max_draft,
+                        int32_t* out, SpecStats* stats) {
+    const int n = static_cast<int>(prompt.size());
+    if (n == 0 || max_batch < 1 || max_batch > Engine::kMaxBatch) return Engine::kInvalid;
+    int i = 0;
+    for (; n - i > max_batch; i += max_batch) {
+        const int32_t r = eng.prefill(prompt.subspan(static_cast<std::size_t>(i), static_cast<std::size_t>(max_batch)), false);
+        if (r < Engine::kNoToken) return r;
+    }
+    // Last batch: the rest of the prompt, then drafts in the room left.
+    const int c = n - i;
+    int k = max_draft < max_batch - c ? max_draft : max_batch - c;
+    if (k > eng.max_ctx() - eng.pos() - c) k = eng.max_ctx() - eng.pos() - c;
+    int32_t tokens[Engine::kMaxBatch];
+    int32_t preds[Engine::kMaxBatch];
+    for (int j = 0; j < c; ++j) tokens[j] = prompt[static_cast<std::size_t>(i + j)];
+    const int nd = k > 0 ? drafter.draft(tokens + c, k) : 0;
+    const int32_t r = eng.verify({tokens, static_cast<std::size_t>(c + nd)}, preds, c - 1);
+    if (r < 0) return r;
+    int accepted = 0;
+    while (accepted < nd && tokens[c + accepted] == preds[c - 1 + accepted]) ++accepted;
+    if (!eng.accept(c + accepted)) return Engine::kIoError;
+
+    int n_out = 0;
+    for (int j = 0; j < accepted; ++j) out[n_out++] = tokens[c + j];
+    out[n_out++] = preds[c - 1 + accepted];
+    for (int j = 0; j < n_out; ++j) drafter.push(out[j]);
+    if (stats != nullptr) {
+        stats->drafted += nd;
+        stats->accepted += accepted;
+    }
+    return n_out;
+}
+
 }  // namespace lfm

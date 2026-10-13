@@ -285,3 +285,32 @@ TEST(Speculative, DebugDraftsVsPreds) {
         fed = preds[0];
     }
 }
+
+// Prompt with drafts in its last batch: same tokens as plain greedy.
+TEST(Speculative, PrefillWithDraftsSameTokens) {
+    REQUIRE(kQ4);
+    lfm::EngineConfig cfg{.max_ctx = 64, .max_batch = 4, .int8_activations = true};
+    const auto want = Plain(kQ4, cfg, 16);
+    cfg.speculative = true;
+    lfm::FileSource src(kQ4.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, cfg), lfm::Status::Ok);
+    std::vector<int32_t> hist(256);
+    lfm::Drafter drafter(hist.data(), 256);
+    const auto table = Exists(kNgram) ? ReadFile(kNgram) : std::vector<char>{};
+    if (!table.empty()) drafter.set_ngram(table.data(), table.size());
+    const auto prompt = Prompt();  // 6 tokens: batches 4 + 2, room for 2 drafts
+    for (int32_t t : prompt) drafter.push(t);
+    int32_t buf[lfm::Engine::kMaxBatch];
+    lfm::SpecStats st;
+    int got = lfm::speculative_prefill(eng, drafter, prompt, 4, 3, buf, &st);
+    ASSERT_GT(got, 0);
+    std::vector<int32_t> out(buf, buf + got);
+    while (out.size() < want.size()) {
+        got = lfm::speculative_step(eng, drafter, out.back(), 3, buf, &st);
+        ASSERT_GT(got, 0);
+        out.insert(out.end(), buf, buf + got);
+    }
+    out.resize(want.size());
+    EXPECT_EQ(out, want);
+}

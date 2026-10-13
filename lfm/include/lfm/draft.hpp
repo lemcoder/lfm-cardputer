@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace lfm {
 
@@ -91,5 +92,13 @@ struct SpecStats {
 // drafter. Returns how many (>= 1), or a negative Engine code. The last one
 // is the next step's `fed`.
 int speculative_step(Engine& eng, Drafter& drafter, int32_t fed, int max_draft, int32_t* out, SpecStats* stats);
+
+// The prompt, max_batch tokens per pass, with drafts for the first answer
+// tokens riding along in the spare room of the last batch (that pass happens
+// anyway). The drafter must already hold the prompt. Writes the produced
+// tokens to out (accepted drafts, then the model's next token; the last is
+// the next step's `fed`) and returns how many, or a negative Engine code.
+int speculative_prefill(Engine& eng, Drafter& drafter, std::span<const int32_t> prompt, int max_batch, int max_draft,
+                        int32_t* out, SpecStats* stats);
 
 }  // namespace lfm

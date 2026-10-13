@@ -50,4 +50,5 @@ kept or not. Starting point and context: [performance.md](performance.md).
 | 17 | Row-scan SIMD kernel for the flash table (one call per 64 rows instead of per 4-block row) | 840 → 256 cycles/row, exact vs C reference on device; B1 36.37 s (the scan was not the main cost: see 18) | yes |
 | 18 | Min-heap top-k instead of a sorted array (k = 1024) | Top-k 0.89 → 0.11 s per B1 run; B1 36.37 → **35.64 s**; B2 **7.77 s/token**, 130.3 s total | yes |
 | 19 | Bigger prompt batch: per-token allocations for x/xn/tmp, scratch slot 12 → 10 KB (conv X → tmp, attention ctx → xn), FATFS buffers 4 KB → 512 B per open file (`CONFIG_WL_SECTOR_SIZE=512`; wear levelling unused) | Batch 7 now fits (38 KB still free). B2 prompt (20 tokens, 3 passes instead of 4) 44.8 → **34.5 s**, B2 total 130.3 → **120.3 s**. B1 unchanged (6 tokens fit either way) | yes |
+| 20 | Drafts for the first answer tokens in the spare room of the last prompt batch (`speculative_prefill`, `verify(…, first_pred)` so prompt positions skip the LM head) | No draft accepted on B1 or B2; costs B1 +0.5 s, B2 +0.3 s. Helps only when the prompt ends mid-phrase | knob, off |
 

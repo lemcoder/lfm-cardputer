@@ -892,7 +892,7 @@ bool Engine::mlp(int layer, int n) {
 
 // ---------------------------------------------------------------- forward
 
-int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds) {
+int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds, int first_pred) {
     if (pos_ + n > cfg_.max_ctx) return kContextFull;
     const Dims d(h_);
     std::span<float> norm_w{norm_w_, d.dim};
@@ -949,8 +949,12 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
     if (preds != nullptr) {
         // Every position's next token (speculative verification): one scan
         // of the LM head for all of them.
-        for (int b = 0; b < n; ++b) m::rmsnorm({act(xn_, b), d.dim}, {act(x_, b), d.dim}, norm_w, h_.norm_eps);
-        if (!lm_head(acts(xn_), n, preds, nullptr)) return kIoError;
+        Ptrs heads{};
+        for (int b = first_pred; b < n; ++b) {
+            m::rmsnorm({act(xn_, b), d.dim}, {act(x_, b), d.dim}, norm_w, h_.norm_eps);
+            heads.p[b - first_pred] = act(xn_, b);
+        }
+        if (!lm_head(heads, n - first_pred, preds + first_pred, nullptr)) return kIoError;
         next = preds[n - 1];
     } else {
         // Only the last token's prediction is needed.
@@ -968,13 +972,13 @@ int32_t Engine::forward(int32_t token, bool want_next, float* logits) {
     return run_batch(&token, 1, want_next, logits, nullptr);
 }
 
-int32_t Engine::verify(std::span<const int32_t> tokens, int32_t* preds) {
+int32_t Engine::verify(std::span<const int32_t> tokens, int32_t* preds, int first_pred) {
     assert(pending_n_ == 0 && "verify() must be followed by accept()");
     const int n = static_cast<int>(tokens.size());
-    if (n < 1 || n > cfg_.max_batch || !cfg_.speculative) return kInvalid;
+    if (n < 1 || n > cfg_.max_batch || !cfg_.speculative || first_pred < 0 || first_pred >= n) return kInvalid;
     const int start = pos_;
     recording_ = true;
-    const int32_t r = run_batch(tokens.data(), n, true, nullptr, preds);
+    const int32_t r = run_batch(tokens.data(), n, true, nullptr, preds, first_pred);
     recording_ = false;
     if (r < 0) return r;  // nothing pending: pos_ only moves on success
     pending_start_ = start;

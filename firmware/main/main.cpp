@@ -168,6 +168,7 @@ struct RunConfig {
     int runs = 1;         // run the prompt this many times without waiting for G0
     int flash_head = 1;   // use the LM head table in flash (if flashed)
     int reserve_kb = 24;  // heap kept free when choosing the prompt batch
+    int spec_prefill = 0; // drafts in the last prompt batch (no gain on B1/B2: experiment 20)
 };
 
 RunConfig read_run_config() {
@@ -187,6 +188,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "runs")) rc.runs = value;
         else if (!std::strcmp(key, "flash_head")) rc.flash_head = value;
         else if (!std::strcmp(key, "reserve_kb")) rc.reserve_kb = value;
+        else if (!std::strcmp(key, "spec_prefill")) rc.spec_prefill = value;
     }
     std::fclose(f);
     return rc;
@@ -340,12 +342,30 @@ extern "C" void app_main(void) {
         const double proj0 = eng->stats().flash_proj_s, topk0 = eng->stats().topk_s;
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
-        for (int i = 0; i < n_prompt && next >= lfm::Engine::kNoToken;) {
-            const int n = n_prompt - i < cfg.max_batch ? n_prompt - i : cfg.max_batch;
-            std::snprintf(phase, sizeof(phase), "prefill %d-%d/%d", i + 1, i + n, n_prompt);
-            set_phase(phase);
-            next = eng->prefill({prompt + i, static_cast<std::size_t>(n)}, i + n == n_prompt);
-            i += n;
+        drafter.reset();
+        for (int i = 0; i < n_prompt; ++i) drafter.push(prompt[i]);
+        lfm::SpecStats spec;
+        int32_t first[lfm::Engine::kMaxBatch];  // tokens produced by the prompt pass
+        int n_first = 0;
+        if (rc.spec && rc.spec_prefill) {
+            // Drafts for the first answer tokens ride in the last prompt batch.
+            set_phase("prefill");
+            n_first = lfm::speculative_prefill(*eng, drafter, {prompt, static_cast<std::size_t>(n_prompt)},
+                                               cfg.max_batch, max_draft, first, &spec);
+            next = n_first > 0 ? first[n_first - 1] : n_first;
+        } else {
+            for (int i = 0; i < n_prompt && next >= lfm::Engine::kNoToken;) {
+                const int n = n_prompt - i < cfg.max_batch ? n_prompt - i : cfg.max_batch;
+                std::snprintf(phase, sizeof(phase), "prefill %d-%d/%d", i + 1, i + n, n_prompt);
+                set_phase(phase);
+                next = eng->prefill({prompt + i, static_cast<std::size_t>(n)}, i + n == n_prompt);
+                i += n;
+            }
+            if (next >= 0) {
+                first[0] = next;
+                n_first = 1;
+                drafter.push(next);
+            }
         }
         const double prefill_s = (esp_timer_get_time() - t0) / 1e6;
         ESP_LOGI(TAG, "prefill %d tokens: %.1f s", n_prompt, prefill_s);
@@ -353,15 +373,11 @@ extern "C" void app_main(void) {
         // Generate until EOS or the context is full: speculative steps, each
         // one pass over the weights for the newest token plus its drafts.
         set_phase("generating");
-        drafter.reset();
-        for (int i = 0; i < n_prompt; ++i) drafter.push(prompt[i]);
-        lfm::SpecStats spec;
         int64_t t_gen = esp_timer_get_time();
         int32_t fed = next;
-        if (fed >= 0) {
-            show_token(*eng, fed, TFT_WHITE);
+        for (int i = 0; i < n_first; ++i) {
+            show_token(*eng, first[i], i + 1 < n_first ? TFT_GREENYELLOW : TFT_WHITE);
             ++g_status.tokens;
-            drafter.push(fed);
         }
         auto finished = [&] {
             if (rc.gen > 0 && g_status.tokens >= rc.gen) return true;

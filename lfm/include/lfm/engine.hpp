@@ -115,7 +115,9 @@ public:
     // Draft i is right iff tokens[i+1] == preds[i]. Then accept(k) keeps the
     // first k positions (1 <= k <= n) and rolls the rest back; call it before
     // anything else. Returns preds[n-1], or a negative code.
-    int32_t verify(std::span<const int32_t> tokens, int32_t* preds);
+    // first_pred: only positions first_pred.. get a prediction (the earlier
+    // ones are known tokens, e.g. the end of the prompt): saves their LM head.
+    int32_t verify(std::span<const int32_t> tokens, int32_t* preds, int first_pred = 0);
     bool accept(int keep);
 
     // Bytes of token `id` (UTF-8 / raw bytes) into buf. Returns the length,
@@ -168,7 +170,7 @@ private:
 
     // n tokens at positions pos_ .. pos_+n-1: read xn_[b], write tmp_[b].
     // preds != nullptr: next token after every position (verify).
-    int32_t run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds);
+    int32_t run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds, int first_pred = 0);
     std::size_t hist_rows() const;
     bool hist_put(int slot, int row, const float* src);
     bool hist_get(int slot, int row, float* dst);

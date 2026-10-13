@@ -77,6 +77,7 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 26 | Flash at 120 MHz (LM head table scan reads 4.7 MB per call at 26 MB/s) | Needs the flash chip's high-performance mode, unverified for this board; ≤ 0.06 s per pass (0.5%) at stake, and a failed boot needs manual download mode | skipped |
 | 27 | **Prompt cache**: after the prompt, snapshot the conv state + position (K/V rows stay valid in kv.bin); a run with the same prompt restores instead of recomputing | B1 run again (G0 / `runs=2`): **34.70 → 23.39 s**, prompt 11.32 → 0.02 s, same tokens | yes |
 | 28 | Re-tune drafts per pass after #11–25 made extra positions cheaper | B2: k=1 8.31, **k=2 7.48**, k=3 7.67, k=4 7.88 s/token | k=2 stays |
+| 29 | **Wi-Fi + SD in parallel**: fetch part of each block from the Mac (`tools/weight_server.py`) while the card reads the rest. Measured with `firmware/main/wifi_test.cpp` (16 MB, 32 KB requests, CRC-checked against the card) | SD alone 9.3 MB/s. Big Wi-Fi buffers: 2.1 + 8.7 = **10.8 MB/s (+16%)** but ~121 KB of RAM at peak. Small buffers (8/16 RX, 16 KB window): 1.6 + 8.7 = 10.3 MB/s (+10%), 48 KB connected / ~73 KB at peak. IRAM opts off: +17 KB heap, 9.8 MB/s (+5%). lwIP must sit on core 0 (unpinned: SD drops to 6.9). Engine has ~35 KB free and a prompt-batch step is 25 KB, so Wi-Fi costs batch 7 → 3–4: ~9% faster generation, ~2× slower prompt; B2 total ~115 → ~145 s (est.), break-even ≈ 45+ generated tokens. Not integrated into the engine | no |
 
 ## Not tried (and why)
 

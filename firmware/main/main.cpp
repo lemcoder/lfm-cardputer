@@ -46,6 +46,7 @@
 #include "sd_speed.hpp"
 #include "kernel_test.hpp"
 #include "usb_upload.hpp"
+#include "wifi_test.hpp"
 
 namespace {
 
@@ -60,6 +61,7 @@ constexpr const char* kPrefixPath = "/sdcard/prefix.bin";
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
 constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
+constexpr bool kWifiTest = false;      // measure weight streaming over Wi-Fi instead (wifi_test.hpp)
 constexpr int32_t kDefaultPrompt[] = {1, 1098, 5706, 803, 4481, 856};  // "The capital of France is"
 constexpr int kMaxPrompt = 64;
 
@@ -250,6 +252,15 @@ extern "C" void app_main(void) {
     // fails; phase 2 is mid-window. 53.3 MHz (div 3) works at every phase.
     static SdCard card(SdCard::Config{.host_div = 2, .delay_phase = 2});
     if (!card.ok()) fatal("SD mount failed", esp_err_to_name(card.err()));
+
+    if (kWifiTest) {
+        set_phase("USB upload? (1.5 s)");
+        upload::serve(1500, &set_phase);
+        set_phase("Wi-Fi test");
+        wifi_test([](const char* line) { lcd.println(line); });
+        set_phase("Wi-Fi test done");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
     struct stat st;
     const bool have_model = stat(kModelPath, &st) == 0;

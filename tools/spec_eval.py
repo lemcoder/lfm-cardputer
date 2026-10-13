@@ -79,12 +79,14 @@ def top_next(keys: np.ndarray, nxt: np.ndarray):
 
 def build_ngram(corpus: np.ndarray, budget_mb: float):
     c = corpus.astype(np.int64)
-    # bigram: full table, 65536 x 2 bytes
-    bk, bv, _ = top_next(c[:-1], c[1:])
+    # bigram: full table, 65536 x 2 bytes (pairs crossing a -1 separator dropped)
+    ok2 = (c[:-1] >= 0) & (c[1:] >= 0)
+    bk, bv, _ = top_next(c[:-1][ok2], c[1:][ok2])
     bigram = np.full(65536, -1, dtype=np.int32)
     bigram[bk.astype(np.int64)] = bv
     # trigram: keep the contexts with the most top-1 hits that fit the budget
-    tk, tv, tc = top_next(c[:-2] * 65536 + c[1:-1], c[2:])
+    ok3 = (c[:-2] >= 0) & (c[1:-1] >= 0) & (c[2:] >= 0)
+    tk, tv, tc = top_next((c[:-2] * 65536 + c[1:-1])[ok3], c[2:][ok3])
     budget = int((budget_mb * 1e6 - 65536 * 2) / TRI_ENTRY_BYTES)
     keep = np.argsort(-tc)[:budget]
     trigram = dict(zip(tk[keep].tolist(), tv[keep].tolist()))
@@ -155,11 +157,34 @@ def simulate(seqs, prompt_lens, draft_fn, k: int):
     return tokens / passes
 
 
+# Clean, held-out prompts (not WikiText: its pre-tokenized artifacts would
+# leak into the model's continuations and flatter a WikiText n-gram table).
+CLEAN_PROMPTS = [
+    "Here is a list of the eight planets of the solar system, in order from the Sun:",
+    "The three primary colors are",
+    "To make a cup of tea, first",
+    "def is_prime(n):\n",
+    "Photosynthesis is the process by which",
+    "Once upon a time, in a small village by the sea,",
+    "The days of the week are Monday,",
+    "Q: What is the capital of Japan?\nA:",
+    "The main causes of the First World War were",
+    "Ingredients for pancakes:\n-",
+    "A computer program is",
+    "The water cycle has four main stages:",
+    "Dear Sir or Madam,\n\nI am writing to",
+    "In mathematics, a prime number is",
+    "The steps to change a flat tire are:\n1.",
+    "Python is a programming language that",
+    "The human heart has four chambers:",
+    "Shakespeare wrote many plays, including",
+    "for (int i = 0; i < 10; i++) {",
+    "The French Revolution began in",
+]
+
+
 def greedy_sequences(n_prompts: int, n_tokens: int, tok: Tokenizer):
-    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="test")
-    paras = [t for t in ds["text"] if len(t) > 400 and not t.strip().startswith("=")]
-    step = max(1, len(paras) // n_prompts)
-    prompts = [[1] + tok.encode(paras[i * step], add_special_tokens=False).ids[:32] for i in range(n_prompts)]
+    prompts = [[1] + tok.encode(p, add_special_tokens=False).ids for p in CLEAN_PROMPTS[:n_prompts]]
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(device).eval()
@@ -178,8 +203,10 @@ def greedy_sequences(n_prompts: int, n_tokens: int, tok: Tokenizer):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus-mb", type=int, default=600, help="wikitext-103 train text to count")
+    ap.add_argument("--corpus", choices=["wiki", "selfgen", "both"], default="wiki",
+                    help="selfgen: the model's own greedy text (tools/selfgen_corpus.py)")
     ap.add_argument("--budget-mb", type=float, nargs="+", default=[1.0, 2.5, 5.5])
-    ap.add_argument("--gen-prompts", type=int, default=24)
+    ap.add_argument("--gen-prompts", type=int, default=20)
     ap.add_argument("--gen-tokens", type=int, default=128)
     ap.add_argument("--export", type=Path, help="write the n-gram table for the device here")
     ap.add_argument("--export-mb", type=float, default=1.0, help="trigram budget for --export")
@@ -187,7 +214,12 @@ def main():
 
     tok = Tokenizer.from_file(hf_hub_download(MODEL, "tokenizer.json"))
     t0 = time.time()
-    corpus = tokenize_corpus(tok, "train", args.corpus_mb)
+    if args.corpus == "selfgen":
+        corpus = np.load(CACHE / "selfgen.npy")
+    elif args.corpus == "both":
+        corpus = np.concatenate([np.load(CACHE / "selfgen.npy"), np.array([-1]), tokenize_corpus(tok, "train", args.corpus_mb)])
+    else:
+        corpus = tokenize_corpus(tok, "train", args.corpus_mb)
     print(f"corpus: {len(corpus) / 1e6:.1f}M tokens ({time.time() - t0:.0f} s)")
 
     if args.export:

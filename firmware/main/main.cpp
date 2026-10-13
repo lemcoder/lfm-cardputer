@@ -157,7 +157,7 @@ long st_size(const char* path) {
 // upload (seconds) instead of a rebuild. tools/bench.py writes it.
 struct RunConfig {
     int spec = 1;         // speculative decoding
-    int max_draft = -1;   // drafts per pass; -1 = batch - 1
+    int max_draft = 2;    // drafts per pass (2 measured best; -1 = batch - 1)
     int max_batch = 6;    // largest prompt batch to try
     int io_kb = 32;       // weight streaming buffer (x2)
     int gen = 0;          // stop after this many generated tokens (0 = at EOS)

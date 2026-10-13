@@ -214,3 +214,74 @@ TEST(Speculative, ConvStateFileSameTokens) {
     lfm::SpecStats st;
     EXPECT_EQ(Speculative(kQ4, cfg, 24, 3, nullptr, &st), want);
 }
+
+// Diagnostics: device file (low-rank head) + device knobs on a longer answer.
+TEST(Speculative, DeviceFileLongAnswerStats) {
+    const std::string lr = kRoot + "/out/lfm-q4-head-lr256.lfm";
+    REQUIRE(lr);
+    const auto table = Exists(kNgram) ? ReadFile(kNgram) : std::vector<char>{};
+    lfm::FileSource src(lr.c_str());
+    lfm::Engine eng;
+    lfm::EngineConfig cfg{.max_ctx = 128, .kv_bf16 = true, .max_batch = 6, .int8_activations = true,
+                          .speculative = true};
+    ASSERT_EQ(eng.open(src, cfg), lfm::Status::Ok);
+    std::vector<int32_t> hist(1024);
+    lfm::Drafter drafter(hist.data(), 1024);
+    if (!table.empty()) ASSERT_TRUE(drafter.set_ngram(table.data(), table.size()));
+    std::vector<int32_t> prompt;
+    {
+        std::ifstream f(kRoot + "/out/bench/prompt.txt");
+        int32_t id;
+        while (f >> id) prompt.push_back(id);
+    }
+    ASSERT_FALSE(prompt.empty());
+    for (int32_t t : prompt) drafter.push(t);
+    int32_t fed = eng.prefill(prompt, true);
+    drafter.push(fed);
+    lfm::SpecStats st;
+    std::string text;
+    char buf[64];
+    text.append(buf, eng.token_text(fed, buf, sizeof(buf)));
+    for (int produced = 1; produced < 24;) {
+        int32_t out[lfm::Engine::kMaxBatch];
+        const int got = lfm::speculative_step(eng, drafter, fed, 5, out, &st);
+        ASSERT_GT(got, 0);
+        for (int i = 0; i < got; ++i) text.append(buf, eng.token_text(out[i], buf, sizeof(buf)));
+        produced += got;
+        fed = out[got - 1];
+    }
+    std::printf("text: %s\npasses %d tokens %d drafted %d accepted %d\n", text.c_str(), st.passes, st.tokens,
+                st.drafted, st.accepted);
+}
+
+TEST(Speculative, DebugDraftsVsPreds) {
+    const std::string lr = kRoot + "/out/lfm-q4-head-lr256.lfm";
+    REQUIRE(lr);
+    const auto table = ReadFile(kNgram);
+    lfm::FileSource src(lr.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_ctx = 128, .max_batch = 6, .int8_activations = true, .speculative = true}),
+              lfm::Status::Ok);
+    std::vector<int32_t> hist(1024);
+    lfm::Drafter drafter(hist.data(), 1024);
+    ASSERT_TRUE(drafter.set_ngram(table.data(), table.size()));
+    std::vector<int32_t> prompt;
+    std::ifstream f(kRoot + "/out/bench/prompt.txt");
+    for (int32_t id; f >> id;) prompt.push_back(id);
+    for (int32_t t : prompt) drafter.push(t);
+    int32_t fed = eng.prefill(prompt, true);
+    drafter.push(fed);
+    for (int pass = 0; pass < 6; ++pass) {
+        int32_t tokens[6] = {fed}, preds[6];
+        const int nd = drafter.draft(tokens + 1, 5);
+        eng.verify({tokens, static_cast<std::size_t>(1 + nd)}, preds);
+        std::printf("pass %d fed %d | drafts:", pass, fed);
+        for (int i = 0; i < nd; ++i) std::printf(" %d", tokens[1 + i]);
+        std::printf(" | preds:");
+        for (int i = 0; i <= nd; ++i) std::printf(" %d", preds[i]);
+        std::printf("\n");
+        eng.accept(1);
+        drafter.push(preds[0]);
+        fed = preds[0];
+    }
+}

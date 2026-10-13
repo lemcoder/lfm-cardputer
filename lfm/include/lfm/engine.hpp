@@ -37,9 +37,6 @@ struct EngineConfig {
     int max_ctx = 128;              // KV cache capacity in tokens
     bool kv_bf16 = false;           // store K/V as bf16: half the size, ~3 digits of precision
     std::size_t io_bytes = 32768;   // weight / KV streaming buffer; keep a multiple of 512 (SD sector)
-    // Bytes the Source may use past io_bytes in a buffer passed to
-    // start_read() (the device's decoder stages compressed data there).
-    std::size_t io_extra = 0;
     // Two weight buffers: compute on one while the Source fills the other
     // (only helps with a Source whose start_read() is really asynchronous).
     bool double_buffer = true;
@@ -65,9 +62,6 @@ struct EngineConfig {
     // reads and writes its 8 KB once per pass: ~128 KB of I/O per pass,
     // traded for RAM that a bigger prompt batch can use.
     const char* conv_state_path = nullptr;
-    // Layers to leave out entirely (bit i = layer i): their weights are never
-    // read. Lossy; for experiments (docs/experiments.md).
-    uint32_t skip_layers = 0;
     // Prompt cache (snapshot_prefix / restore_prefix): where the conv state
     // snapshot lives when the conv state is in a file. nullptr: RAM.
     const char* prefix_path = nullptr;

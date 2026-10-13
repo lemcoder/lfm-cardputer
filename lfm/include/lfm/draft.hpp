@@ -9,10 +9,9 @@
 //      model's final hidden state, one shared step per draft:
 //        h' = h + up(silu(down([h, rmsnorm(embedding(token))])))
 //        draft = argmax(LM head(final_norm(h')))
-//   3. otherwise the n-gram table: trigram (a, b) -> most frequent next
-//      token, bigram fallback (tools/spec_eval.py --export).
-// On the device the head or the n-gram table lives in the flash "ngram"
-// partition, read through mmap.
+//      with its top guesses forming a tree of drafts (DraftShape).
+// On the device the head lives in the flash "draft" partition, read through
+// mmap.
 //
 // Greedy verification makes the result identical to plain greedy decoding;
 // drafts only change how many tokens one pass over the weights produces.
@@ -26,34 +25,6 @@
 namespace lfm {
 
 class Engine;
-
-// N-gram table file layout (little-endian), written by tools/spec_eval.py:
-//   NgramHeader
-//   uint16 bigram[vocab]            next token after b; 0xFFFF = none
-//   NgramEntry tri[tri_slots]       open addressing, linear probing
-struct NgramHeader {
-    char magic[8];         // "LFMNGRM\0"
-    uint32_t version;      // 1
-    uint32_t vocab;
-    uint32_t tri_slots;    // power of two
-    uint32_t reserved;
-};
-struct NgramEntry {
-    uint32_t key;   // (a << 16) | b
-    uint16_t next;  // 0xFFFF = empty slot
-    uint16_t pad;
-};
-static_assert(sizeof(NgramHeader) == 24 && sizeof(NgramEntry) == 8);
-
-inline constexpr char kNgramMagic[8] = {'L', 'F', 'M', 'N', 'G', 'R', 'M', '\0'};
-inline constexpr uint16_t kNgramNone = 0xFFFF;
-
-// Slot for a trigram key: Fibonacci hashing (same in spec_eval.py).
-inline uint32_t ngram_slot(uint32_t key, uint32_t slots) {
-    uint32_t bits = 0;
-    while ((1u << bits) < slots) ++bits;
-    return bits == 0 ? 0 : (key * 0x9E3779B1u) >> (32 - bits);
-}
 
 // Draft head file layout (little-endian), written by tools/draft_heads.py export:
 //   DraftHeadHeader, then the two matrices at their offsets (from the header start).
@@ -115,21 +86,15 @@ public:
     // history: caller-owned buffer for up to `cap` tokens (the context).
     Drafter(int32_t* history, int cap) : hist_(history), cap_(cap) {}
 
-    // Optional n-gram table (whole file contents, kept by the caller).
-    // False if it isn't a valid table; drafting then uses lookup only.
-    bool set_ngram(const void* table, std::size_t size);
-
     void reset() { n_ = 0; }
     void push(int32_t token);
     int size() const { return n_; }
 
-    // Up to k draft tokens continuing the history. Returns how many.
-    int draft(int32_t* out, int k) const;
-    // Prompt lookup only.
+    // Prompt lookup: up to k tokens that followed the last 2 tokens the most
+    // recent time they appeared earlier. Returns how many.
     int lookup(int32_t* out, int k) const;
 
-    // Optional draft head, used when lookup finds nothing (instead of the
-    // n-gram table). Kept by the caller.
+    // Optional draft head, used when lookup finds nothing. Kept by the caller.
     void set_head(const DraftHead* head) { head_ = head; }
     const DraftHead* head() const { return head_; }
     // Tree shape for the head's drafts (nullptr: a chain of max_draft).
@@ -137,16 +102,9 @@ public:
     const DraftShape* shape() const { return shape_; }
 
 private:
-    int ngram(int32_t* out, int k) const;
-    int32_t ngram_next(int32_t a, int32_t b) const;  // -1 if unknown
-
     int32_t* hist_;
     int cap_;
     int n_ = 0;
-    const uint16_t* bigram_ = nullptr;
-    const NgramEntry* tri_ = nullptr;
-    uint32_t vocab_ = 0;
-    uint32_t tri_slots_ = 0;
     const DraftHead* head_ = nullptr;
     const DraftShape* shape_ = nullptr;
 };
@@ -166,13 +124,5 @@ struct SpecStats {
 // drafter. Returns how many (>= 1), or a negative Engine code. The last one
 // is the next step's `fed`.
 int speculative_step(Engine& eng, Drafter& drafter, int32_t fed, int max_draft, int32_t* out, SpecStats* stats);
-
-// The prompt, max_batch tokens per pass, with drafts for the first answer
-// tokens riding along in the spare room of the last batch (that pass happens
-// anyway). The drafter must already hold the prompt. Writes the produced
-// tokens to out (accepted drafts, then the model's next token; the last is
-// the next step's `fed`) and returns how many, or a negative Engine code.
-int speculative_prefill(Engine& eng, Drafter& drafter, std::span<const int32_t> prompt, int max_batch, int max_draft,
-                        int32_t* out, SpecStats* stats);
 
 }  // namespace lfm

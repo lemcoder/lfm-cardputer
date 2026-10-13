@@ -323,12 +323,6 @@ esp_err_t sdmmc_host_stream_begin(int slot, uint32_t arg, size_t total_bytes);
 esp_err_t sdmmc_host_stream_feed(void* buf, size_t len);
 /** Until all of buf (fed earlier) has been written. */
 esp_err_t sdmmc_host_stream_wait(void* buf, uint32_t timeout_ms);
-/** Descriptors of the most recent feed (for sdmmc_host_stream_landed). */
-void sdmmc_host_stream_last_feed(int* first_desc, int* n_desc);
-/** Bytes of that feed already written by the DMA (in order from its start). Safe from another task. */
-size_t sdmmc_host_stream_landed(int first_desc, int n_desc);
-/** Forget a fed buffer without sdmmc_host_stream_wait (its data is known to have landed). */
-void sdmmc_host_stream_release(void* buf);
 /** After the last buffer: wait for the transfer and auto stop to finish, release the bus. */
 esp_err_t sdmmc_host_stream_end(void);
 

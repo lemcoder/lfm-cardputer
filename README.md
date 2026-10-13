@@ -58,7 +58,7 @@ the quantized variants, and what's next.
 
 - ESP32-S3FN8, 240 MHz dual core, 8 MB flash, **no PSRAM** -> ~512 KB SRAM, ~300 KB usable.
 - microSD wired for SPI: MISO 39, MOSI 14, SCLK 40, CS 12. Bus shared with LoRa cap (NSS 5).
-- **Measured (firmware/main/sd_bench, 32 KB sequential reads):**
+- **Measured (an SD test mode, 32 KB sequential reads; removed in the cleanup, see docs/experiments.md):**
   - SPI 20 MHz: 1.82 MB/s. SPI 40 MHz: fails (GPIO-matrix input timing).
   - **SD 1-bit mode on the same wires** (CLK 40, CMD 14, DAT0 39, DAT3 12): 2.45 MB/s @ 20 MHz,
     **4.85 MB/s @ 40 MHz** (97% of the 1-bit ceiling). Input delay phase 0-3 makes no difference.

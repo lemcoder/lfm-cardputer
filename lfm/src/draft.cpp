@@ -8,24 +8,6 @@
 
 namespace lfm {
 
-bool Drafter::set_ngram(const void* table, std::size_t size) {
-    bigram_ = nullptr;
-    tri_ = nullptr;
-    if (table == nullptr || size < sizeof(NgramHeader)) return false;
-    NgramHeader h;
-    std::memcpy(&h, table, sizeof(h));
-    if (std::memcmp(h.magic, kNgramMagic, sizeof(kNgramMagic)) != 0 || h.version != 1) return false;
-    if (h.tri_slots == 0 || (h.tri_slots & (h.tri_slots - 1)) != 0) return false;
-    const std::size_t need = sizeof(NgramHeader) + h.vocab * sizeof(uint16_t) + h.tri_slots * sizeof(NgramEntry);
-    if (size < need) return false;
-    const auto* base = static_cast<const std::byte*>(table);
-    bigram_ = reinterpret_cast<const uint16_t*>(base + sizeof(NgramHeader));
-    tri_ = reinterpret_cast<const NgramEntry*>(base + sizeof(NgramHeader) + h.vocab * sizeof(uint16_t));
-    vocab_ = h.vocab;
-    tri_slots_ = h.tri_slots;
-    return true;
-}
-
 void Drafter::push(int32_t token) {
     if (n_ == cap_) {  // full: drop the oldest half (lookup only needs recent context)
         const int keep = cap_ / 2;
@@ -33,12 +15,6 @@ void Drafter::push(int32_t token) {
         n_ = keep;
     }
     hist_[n_++] = token;
-}
-
-int Drafter::draft(int32_t* out, int k) const {
-    if (k <= 0) return 0;
-    const int n = lookup(out, k);
-    return n > 0 ? n : ngram(out, k);
 }
 
 // Most recent earlier occurrence of the last 2 tokens; propose what followed.
@@ -54,36 +30,6 @@ int Drafter::lookup(int32_t* out, int k) const {
         }
     }
     return 0;
-}
-
-int32_t Drafter::ngram_next(int32_t a, int32_t b) const {
-    if (tri_ == nullptr || b < 0 || static_cast<uint32_t>(b) >= vocab_) return -1;
-    if (a >= 0 && static_cast<uint32_t>(a) < vocab_) {
-        const uint32_t key = (static_cast<uint32_t>(a) << 16) | static_cast<uint32_t>(b);
-        for (uint32_t s = ngram_slot(key, tri_slots_), probes = 0; probes < tri_slots_; s = (s + 1) & (tri_slots_ - 1), ++probes) {
-            const NgramEntry& e = tri_[s];
-            if (e.next == kNgramNone) break;
-            if (e.key == key) return e.next;
-        }
-    }
-    const uint16_t bi = bigram_[b];
-    return bi == kNgramNone ? -1 : bi;
-}
-
-// Chain n-gram predictions, each extending the context with the previous one.
-int Drafter::ngram(int32_t* out, int k) const {
-    if (tri_ == nullptr || n_ == 0) return 0;
-    int32_t a = n_ >= 2 ? hist_[n_ - 2] : -1;
-    int32_t b = hist_[n_ - 1];
-    int m = 0;
-    while (m < k) {
-        const int32_t next = ngram_next(a, b);
-        if (next < 0) break;
-        out[m++] = next;
-        a = b;
-        b = next;
-    }
-    return m;
 }
 
 bool DraftHead::set(const void* data, std::size_t size, const Engine& eng) {
@@ -202,22 +148,19 @@ int speculative_step(Engine& eng, Drafter& drafter, int32_t fed, int max_draft, 
     if (k > eng.max_ctx() - eng.pos() - 1) k = eng.max_ctx() - eng.pos() - 1;
 
     // Prompt lookup (a chain), else the draft head: a tree when a shape is
-    // set and fits, else a chain; else the n-gram table.
-    int n_draft = 0;
+    // set and fits, else a chain.
+    int n_draft = k > 0 ? drafter.lookup(tokens + 1, k) : 0;
     int n_tree = 0;
     int8_t parents[Engine::kMaxBatch];
-    if (k > 0 && drafter.head() != nullptr) {
-        n_draft = drafter.lookup(tokens + 1, k);
+    if (k > 0 && n_draft == 0 && drafter.head() != nullptr) {
         const DraftShape* shape = drafter.shape();
-        if (n_draft == 0 && shape != nullptr && shape->n - 1 <= k && shape->n <= eng.max_batch()) {
+        if (shape != nullptr && shape->n - 1 <= k && shape->n <= eng.max_batch()) {
             n_tree = drafter.head()->draft_tree(eng, fed, *shape, tokens, parents);
             if (n_tree < 0) return n_tree;
-        } else if (n_draft == 0) {
+        } else {
             n_draft = drafter.head()->draft(eng, fed, k, tokens + 1);
             if (n_draft < 0) return n_draft;
         }
-    } else if (k > 0) {
-        n_draft = drafter.draft(tokens + 1, k);
     }
 
     int n_out = 0;
@@ -256,40 +199,6 @@ int speculative_step(Engine& eng, Drafter& drafter, int32_t fed, int max_draft, 
         ++stats->passes;
         stats->tokens += n_out;
         stats->drafted += n_draft;
-        stats->accepted += accepted;
-    }
-    return n_out;
-}
-
-int speculative_prefill(Engine& eng, Drafter& drafter, std::span<const int32_t> prompt, int max_batch, int max_draft,
-                        int32_t* out, SpecStats* stats) {
-    const int n = static_cast<int>(prompt.size());
-    if (n == 0 || max_batch < 1 || max_batch > Engine::kMaxBatch) return Engine::kInvalid;
-    int i = 0;
-    for (; n - i > max_batch; i += max_batch) {
-        const int32_t r = eng.prefill(prompt.subspan(static_cast<std::size_t>(i), static_cast<std::size_t>(max_batch)), false);
-        if (r < Engine::kNoToken) return r;
-    }
-    // Last batch: the rest of the prompt, then drafts in the room left.
-    const int c = n - i;
-    int k = max_draft < max_batch - c ? max_draft : max_batch - c;
-    if (k > eng.max_ctx() - eng.pos() - c) k = eng.max_ctx() - eng.pos() - c;
-    int32_t tokens[Engine::kMaxBatch];
-    int32_t preds[Engine::kMaxBatch];
-    for (int j = 0; j < c; ++j) tokens[j] = prompt[static_cast<std::size_t>(i + j)];
-    const int nd = k > 0 ? drafter.draft(tokens + c, k) : 0;
-    const int32_t r = eng.verify({tokens, static_cast<std::size_t>(c + nd)}, preds, c - 1);
-    if (r < 0) return r;
-    int accepted = 0;
-    while (accepted < nd && tokens[c + accepted] == preds[c - 1 + accepted]) ++accepted;
-    if (!eng.accept(c + accepted)) return Engine::kIoError;
-
-    int n_out = 0;
-    for (int j = 0; j < accepted; ++j) out[n_out++] = tokens[c + j];
-    out[n_out++] = preds[c - 1 + accepted];
-    for (int j = 0; j < n_out; ++j) drafter.push(out[j]);
-    if (stats != nullptr) {
-        stats->drafted += nd;
         stats->accepted += accepted;
     }
     return n_out;

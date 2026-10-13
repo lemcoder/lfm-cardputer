@@ -9,7 +9,7 @@
 //   /cfg.txt       optional experiment knobs, key=value per line (RunConfig)
 //
 // Flash partitions (tools/flash_part.sh), both optional:
-//   ngram   the speculative-decoding n-gram draft table (else lookup drafts only)
+//   draft   the speculative-decoding draft head (else prompt-lookup drafts only)
 //   lmhead  the LM head shortlist table (else the .lfm file's LM head, from SD)
 //
 // No card reader? `uv run tools/upload.py` sends the files over the USB cable
@@ -45,11 +45,8 @@
 #include "lfm/tokenizer.hpp"
 #include "async_file.hpp"
 #include "sd_card.hpp"
-#include "sd_speed.hpp"
 #include "kernel_test.hpp"
 #include "keyboard.hpp"
-
-void z_test(void (*print)(const char*));
 #include "usb_upload.hpp"
 
 namespace {
@@ -63,12 +60,8 @@ constexpr const char* kConvStatePath = "/sdcard/cstate.bin";
 constexpr const char* kRunConfigPath = "/sdcard/cfg.txt";
 constexpr const char* kPrefixPath = "/sdcard/prefix.bin";
 constexpr const char* kTokenizerPath = "/sdcard/tok.bin";  // tools/export_tokenizer.py
-constexpr const char* kLfzPath = "/sdcard/lfm.lfz";        // tools/zcodec.py pack (optional)
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
-constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
-constexpr bool kSdRawTest = false;     // measure raw SD reads vs FATFS after mounting, instead of the model
-constexpr bool kZTest = false;         // decode speed of the weight codec (ztest.cpp), instead of the model
 constexpr int32_t kDefaultPrompt[] = {1, 1098, 5706, 803, 4481, 856};  // "The capital of France is"
 constexpr int kMaxPrompt = 64;
 
@@ -220,15 +213,13 @@ struct RunConfig {
     int runs = 1;         // run the prompt this many times without waiting for G0
     int flash_head = 1;   // use the LM head table in flash (if flashed)
     int reserve_kb = 24;  // heap kept free when choosing the prompt batch
-    int spec_prefill = 0; // drafts in the last prompt batch (no gain on B1/B2: experiment 20)
     int prompt_cache = 1; // reuse the prompt's state when a run repeats the previous prompt
     int chat = 1;         // keyboard chat (needs /tok.bin); 0 = run /prompt.txt (benchmarks)
     int max_reply = 256;  // chat: longest answer, tokens
-    int draft_head = 1;   // use a draft head flashed in the "ngram" partition
+    int draft_head = 1;   // use the draft head flashed in the "draft" partition
     int worker = 1;       // split the LM head scan with core 1
     int stream = 1;       // one SD command per matrix (AsyncFile::enable_streaming)
     int tree = 1;         // draft head proposes a tree (lfm::kTree3x1) instead of a chain
-    int compress = 0;     // read layer matrices from /lfm.lfz (experiment 41: costs batch 7, so off)
 };
 
 RunConfig read_run_config() {
@@ -248,7 +239,6 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "runs")) rc.runs = value;
         else if (!std::strcmp(key, "flash_head")) rc.flash_head = value;
         else if (!std::strcmp(key, "reserve_kb")) rc.reserve_kb = value;
-        else if (!std::strcmp(key, "spec_prefill")) rc.spec_prefill = value;
         else if (!std::strcmp(key, "prompt_cache")) rc.prompt_cache = value;
         else if (!std::strcmp(key, "chat")) rc.chat = value;
         else if (!std::strcmp(key, "max_reply")) rc.max_reply = value;
@@ -256,7 +246,6 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "worker")) rc.worker = value;
         else if (!std::strcmp(key, "stream")) rc.stream = value;
         else if (!std::strcmp(key, "tree")) rc.tree = value;
-        else if (!std::strcmp(key, "compress")) rc.compress = value;
     }
     std::fclose(f);
     return rc;
@@ -642,35 +631,13 @@ extern "C" void app_main(void) {
         set_phase(ok ? "SIMD kernels OK" : "SIMD kernels MISMATCH");
         while (true) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    if (kSdSpeedTest) {
-        set_phase("SD clock test");
-        vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log after flashing
-        vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log after flashing
-        sd_speed_test([](const char* line) { lcd.println(line); });
-        set_phase("SD clock test done");
-        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
 
     set_phase("mounting SD");
     // 80 MHz (160 / 2, overclock; SD high-speed spec is 50 MHz). Measured on
-    // this card with sd_speed.cpp: CRC-clean at sampling phases 1-3, phase 0
-    // fails; phase 2 is mid-window. 53.3 MHz (div 3) works at every phase.
+    // this card (experiments: SD clock): CRC-clean at sampling phases 1-3,
+    // phase 0 fails; phase 2 is mid-window. 160 MHz doesn't answer.
     static SdCard card(SdCard::Config{.host_div = 2, .delay_phase = 2});
     if (!card.ok()) fatal("SD mount failed", esp_err_to_name(card.err()));
-    if (kZTest) {
-        set_phase("weight codec test");
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        z_test([](const char* line) { lcd.println(line); });
-        set_phase("weight codec test done");
-        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-    if (kSdRawTest) {
-        set_phase("SD driver test");
-        vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log
-        sd_raw_test([](const char* line) { lcd.println(line); }, card);
-        set_phase("SD driver test done");
-        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
 
     struct stat st;
     const bool have_model = stat(kModelPath, &st) == 0;
@@ -687,18 +654,14 @@ extern "C" void app_main(void) {
 
     const RunConfig rc = read_run_config();
     const bool streaming = rc.stream && src.enable_streaming(card.card(), "0:/lfm.lfm");
-    src.set_io_bytes(static_cast<std::size_t>(rc.io_kb) * 1024);
-    const bool compressed = streaming && rc.compress && src.enable_compression(kLfzPath, "0:/lfm.lfz");
-    ESP_LOGI(TAG, "weight reads: %s%s", streaming ? "streamed (one SD command per matrix)" : "one SD command per block",
-             compressed ? ", layer matrices compressed (/lfm.lfz)" : "");
+    ESP_LOGI(TAG, "weight reads: %s", streaming ? "streamed (one SD command per matrix)" : "one SD command per block");
     ESP_LOGI(TAG, "run config: spec %d max_draft %d max_batch %d io_kb %d gen %d ignore_eos %d progress %d runs %d",
              rc.spec, rc.max_draft, rc.max_batch, rc.io_kb, rc.gen, rc.ignore_eos, rc.progress, rc.runs);
 
     // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
     const std::size_t kReserve = static_cast<std::size_t>(rc.reserve_kb) * 1024;
     lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true,
-                          .io_bytes = static_cast<std::size_t>(rc.io_kb) * 1024,
-                          .io_extra = compressed ? AsyncFile::kIoExtra : 0, .kv_path = kKvPath,
+                          .io_bytes = static_cast<std::size_t>(rc.io_kb) * 1024, .kv_path = kKvPath,
                           .int8_activations = true, .speculative = rc.spec != 0, .conv_history_path = kConvHistPath,
                           .conv_state_path = kConvStatePath, .prefix_path = kPrefixPath};
     static lfm::Engine* eng = nullptr;
@@ -737,7 +700,7 @@ extern "C" void app_main(void) {
     const int n_prompt = read_prompt(prompt, kMaxPrompt);
 
     // Speculative decoding drafts: prompt lookup over the context, else the
-    // n-gram table memory-mapped from flash (if flashed).
+    // draft head memory-mapped from flash (if flashed).
     static int32_t draft_hist[kMaxCtx];
     static lfm::Drafter drafter(draft_hist, kMaxCtx);
     auto map_partition = [](const char* name, std::size_t* size) -> const void* {
@@ -750,21 +713,16 @@ extern "C" void app_main(void) {
         *size = part->size;
         return ptr;
     };
-    std::size_t ngram_size = 0, head_size = 0;
+    std::size_t draft_size = 0, head_size = 0;
     const void* head = map_partition("lmhead", &head_size);
     const bool head_ok = rc.flash_head && eng->set_flash_head(head, head_size);
     ESP_LOGI(TAG, "LM head table: %s", head_ok ? "from flash" : "from the SD card");
-    // The "ngram" partition holds a draft head (tools/draft_heads.py export)
-    // or an n-gram table (tools/spec_eval.py --export).
-    const void* ngram = map_partition("ngram", &ngram_size);
+    // The "draft" partition holds the draft head (tools/draft_heads.py export).
+    const void* draft = map_partition("draft", &draft_size);
     static lfm::DraftHead draft_head;
-    if (rc.draft_head && draft_head.set(ngram, ngram_size, *eng)) {
-        drafter.set_head(&draft_head);
-        ESP_LOGI(TAG, "drafts: prompt lookup, then the draft head in flash");
-    } else {
-        const bool ngram_ok = drafter.set_ngram(ngram, ngram_size);
-        ESP_LOGI(TAG, "drafts: prompt lookup, then %s", ngram_ok ? "the n-gram table in flash" : "nothing (not flashed)");
-    }
+    const bool head_drafts = rc.draft_head && draft_head.set(draft, draft_size, *eng);
+    if (head_drafts) drafter.set_head(&draft_head);
+    ESP_LOGI(TAG, "drafts: prompt lookup%s", head_drafts ? ", then the draft head in flash" : " only (no draft head flashed)");
     const bool tree = rc.tree && drafter.head() != nullptr && cfg.max_batch >= lfm::kTree3x1.n;
     if (tree) drafter.set_shape(&lfm::kTree3x1);  // 6 drafts per pass; prompt lookup may use as many
     const int max_draft = tree ? lfm::kTree3x1.n - 1 : rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
@@ -821,12 +779,6 @@ extern "C" void app_main(void) {
             n_first = 1;
             next = cached_first;
             drafter.push(next);
-        } else if (rc.spec && rc.spec_prefill) {
-            // Drafts for the first answer tokens ride in the last prompt batch.
-            set_phase("prefill");
-            n_first = lfm::speculative_prefill(*eng, drafter, {prompt, static_cast<std::size_t>(n_prompt)},
-                                               cfg.max_batch, max_draft, first, &spec);
-            next = n_first > 0 ? first[n_first - 1] : n_first;
         } else {
             for (int i = 0; i < n_prompt && next >= lfm::Engine::kNoToken;) {
                 const int n = n_prompt - i < cfg.max_batch ? n_prompt - i : cfg.max_batch;

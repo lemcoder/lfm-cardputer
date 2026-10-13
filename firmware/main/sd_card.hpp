@@ -1,6 +1,6 @@
 #pragma once
-// microSD in SD 1-bit mode on the Cardputer-Adv's SPI wiring (see sd_bench.hpp
-// for why: 4.85 MB/s at 40 MHz vs 1.8 MB/s over SPI). Mounted at /sdcard.
+// microSD in SD 1-bit mode on the Cardputer-Adv's SPI wiring (4.85 MB/s at
+// 40 MHz vs 1.8 MB/s over SPI, docs/performance.md). Mounted at /sdcard.
 //
 // Only DAT0 is wired, so the bus is 1 bit wide: bytes/s = clock / 8. The
 // ESP32-S3 SDMMC clock is 160 MHz / divider: 40 MHz (div 4) is the fastest

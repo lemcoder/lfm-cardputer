@@ -47,9 +47,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: %s tokens.txt reference.lfm candidate.lfm...\n", argv[0]);
         return 2;
     }
-    // Optional: LFM_SKIP_LAYERS=mask applies to every candidate (not the reference).
-    const char* skip_env = std::getenv("LFM_SKIP_LAYERS");
-    const uint32_t skip = skip_env ? static_cast<uint32_t>(std::strtoul(skip_env, nullptr, 0)) : 0;
     std::vector<int32_t> tokens;
     {
         std::ifstream f(argv[1]);
@@ -68,8 +65,7 @@ int main(int argc, char** argv) {
         m.path = argv[i];
         m.src = std::make_unique<lfm::FileSource>(argv[i]);
         m.eng = std::make_unique<lfm::Engine>();
-        const uint32_t mask = models.empty() ? 0 : skip;  // first model = reference, never skipped
-        if (lfm::Status s = m.eng->open(*m.src, {.max_ctx = n, .skip_layers = mask}); s != lfm::Status::Ok) {
+        if (lfm::Status s = m.eng->open(*m.src, {.max_ctx = n}); s != lfm::Status::Ok) {
             std::fprintf(stderr, "%s: %s\n", argv[i], lfm::to_string(s));
             return 1;
         }

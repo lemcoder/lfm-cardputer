@@ -2,24 +2,22 @@
 # requires-python = ">=3.10"
 # dependencies = ["torch", "transformers>=4.57", "numpy", "datasets", "huggingface_hub", "tokenizers", "safetensors"]
 # ///
-"""Draft heads for speculative decoding (Medusa / Hydra style), trained on
-the model's own greedy text.
+"""Draft heads for speculative decoding (Hydra style), trained on the
+model's own greedy text.
 
 After a pass the engine has h, the final (normed) hidden state at the
 position that produced the newest token `fed`. A draft head guesses the
 tokens after `fed` from h alone, so drafts cost no extra pass over the
-weights. Two variants:
-
-  medusa     head_k(h) predicts token k+1 after h's position, one head per k
-  recurrent  one shared step (h, embedding of the last token) -> h', applied
-             again for the next draft with the token it just proposed
+weights. One shared step, applied once per draft with the token it just
+proposed: (h, embedding of the last token) -> h'. (Separate Medusa heads per
+depth, without the token, did worse: docs/experiments.md #30.)
 
 Draft logits use the model's own (tied) LM head.
 
     uv run tools/draft_heads.py collect          # hidden states of out/spec/selfgen.npy, Q4 model
-    uv run tools/draft_heads.py train --variant recurrent
-    uv run tools/draft_heads.py eval             # acceptance on chat / clean prompts vs the n-gram drafter
-    uv run tools/draft_heads.py export           # -> out/dhead.bin (rank 512, Q4: 0.9 MB, flash "ngram" partition)
+    uv run tools/draft_heads.py train
+    uv run tools/draft_heads.py eval             # acceptance on chat / clean prompts vs prompt lookup alone
+    uv run tools/draft_heads.py export           # -> out/dhead.bin (rank 512, Q4: 0.9 MB, flash "draft" partition)
 
 Hidden states come from the model with Q4_0-dequantized matrices (what the
 device runs), not the BF16 original.
@@ -120,20 +118,6 @@ def collect(args):
 
 # ---------------------------------------------------------------- heads
 
-class Medusa(nn.Module):
-    def __init__(self, dim: int, rank: int, depth: int):
-        super().__init__()
-        self.depth = depth
-        self.down = nn.ModuleList(nn.Linear(dim, rank, bias=False) for _ in range(depth))
-        self.up = nn.ModuleList(nn.Linear(rank, dim, bias=False) for _ in range(depth))
-        for u in self.up:
-            nn.init.zeros_(u.weight)
-
-    def forward(self, h, toks, E, norm_w):
-        """h [B, dim]; toks [B, depth] (unused). Returns per-depth hidden [depth][B, dim]."""
-        return [h + self.up[k](F.silu(self.down[k](h))) for k in range(len(self.down))]
-
-
 class Recurrent(nn.Module):
     """h_{k+1} = h_k + up(silu(down([h_k, norm(emb(tok_k))])))."""
 
@@ -159,16 +143,12 @@ class Recurrent(nn.Module):
 
 
 def make_head(variant: str, dim: int, rank: int, depth: int):
-    return (Medusa if variant == "medusa" else Recurrent)(dim, rank, depth)
-
-
-DRAFT_VOCAB = None  # eval --draft-vocab: drafts only from token ids below this
+    assert variant == "recurrent", variant
+    return Recurrent(dim, rank, depth)
 
 
 def head_logits(hk, E, norm_w):
     hn = hk * torch.rsqrt(hk.pow(2).mean(-1, keepdim=True) + 1e-5) * norm_w
-    if DRAFT_VOCAB is not None and not hk.requires_grad:
-        return hn @ E[:DRAFT_VOCAB].T
     return hn @ E.T
 
 
@@ -204,7 +184,7 @@ def train(args):
     dim = E.shape[1]
     del model
 
-    head = make_head(args.variant, dim, args.rank, args.depth).to(DEVICE)
+    head = make_head("recurrent", dim, args.rank, args.depth).to(DEVICE)
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.0)
     steps = args.epochs * len(tr[0]) // args.batch
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
@@ -230,23 +210,20 @@ def train(args):
         acc = evaluate_rows(head, H, va, E, norm_w)
         print(f"epoch {epoch}: held-out top-1 per depth (drafting on its own guesses): "
               + ", ".join(f"{100 * a:.1f}%" for a in acc), flush=True)
-    path = OUT / f"{args.variant}_r{args.rank}_d{args.depth}.pt"
-    torch.save({"variant": args.variant, "rank": args.rank, "depth": args.depth, "state": head.state_dict()}, path)
+    path = OUT / f"recurrent_r{args.rank}_d{args.depth}.pt"
+    torch.save({"variant": "recurrent", "rank": args.rank, "depth": args.depth, "state": head.state_dict()}, path)
     print(f"wrote {path}")
 
 
 @torch.no_grad()
 def draft_chain(head, h, fed, E, norm_w, depth):
     """Free-running drafts: each step feeds the previous guess. h [B, dim], fed [B]."""
-    if isinstance(head, Recurrent):
-        out, tok = [], fed
-        for _ in range(depth):
-            h = head.step(h, tok, E)
-            tok = head_logits(h, E, norm_w).argmax(-1)
-            out.append(tok)
-        return torch.stack(out, 1)
-    outs = head(h, None, E, norm_w)
-    return torch.stack([head_logits(o, E, norm_w).argmax(-1) for o in outs[:depth]], 1)
+    out, tok = [], fed
+    for _ in range(depth):
+        h = head.step(h, tok, E)
+        tok = head_logits(h, E, norm_w).argmax(-1)
+        out.append(tok)
+    return torch.stack(out, 1)
 
 
 @torch.no_grad()
@@ -282,6 +259,64 @@ def load_head(path: Path, dim: int, quant: str = "f32"):
     return head.to(DEVICE).eval()
 
 
+# ---------------------------------------------------------------- simulation
+
+def draft_lookup(ctx: list[int], k: int, n: int = 2) -> list[int]:
+    """Most recent earlier occurrence of the last n tokens; propose what followed."""
+    if len(ctx) <= n:
+        return []
+    tail = ctx[-n:]
+    for start in range(len(ctx) - n - 1, -1, -1):
+        if ctx[start:start + n] == tail:
+            return ctx[start + n:start + n + k]
+    return []
+
+
+def simulate(seqs, prompt_lens, draft_fn, k: int, stats=None):
+    passes = tokens = drafted = 0
+    for s, p in zip(seqs, prompt_lens):
+        i = p
+        while i < len(s):
+            drafts = draft_fn(s[:i], k)
+            drafted += len(drafts)
+            acc = 0
+            while acc < len(drafts) and i + acc < len(s) and drafts[acc] == s[i + acc]:
+                acc += 1
+            step = min(acc + 1, len(s) - i)
+            tokens += step
+            passes += 1
+            i += step
+    if stats is not None:
+        stats.update(passes=passes, tokens=tokens, drafted=drafted)
+    return tokens / passes
+
+
+# Clean, held-out prompts (not WikiText: its pre-tokenized artifacts would
+# leak into the model's continuations and flatter WikiText-trained drafts).
+CLEAN_PROMPTS = [
+    "Here is a list of the eight planets of the solar system, in order from the Sun:",
+    "The three primary colors are",
+    "To make a cup of tea, first",
+    "def is_prime(n):\n",
+    "Photosynthesis is the process by which",
+    "Once upon a time, in a small village by the sea,",
+    "The days of the week are Monday,",
+    "Q: What is the capital of Japan?\nA:",
+    "The main causes of the First World War were",
+    "Ingredients for pancakes:\n-",
+    "A computer program is",
+    "The water cycle has four main stages:",
+    "Dear Sir or Madam,\n\nI am writing to",
+    "In mathematics, a prime number is",
+    "The steps to change a flat tire are:\n1.",
+    "Python is a programming language that",
+    "The human heart has four chambers:",
+    "Shakespeare wrote many plays, including",
+    "for (int i = 0; i < 10; i++) {",
+    "The French Revolution began in",
+]
+
+
 CHAT_PROMPTS = [
     "Hello", "Hi! Who are you?", "What is the capital of France?", "Tell me a joke.",
     "Write a haiku about the sea.", "How do I boil an egg?", "What is 17 times 23?",
@@ -300,9 +335,6 @@ def chat_ids(tok, text: str) -> list[int]:
 
 
 def evaluate(args):
-    global DRAFT_VOCAB
-    DRAFT_VOCAB = args.draft_vocab
-    import spec_eval
     from huggingface_hub import hf_hub_download
     from tokenizers import Tokenizer
 
@@ -313,10 +345,8 @@ def evaluate(args):
 
     sets = {
         "chat": [chat_ids(tok, p) for p in CHAT_PROMPTS],
-        "clean": [[1] + tok.encode(p, add_special_tokens=False).ids for p in spec_eval.CLEAN_PROMPTS],
+        "clean": [[1] + tok.encode(p, add_special_tokens=False).ids for p in CLEAN_PROMPTS],
     }
-    corpus = np.load(ROOT / "out" / "spec" / "selfgen.npy")
-    bigram, trigram = spec_eval.build_ngram(corpus, 1.0)  # the table flashed on the device
     heads = {}
     for p in sorted(OUT.glob("*_r*_d*.pt")):
         for q in args.head_quant:
@@ -336,14 +366,10 @@ def evaluate(args):
 
         cur = [0]  # index of the sequence being simulated
 
-        def ngram_fn(ctx, k):
-            d = spec_eval.draft_lookup(ctx, k)
-            return d if d else spec_eval.draft_ngram(ctx, k, bigram, trigram)
-
         def head_fn(head, lookup_first):
             def fn(ctx, k):
                 if lookup_first:
-                    d = spec_eval.draft_lookup(ctx, k)
+                    d = draft_lookup(ctx, k)
                     if d:
                         return d
                 h = hs[cur[0]][len(ctx) - 2][None]  # produced fed = ctx[-1]
@@ -351,7 +377,7 @@ def evaluate(args):
                 return draft_chain(head, h, fed, E, norm_w, min(k, head.depth))[0].tolist()
             return fn
 
-        drafters = {"ngram (current)": (ngram_fn, 0.0)}
+        drafters = {"prompt lookup only": (lambda ctx, k: draft_lookup(ctx, k), 0.0)}
         for name, head in heads.items():
             drafters[name] = (head_fn(head, False), 0.5)
             drafters["lookup + " + name] = (head_fn(head, True), 0.5)
@@ -361,7 +387,7 @@ def evaluate(args):
                 for s_i, (q, p) in enumerate(zip(seqs, plens)):
                     cur[0] = s_i
                     st = {}
-                    spec_eval.simulate([q], [p], fn, k, st)
+                    simulate([q], [p], fn, k, st)
                     passes += st["passes"]
                     tokens += st["tokens"]
                     drafted += st["drafted"]
@@ -399,14 +425,12 @@ def main():
     ap.add_argument("--head", type=Path, default=OUT / "recurrent_r512_d3.pt", help="export: trained head")
     ap.add_argument("--quant", choices=["q4", "q8"], default="q4", help="export: weight format")
     ap.add_argument("--out", type=Path, default=ROOT / "out" / "dhead.bin", help="export: output file")
-    ap.add_argument("--variant", choices=["medusa", "recurrent"], default="recurrent")
     ap.add_argument("--rank", type=int, default=512)
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--tokens", type=int, default=128, help="eval: greedy tokens per clean prompt")
-    ap.add_argument("--draft-vocab", type=int, default=None, help="eval: drafts only from ids below this")
     ap.add_argument("--head-quant", nargs="+", default=["f32"], choices=["f32", "q8", "q4"],
                     help="eval: head weights as stored on the device")
     ap.add_argument("--corpus", type=Path, nargs="+", default=[ROOT / "out" / "spec" / "selfgen.npy"],

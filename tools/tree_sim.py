@@ -26,7 +26,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import draft_heads as dh  # noqa: E402
 import export  # noqa: E402
-import spec_eval  # noqa: E402
 
 # Tree shapes: per node (parent index, rank among the parent's guesses);
 # index 0 is the root (the fed token). Siblings come from one head step.
@@ -81,7 +80,7 @@ def main():
     head = dh.load_head(args.head, E.shape[1], "q4")
     sets = {
         "chat": [dh.chat_ids(tok, p) for p in dh.CHAT_PROMPTS],
-        "clean": [[1] + tok.encode(p, add_special_tokens=False).ids for p in spec_eval.CLEAN_PROMPTS],
+        "clean": [[1] + tok.encode(p, add_special_tokens=False).ids for p in dh.CLEAN_PROMPTS],
     }
     for set_name, prompts in sets.items():
         seqs = []
@@ -97,7 +96,7 @@ def main():
                 i = p  # next position to produce; s[i-1] is fed, hs[i-2] produced it
                 while i < len(s):
                     fed = s[i - 1]
-                    drafts = spec_eval.draft_lookup(s[:i], 6)
+                    drafts = dh.draft_lookup(s[:i], 6)
                     if drafts:  # prompt lookup first, as on the device: a chain
                         acc = 0
                         while acc < len(drafts) and i + acc < len(s) and drafts[acc] == s[i + acc]:

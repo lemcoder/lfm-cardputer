@@ -67,7 +67,7 @@ DAT3 12 held high) and caps at `clock / 8` bytes per second.
 | SD 1-bit | 53.3 MHz | 5.03 bench / 6.13 in engine | all 4 sampling phases CRC-clean |
 | SD 1-bit | **80 MHz** | 6.76 bench / **8.90 in engine** | phases 1–3 clean, phase 0 fails; using phase 2 |
 
-The bench numbers (`firmware/main/sd_speed.cpp`) include CRC computation in
+The bench numbers (an SD clock test mode, since removed) include CRC computation in
 the read loop, so they're lower than in-engine throughput. Ratios are what
 matter.
 
@@ -191,8 +191,9 @@ The idea: draft k tokens cheaply, verify all k+1 positions in one pass over
 the weights (the same reads as one token), and keep drafts that match the
 model's own greedy choice. Output is identical to plain greedy decoding.
 
-`tools/spec_eval.py` builds a trigram → next-token table (bigram fallback)
-from WikiText-103 and simulates this on the model's own greedy output.
+A trigram → next-token table (bigram fallback) from WikiText-103, simulated
+on the model's own greedy output (the n-gram drafter and its tool were
+later replaced by the draft head and removed: experiments.md #30, cleanup).
 Results in tokens per pass (24 prompts, 1292 generated tokens):
 
 | Draft | k=1 | k=2 | k=3 |
@@ -246,13 +247,18 @@ reads the file back and checks size and CRC-32.
 ## Reproducing
 
 ```
-uv run tools/export.py --quant q4                      # out/lfm-q4.lfm (device file)
-uv run tools/upload.py                                 # to the card over USB
-# Zed: fw: flash + monitor
-./host/build/lfm_tests                                 # host tests (golden, async, batch, int8)
-./host/build/lfm_eval out/eval.txt out/lfm-bf16.lfm out/lfm-q4.lfm   # quality
-uv run tools/spec_eval.py                              # speculative decoding simulation
+uv run tools/lm_basis.py                                              # out/lm_basis.npy (low-rank LM head basis)
+uv run tools/export.py --quant q4 --lm-head lowrank --out out/lfm-q4-head-lr256.lfm   # the device's model file
+uv run tools/export_tokenizer.py                                      # out/tok.bin (chat tokenizer)
+uv run tools/upload.py out/lfm-q4-head-lr256.lfm:lfm.lfm out/tok.bin:tok.bin   # to the card over USB
+uv run tools/flash_head.py && tools/flash_part.sh lmhead out/lmhead.bin        # LM head table -> flash
+uv run tools/selfgen_corpus.py ...                                    # the model's own text (draft_heads.py header)
+uv run tools/draft_heads.py collect && uv run tools/draft_heads.py train && uv run tools/draft_heads.py export
+tools/flash_part.sh draft out/dhead.bin                               # draft head -> flash
+tools/idf.sh build flash                                              # firmware
+./host/build/lfm_tests                                                # host tests
+uv run tools/bench.py --prompt "..." --cfg gen=12,ignore_eos=1        # device benchmark (then re-upload a chat cfg.txt)
 ```
 
-In `firmware/main/main.cpp`, `kSdSpeedTest` and `kKernelTest` switch the
-firmware to the SD clock test or the SIMD kernel test.
+In `firmware/main/main.cpp`, `kKernelTest` switches the firmware to the
+SIMD kernel test (PIE kernels vs the C reference).

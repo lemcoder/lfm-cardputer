@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Write a file into a flash data partition (see firmware/partitions.csv).
-#   tools/flash_part.sh ngram  out/ngram.bin    # speculative-decoding n-gram table
+#   tools/flash_part.sh draft  out/dhead.bin    # speculative-decoding draft head
 #   tools/flash_part.sh lmhead out/lmhead.bin   # LM head shortlist table
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

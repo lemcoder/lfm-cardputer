@@ -2,10 +2,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["torch", "transformers>=4.57", "numpy", "datasets", "huggingface_hub", "tokenizers"]
 # ///
-"""Corpus of the model's own greedy text, for the speculative n-gram table.
+"""Corpus of the model's own greedy text, to train the draft head on
+(tools/draft_heads.py).
 
-Drafts should predict what *this model* writes greedily, so the table is
-built from its greedy continuations of many clean prompts (WikiText
+Drafts should predict what *this model* writes greedily, so the head learns
+from its greedy continuations of many clean prompts (WikiText
 paragraph openings with the dataset's tokenization artifacts undone:
 "@,@" -> ",", " ," -> ",", ...).
 

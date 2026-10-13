@@ -93,7 +93,7 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 38 | 2-bit / 3-bit layer weights (`tools/quant2_study.py`; RTN and GPTQ; WikiText-2 perplexity, next-token agreement with the Q4 model on chat) | BF16 47.3 / Q4 53.5. 2-bit: RTN 2569, GPTQ 284 (b64) / 224 (b32), MLP-only 143 — agreement 15–58%: broken. 3-bit GPTQ b64 (3.5 bits, −22% bytes): 68.6, 74% agreement; b32: 65.0 | no (2-bit); 3-bit parked |
 | 39 | **Tree drafts on the device**: the draft head proposes a tree (top 3 first guesses, one more under the best two, one more under the best path: `lfm::kTree3x1`, 6 drafts); `Engine::verify_tree` places each node at its depth, attention sees context + ancestors, conv windows follow the ancestry, `accept_path` rebuilds the conv state and moves accepted K/V rows. Host tests: every node's prediction equals decoding its own path; output identical to greedy | Chat (48 tokens): 1.71 → **2.00 tokens/pass**, but 7 verified positions cost ~1 s more LM head per pass: 6.52 → 6.35 s/token. B2: 4.97 → 4.55 s/token | yes |
 | 40 | **Lazy re-score in verification**: the shared LM head table scan still covers every position, but exact re-scoring follows only the path that can still be accepted (root, then the child matching its prediction, ...) | Chat 48 tokens: 6.35 → **6.10 s/token** (total 336 → 317 s with #39); B2 4.55 → **4.39 s/token**, total 84.6 → 78.2 s; same tokens | yes |
-| 41 | **Lossless compression of the layer weights** (`tools/zcodec.py`, `lfm/zcodec.hpp`, `lfm/zfile.hpp`): Huffman codes (≤ 10 bits, one table for the 4-bit-value bytes, one for the scales' high byte; low byte raw), chunks = the engine's 32 KB blocks, stored in `/lfm.lfz` next to the `.lfm`. Each block streams into the end of the engine's buffer and the reader task on core 1 decodes it in place while the DMA is still writing it. Ideal order-0 saving 10.4% (values 7%, scales 37%); achieved 8.4% (91.4 → 83.7 MB); decoder 14.8 MB/s on one core (first version 6.0) | Same tokens. Like for like (batch 6, chain) B2 4.93 → **4.75 s/token (−3.7%)**, prompt +1%. But ~8 KB of RAM (tables, index, buffer extra) drops the prompt batch 7 → 6, which also disables the tree: 78.2 → 92.0 s. Left in, off by default (`compress=1` in cfg.txt) | no (RAM) |
+| 41 | **Lossless compression of the layer weights** (`tools/zcodec.py`, `lfm/zcodec.hpp`, `lfm/zfile.hpp`): Huffman codes (≤ 10 bits, one table for the 4-bit-value bytes, one for the scales' high byte; low byte raw), chunks = the engine's 32 KB blocks, stored in `/lfm.lfz` next to the `.lfm`. Each block streams into the end of the engine's buffer and the reader task on core 1 decodes it in place while the DMA is still writing it. Ideal order-0 saving 10.4% (values 7%, scales 37%); achieved 8.4% (91.4 → 83.7 MB); decoder 14.8 MB/s on one core (first version 6.0) | Same tokens. Like for like (batch 6, chain) B2 4.93 → **4.75 s/token (−3.7%)**, prompt +1%. But ~8 KB of RAM (tables, index, buffer extra) drops the prompt batch 7 → 6, which also disables the tree: 78.2 → 92.0 s. Code removed (see Cleanup) | no (RAM) |
 
 
 ## 29 in detail: Wi-Fi + SD in parallel
@@ -180,8 +180,8 @@ Training data mattered most: trained on WikiText only, the head was right
 the drafted token back in (recurrent) beats separate per-depth heads.
 
 **On the device.** Rank 512, Q4: 0.86 MB in the flash partition that held
-the n-gram table (`tools/draft_heads.py export`, `tools/flash_part.sh ngram
-out/dhead.bin`). Per draft: embedding row (flash cache or SD), two matvecs
+the n-gram table, now called `draft` (`tools/draft_heads.py export`,
+`tools/flash_part.sh draft out/dhead.bin`). Per draft: embedding row (flash cache or SD), two matvecs
 from flash, then the flash LM-head table scan with only the top 16 candidates
 re-scored. Engine scratch slots hold the temporaries, so no extra RAM.
 Measured: 1.71 tokens/pass on a 48-token chat reply (host prediction 1.70),
@@ -202,3 +202,22 @@ of tokens).
 - **Both cores computing:** SD is busy 92–93% of the time; compute already hides behind it.
 - **Tree / multi-candidate speculative drafts:** needs tree attention; current single-chain acceptance (~1.3 tokens per pass) suggests little headroom with these drafters.
 
+## Cleanup: code removed after the experiments
+
+Everything optional that didn't make the device faster was removed from the
+tree; the last commit that still has all of it is `b0ead88` (`git show
+b0ead88:<path>` to get a file back).
+
+| Removed | Experiment | Why |
+|---|---|---|
+| Weight compression: `lfm/zcodec.*`, `lfm/zfile.*`, the `.lfz` path in `AsyncFile`, `EngineConfig::io_extra`, the SD driver's landed-bytes API and 2 KB descriptors, `tools/zcodec.py`, the decoder test mode, its host tests | #41 | −3.7% per token like for like, but its RAM costs the prompt batch 7 and the tree: a net loss |
+| N-gram draft table: `Drafter::set_ngram` and the table format, the firmware fallback, `tools/spec_eval.py` (its prompt-lookup and simulation helpers moved into `tools/draft_heads.py`) | #5, #30 | replaced by the draft head; the flash partition is now named `draft` |
+| Drafts in the last prompt batch: `speculative_prefill`, cfg `spec_prefill` | #20 | no gain |
+| Layer skipping: `EngineConfig::skip_layers`, `LFM_SKIP_LAYERS` in `lfm_eval` | #7 | wrecks the model |
+| SD test modes: `sd_speed.cpp` (clock sweep, raw reads, stream test), `sd_bench.cpp` | #2–4, #34–36 | measurements, done |
+| Medusa heads and `--draft-vocab` in `tools/draft_heads.py` | #30, #32 | worse than the recurrent head / no gain |
+| `tools/quant2_study.py`, `tools/sparsity_eval.py` | #8, #38 | studies of rejected ideas |
+
+Kept: the SIMD kernel test mode (`kKernelTest`, correctness of the PIE
+kernels on the device) and every host test of code that ships.
+After the cleanup B2 is unchanged: 78.1 s, the same 12 tokens.

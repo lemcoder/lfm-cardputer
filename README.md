@@ -50,6 +50,10 @@ Uses clangd. Each of `firmware/`, `host/`, `lfm/` has a `.clangd` pointing at th
 For firmware, Espressif's `esp-clang` (`idf_tools.py install esp-clang`) gives better
 Xtensa header resolution than macOS clangd.
 
+**Performance and findings:** [docs/performance.md](docs/performance.md): what limits speed on this
+hardware, every optimisation with device measurements (413 s -> 55 s for the golden prompt), quality of
+the quantized variants, and what's next.
+
 ## Hardware facts (Cardputer-Adv, verified against M5Cardputer-UserDemo `CardputerADV` branch)
 
 - ESP32-S3FN8, 240 MHz dual core, 8 MB flash, **no PSRAM** -> ~512 KB SRAM, ~300 KB usable.

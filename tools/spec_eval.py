@@ -11,6 +11,7 @@ only on how often the draft is right. This script measures that.
 
     uv run tools/spec_eval.py                  # wikitext-103 n-gram table + prompt lookup
     uv run tools/spec_eval.py --gen-prompts 40 --gen-tokens 160
+    uv run tools/spec_eval.py --export out/ngram.bin    # also write the device table (lfm/draft.hpp)
 
 Drafts:
   ngram   trigram (a, b) -> most frequent next token, bigram fallback, built
@@ -90,6 +91,30 @@ def build_ngram(corpus: np.ndarray, budget_mb: float):
     return bigram, trigram
 
 
+def write_table(path: Path, bigram: np.ndarray, trigram: dict, load: float = 0.6) -> None:
+    """Binary table read by lfm::Drafter (layout in lfm/include/lfm/draft.hpp)."""
+    slots = 1
+    while slots * load < len(trigram):
+        slots *= 2
+    bits = slots.bit_length() - 1
+    keys = np.zeros(slots, dtype="<u4")
+    nexts = np.full(slots, 0xFFFF, dtype="<u2")
+    for key, nxt in trigram.items():
+        a, b = divmod(int(key), 65536)
+        k32 = (a << 16) | b
+        s = ((k32 * 0x9E3779B1) & 0xFFFFFFFF) >> (32 - bits)
+        while nexts[s] != 0xFFFF:
+            s = (s + 1) & (slots - 1)
+        keys[s], nexts[s] = k32, nxt
+    entries = np.zeros(slots, dtype=[("key", "<u4"), ("next", "<u2"), ("pad", "<u2")])
+    entries["key"], entries["next"] = keys, nexts
+    bi = np.where(bigram >= 0, bigram, 0xFFFF).astype("<u2")
+    header = b"LFMNGRM\0" + np.array([1, 65536, slots, 0], dtype="<u4").tobytes()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(header + bi.tobytes() + entries.tobytes())
+    print(f"wrote {path}: {len(trigram)} trigrams in {slots} slots, {path.stat().st_size / 1e6:.2f} MB")
+
+
 def draft_ngram(ctx: list[int], k: int, bigram, trigram) -> list[int]:
     out, c = [], list(ctx[-2:])
     for _ in range(k):
@@ -156,12 +181,20 @@ def main():
     ap.add_argument("--budget-mb", type=float, nargs="+", default=[1.0, 2.5, 5.5])
     ap.add_argument("--gen-prompts", type=int, default=24)
     ap.add_argument("--gen-tokens", type=int, default=128)
+    ap.add_argument("--export", type=Path, help="write the n-gram table for the device here")
+    ap.add_argument("--export-mb", type=float, default=1.0, help="trigram budget for --export")
     args = ap.parse_args()
 
     tok = Tokenizer.from_file(hf_hub_download(MODEL, "tokenizer.json"))
     t0 = time.time()
     corpus = tokenize_corpus(tok, "train", args.corpus_mb)
     print(f"corpus: {len(corpus) / 1e6:.1f}M tokens ({time.time() - t0:.0f} s)")
+
+    if args.export:
+        bigram, trigram = build_ngram(corpus, args.export_mb)
+        write_table(args.export, bigram, trigram)
+        if args.gen_prompts == 0:
+            return
 
     seqs, plens = greedy_sequences(args.gen_prompts, args.gen_tokens, tok)
     sample = tok.decode(seqs[0][plens[0]:plens[0] + 60])

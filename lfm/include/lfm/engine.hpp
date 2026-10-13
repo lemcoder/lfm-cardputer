@@ -52,6 +52,11 @@ struct EngineConfig {
     // weight rows are dotted with integer math (llama.cpp's Q8 x Q8). Much
     // faster on the ESP32-S3; slightly less exact than float activations.
     bool int8_activations = false;
+    // Allow verify()/accept() (speculative decoding). Rolling back needs each
+    // conv layer's state history: (conv_l - 1 + max_batch) rows of dim floats
+    // per conv layer, in RAM, or in this file if set (the device: ~160 KB).
+    bool speculative = false;
+    const char* conv_history_path = nullptr;
 };
 
 class Engine {
@@ -83,6 +88,7 @@ public:
     static constexpr int32_t kNoToken = -1;      // want_next was false
     static constexpr int32_t kIoError = -2;
     static constexpr int32_t kContextFull = -3;  // pos() == max_ctx()
+    static constexpr int32_t kInvalid = -4;      // bad verify() arguments / not enabled
 
     // Feed `token` at position pos() and advance.
     // With want_next, also runs the LM head and returns the greedy next token
@@ -93,6 +99,16 @@ public:
     // as calling forward() on each, but with fewer weight reads. With
     // want_next, returns the greedy token after the last one.
     int32_t prefill(std::span<const int32_t> tokens, bool want_next, float* logits = nullptr);
+
+    // Speculative decoding (EngineConfig::speculative). verify() feeds
+    // tokens[0] (the last real token) and drafts tokens[1..] at positions
+    // pos() .. pos()+n-1 in one pass over the weights (n <= max_batch), and
+    // writes the greedy next token after each position into preds[0..n).
+    // Draft i is right iff tokens[i+1] == preds[i]. Then accept(k) keeps the
+    // first k positions (1 <= k <= n) and rolls the rest back; call it before
+    // anything else. Returns preds[n-1], or a negative code.
+    int32_t verify(std::span<const int32_t> tokens, int32_t* preds);
+    bool accept(int keep);
 
     // Bytes of token `id` (UTF-8 / raw bytes) into buf. Returns the length,
     // truncated to cap. Not NUL-terminated.
@@ -118,10 +134,16 @@ private:
     // row bytes) for each, with the next chunk's read overlapping fn's work.
     template <typename Fn>
     bool stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&& fn);
-    int32_t lm_head(std::span<const float> x, float* logits);
+    // Greedy next token for each of n normalised vectors (one shared scan);
+    // logits (n == 1 only) gets every vocab score.
+    bool lm_head(const Ptrs& xs, int n, int32_t* out, float* logits);
 
     // n tokens at positions pos_ .. pos_+n-1: read xn_[b], write tmp_[b].
-    int32_t run_batch(const int32_t* tokens, int n, bool want_next, float* logits);
+    // preds != nullptr: next token after every position (verify).
+    int32_t run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds);
+    std::size_t hist_rows() const;
+    bool hist_put(int slot, int row, const float* src);
+    bool hist_get(int slot, int row, float* dst);
     bool conv_op(int layer, int n);
     bool attn_op(int layer, int n);
     bool mlp(int layer, int n);
@@ -170,6 +192,12 @@ private:
     // or in a file: rows appended position-major, (pos * n_attn + layer).
     std::byte* kv_ram_[kMaxLayers] = {};
     FileSource* kv_file_ = nullptr;
+    // Speculative decoding: conv history, verify() state.
+    float* hist_ram_ = nullptr;
+    FileSource* hist_file_ = nullptr;
+    bool recording_ = false;
+    int pending_start_ = 0;
+    int pending_n_ = 0;
 
     LayerHook layer_hook_ = nullptr;
     void* layer_ctx_ = nullptr;

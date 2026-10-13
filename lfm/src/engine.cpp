@@ -21,7 +21,7 @@ const char* to_string(Status s) {
         case Status::BadVersion: return "unsupported .lfm version";
         case Status::Unsupported: return "unsupported model config";
         case Status::OutOfMemory: return "out of memory";
-        case Status::KvFileError: return "can't create KV cache file";
+        case Status::KvFileError: return "can't create KV cache / history file";
     }
     return "?";
 }
@@ -112,6 +112,8 @@ Engine::~Engine() {
     for (float* p : conv_state_) std::free(p);
     for (std::byte* p : kv_ram_) std::free(p);
     delete kv_file_;
+    std::free(hist_ram_);
+    delete hist_file_;
 }
 
 // 16-byte aligned (SIMD loads), and 16 bytes of slack at the end: the SIMD
@@ -212,6 +214,15 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
             if (conv_state_[i] == nullptr) return Status::OutOfMemory;
         }
     }
+    if (cfg.speculative && n_conv_ > 0) {
+        if (cfg.conv_history_path != nullptr) {
+            hist_file_ = new FileSource(cfg.conv_history_path, FileSource::Mode::ReadWrite);
+            if (!hist_file_->ok()) return Status::KvFileError;
+        } else {
+            hist_ram_ = static_cast<float*>(std::malloc(static_cast<std::size_t>(n_conv_) * hist_rows() * d.dim * sizeof(float)));
+            if (hist_ram_ == nullptr) return Status::OutOfMemory;
+        }
+    }
     if (cfg.kv_path != nullptr) {
         kv_file_ = new FileSource(cfg.kv_path, FileSource::Mode::ReadWrite);
         if (!kv_file_->ok()) return Status::KvFileError;
@@ -229,6 +240,7 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
 
 void Engine::reset() {
     pos_ = 0;
+    pending_n_ = 0;
     for (int i = 0; i < n_conv_; ++i) {
         if (conv_state_[i] != nullptr) std::memset(conv_state_[i], 0, (h_.conv_l - 1) * h_.dim * sizeof(float));
     }
@@ -333,56 +345,73 @@ bool Engine::matvec(const Ptrs& out, std::size_t rows, uint64_t offset, Dtype dt
 // and only its top `lm_head_candidates` are re-scored with the exact rows:
 // same top-1 (unless the true winner falls outside the shortlist), about half
 // the bytes. With `logits` requested, the exact full scan is used.
-int32_t Engine::lm_head(std::span<const float> x, float* logits) {
+bool Engine::lm_head(const Ptrs& xs, int n, int32_t* out, float* logits) {
+    assert(n >= 1 && n <= cfg_.max_batch && (logits == nullptr || n == 1));
     const bool shortlist = h_.lm_head != 0 && logits == nullptr;
     const Dtype scan_dt = shortlist ? h_.lm_head_dtype : h_.embed_dtype;
     const uint64_t scan_off = shortlist ? h_.lm_head : h_.embed;
     const std::size_t rb = row_bytes(scan_dt, h_.dim);
 
-    // Integer path (see matvec): quantize x once for the scan and the re-score.
+    // Integer path (see matvec): quantize each x once for the scan and the re-score.
     const bool int8 = xq_ != nullptr && logits == nullptr;
-    if (int8) m::quantize_q8(x, xq_, xs_);
-    auto score = [&](Dtype dt, const std::byte* row) {
-        if (int8 && dt == Dtype::Q8_0) return m::dot_q8_0_q8(row, xq_, xs_, h_.dim);
-        if (int8 && dt == Dtype::Q4_0) return m::dot_q4_0_q8(row, xq_, xs_, h_.dim);
-        return dot_row(dt, row, x);
+    if (int8) {
+        for (int b = 0; b < n; ++b) m::quantize_q8({xs.p[b], h_.dim}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
+    }
+    auto score = [&](int b, Dtype dt, const std::byte* row) {
+        const int8_t* q = xq_ + b * xq_cols_;
+        const float* sc = xs_ + b * (xq_cols_ / 32);
+        if (int8 && dt == Dtype::Q8_0) return m::dot_q8_0_q8(row, q, sc, h_.dim);
+        if (int8 && dt == Dtype::Q4_0) return m::dot_q4_0_q8(row, q, sc, h_.dim);
+        return dot_row(dt, row, {xs.p[b], h_.dim});
     };
 
-    // Top-k by approximate score, kept sorted descending (k is small).
+    // Per token: top-k by (approximate) score, kept sorted descending; ties
+    // keep the lower id first, like argmax.
     const int k = shortlist ? static_cast<int>(h_.lm_head_candidates) : 1;
-    float top_score[kMaxCandidates];
-    int32_t top_id[kMaxCandidates];
-    int n_top = 0;
+    float top_score[kMaxBatch][kMaxCandidates];
+    int32_t top_id[kMaxBatch][kMaxCandidates];
+    int n_top[kMaxBatch] = {};
 
     const bool ok = stream_rows(scan_off, h_.vocab, rb, [&](std::size_t r, const std::byte* row) {
-        const float v = score(scan_dt, row);
-        if (logits != nullptr) logits[r] = v;
-        if (n_top == k && v <= top_score[k - 1]) return;
-        int pos = n_top < k ? n_top++ : k - 1;
-        while (pos > 0 && top_score[pos - 1] < v) {
-            top_score[pos] = top_score[pos - 1];
-            top_id[pos] = top_id[pos - 1];
-            --pos;
+        for (int b = 0; b < n; ++b) {
+            const float v = score(b, scan_dt, row);
+            if (logits != nullptr) logits[r] = v;
+            float* ts = top_score[b];
+            int32_t* ti = top_id[b];
+            if (n_top[b] == k && v <= ts[k - 1]) continue;
+            int pos = n_top[b] < k ? n_top[b]++ : k - 1;
+            while (pos > 0 && ts[pos - 1] < v) {
+                ts[pos] = ts[pos - 1];
+                ti[pos] = ti[pos - 1];
+                --pos;
+            }
+            ts[pos] = v;
+            ti[pos] = static_cast<int32_t>(r);
         }
-        top_score[pos] = v;
-        top_id[pos] = static_cast<int32_t>(r);
     });
-    if (!ok) return kIoError;
-    if (!shortlist) return top_id[0];
+    if (!ok) return false;
 
-    // Re-score the shortlist with the exact rows.
-    const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
-    float best = -INFINITY;
-    int32_t best_id = top_id[0];
-    for (int i = 0; i < n_top; ++i) {
-        if (!src_->read_at(h_.embed + static_cast<uint64_t>(top_id[i]) * erb, io_, erb)) return kIoError;
-        const float v = score(h_.embed_dtype, io_);
-        if (v > best || (v == best && top_id[i] < best_id)) {
-            best = v;
-            best_id = top_id[i];
+    for (int b = 0; b < n; ++b) {
+        if (!shortlist) {
+            out[b] = top_id[b][0];
+            continue;
         }
+        // Re-score the shortlist with the exact rows.
+        const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
+        float best = -INFINITY;
+        int32_t best_id = top_id[b][0];
+        for (int i = 0; i < n_top[b]; ++i) {
+            const int32_t id = top_id[b][i];
+            if (!src_->read_at(h_.embed + static_cast<uint64_t>(id) * erb, io_, erb)) return false;
+            const float v = score(b, h_.embed_dtype, io_);
+            if (v > best || (v == best && id < best_id)) {
+                best = v;
+                best_id = id;
+            }
+        }
+        out[b] = best_id;
     }
-    return best_id;
+    return true;
 }
 
 // ---------------------------------------------------------------- layers
@@ -401,8 +430,14 @@ bool Engine::conv_op(int layer, int n) {
     if (!matvec(slots(0), 3 * d.dim, L.conv_in, h_.dtype(layer, kConvIn), d.dim, acts(xn_), n)) return false;
     if (!read_f32(L.conv_kernel, {kernel, d.dim * d.conv_l})) return false;
 
-    float* state = conv_state_[layer_slot_[layer]];
+    const int cs = layer_slot_[layer];
+    float* state = conv_state_[cs];
     const std::size_t hist = d.conv_l - 1;  // previous tokens kept
+    if (recording_) {  // speculative verify: keep what accept() may need to roll back to
+        for (std::size_t j = 0; j < hist; ++j) {
+            if (!hist_put(cs, static_cast<int>(j), state + j * d.dim)) return false;
+        }
+    }
     for (int b = 0; b < n; ++b) {
         float* B = slot(b);
         const float* C = B + d.dim;
@@ -421,6 +456,7 @@ bool Engine::conv_op(int layer, int n) {
             state[(hist - 1) * d.dim + c] = bx;
             B[c] = C[c] * y;  // B is no longer needed: reuse it for out_proj's input
         }
+        if (recording_ && !hist_put(cs, static_cast<int>(hist) + b, state + (hist - 1) * d.dim)) return false;
     }
     return matvec(acts(tmp_), d.dim, L.conv_out, h_.dtype(layer, kConvOut), d.dim, slots(0), n);
 }
@@ -596,7 +632,7 @@ bool Engine::mlp(int layer, int n) {
 
 // ---------------------------------------------------------------- forward
 
-int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* logits) {
+int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds) {
     if (pos_ + n > cfg_.max_ctx) return kContextFull;
     const Dims d(h_);
     std::span<float> norm_w{norm_w_, d.dim};
@@ -640,29 +676,95 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
     }
     pos_ += n;
 
-    if (!want_next) {
+    if (!want_next && preds == nullptr) {
         progress(static_cast<int>(h_.n_layers) + 1);
         return kNoToken;
     }
-    // Only the last token's next-token prediction is needed.
-    std::span<float> xn{act(xn_, n - 1), d.dim};
     if (!read_f32(h_.final_norm, norm_w)) return kIoError;
-    m::rmsnorm(xn, {act(x_, n - 1), d.dim}, norm_w, h_.norm_eps);
-    const int32_t next = lm_head(xn, logits);
+    int32_t next = kNoToken;
+    if (preds != nullptr) {
+        // Every position's next token (speculative verification): one scan
+        // of the LM head for all of them.
+        for (int b = 0; b < n; ++b) m::rmsnorm({act(xn_, b), d.dim}, {act(x_, b), d.dim}, norm_w, h_.norm_eps);
+        if (!lm_head(acts(xn_), n, preds, nullptr)) return kIoError;
+        next = preds[n - 1];
+    } else {
+        // Only the last token's prediction is needed.
+        m::rmsnorm({act(xn_, n - 1), d.dim}, {act(x_, n - 1), d.dim}, norm_w, h_.norm_eps);
+        Ptrs last{};
+        last.p[0] = act(xn_, n - 1);
+        if (!lm_head(last, 1, &next, logits)) return kIoError;
+    }
     progress(static_cast<int>(h_.n_layers) + 1);
     return next;
 }
 
 int32_t Engine::forward(int32_t token, bool want_next, float* logits) {
-    return run_batch(&token, 1, want_next, logits);
+    assert(pending_n_ == 0 && "verify() must be followed by accept()");
+    return run_batch(&token, 1, want_next, logits, nullptr);
+}
+
+int32_t Engine::verify(std::span<const int32_t> tokens, int32_t* preds) {
+    assert(pending_n_ == 0 && "verify() must be followed by accept()");
+    const int n = static_cast<int>(tokens.size());
+    if (n < 1 || n > cfg_.max_batch || !cfg_.speculative) return kInvalid;
+    const int start = pos_;
+    recording_ = true;
+    const int32_t r = run_batch(tokens.data(), n, true, nullptr, preds);
+    recording_ = false;
+    if (r < 0) return r;  // nothing pending: pos_ only moves on success
+    pending_start_ = start;
+    pending_n_ = n;
+    return r;
+}
+
+bool Engine::accept(int keep) {
+    if (pending_n_ == 0 || keep < 1 || keep > pending_n_) return false;
+    if (keep < pending_n_) {
+        // Conv state after `keep` tokens = history rows keep .. keep+hist-1
+        // (history = the state before verify(), then each token's bx).
+        const std::size_t hist = h_.conv_l - 1;
+        for (int s = 0; s < n_conv_; ++s) {
+            for (std::size_t j = 0; j < hist; ++j) {
+                if (!hist_get(s, static_cast<int>(static_cast<std::size_t>(keep) + j), conv_state_[s] + j * h_.dim)) {
+                    return false;
+                }
+            }
+        }
+        // Rejected K/V rows are simply overwritten by the next positions.
+    }
+    pos_ = pending_start_ + keep;
+    pending_n_ = 0;
+    return true;
+}
+
+// Conv history for speculative rollback: per conv layer, rows of dim floats:
+// the conv_l-1 state rows before verify(), then one row (bx) per token.
+std::size_t Engine::hist_rows() const { return h_.conv_l - 1 + static_cast<std::size_t>(cfg_.max_batch); }
+
+bool Engine::hist_put(int slot, int row, const float* src) {
+    const std::size_t bytes = h_.dim * sizeof(float);
+    const std::size_t idx = static_cast<std::size_t>(slot) * hist_rows() + static_cast<std::size_t>(row);
+    if (hist_file_ != nullptr) return hist_file_->write_at(idx * bytes, src, bytes);
+    std::memcpy(hist_ram_ + idx * h_.dim, src, bytes);
+    return true;
+}
+
+bool Engine::hist_get(int slot, int row, float* dst) {
+    const std::size_t bytes = h_.dim * sizeof(float);
+    const std::size_t idx = static_cast<std::size_t>(slot) * hist_rows() + static_cast<std::size_t>(row);
+    if (hist_file_ != nullptr) return hist_file_->read_at(idx * bytes, dst, bytes);
+    std::memcpy(dst, hist_ram_ + idx * h_.dim, bytes);
+    return true;
 }
 
 int32_t Engine::prefill(std::span<const int32_t> tokens, bool want_next, float* logits) {
+    assert(pending_n_ == 0 && "verify() must be followed by accept()");
     int32_t next = kNoToken;
     for (std::size_t i = 0; i < tokens.size();) {
         const int n = static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(cfg_.max_batch), tokens.size() - i));
         const bool last = i + static_cast<std::size_t>(n) == tokens.size();
-        next = run_batch(tokens.data() + i, n, want_next && last, last ? logits : nullptr);
+        next = run_batch(tokens.data() + i, n, want_next && last, last ? logits : nullptr, nullptr);
         if (next < kNoToken) return next;  // error / context full
         i += static_cast<std::size_t>(n);
     }

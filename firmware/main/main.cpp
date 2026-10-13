@@ -4,6 +4,10 @@
 //   /lfm.lfm       out/lfm-q8.lfm
 //   /prompt.txt    out/prompt.txt  (token ids; optional, defaults below)
 //   /kv.bin        created at boot: the KV cache lives on the card, not in RAM
+//   /conv.bin      created at boot: conv state history for speculative rollback
+//
+// Flash partition "weights": the n-gram draft table (tools/flash_ngram.sh).
+// Without it, speculative decoding still runs with prompt-lookup drafts.
 //
 // No card reader? `uv run tools/upload.py` sends the files over the USB cable
 // (the firmware listens for it for 1.5 s after boot, or until it arrives if
@@ -26,10 +30,12 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lfm.hpp"
+#include "lfm/draft.hpp"
 #include "lfm/engine.hpp"
 #include "async_file.hpp"
 #include "sd_card.hpp"
@@ -43,6 +49,7 @@ constexpr const char* TAG = "lfm";
 constexpr const char* kModelPath = "/sdcard/lfm.lfm";
 constexpr const char* kPromptPath = "/sdcard/prompt.txt";
 constexpr const char* kKvPath = "/sdcard/kv.bin";
+constexpr const char* kConvHistPath = "/sdcard/conv.bin";
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
 constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
@@ -211,7 +218,7 @@ extern "C" void app_main(void) {
     // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
     constexpr std::size_t kReserve = 24 * 1024;
     lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath,
-                          .int8_activations = true};
+                          .int8_activations = true, .speculative = true, .conv_history_path = kConvHistPath};
     static lfm::Engine* eng = nullptr;
     lfm::Status status = lfm::Status::OutOfMemory;
     for (int batch = 6; batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {
@@ -243,6 +250,21 @@ extern "C" void app_main(void) {
     static int32_t prompt[kMaxPrompt];
     const int n_prompt = read_prompt(prompt, kMaxPrompt);
 
+    // Speculative decoding drafts: prompt lookup over the context, else the
+    // n-gram table memory-mapped from flash (if flashed).
+    static int32_t draft_hist[kMaxCtx];
+    static lfm::Drafter drafter(draft_hist, kMaxCtx);
+    if (const esp_partition_t* part = esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA, static_cast<esp_partition_subtype_t>(0x40), "weights")) {
+        const void* table = nullptr;
+        esp_partition_mmap_handle_t handle;
+        if (esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_DATA, &table, &handle) == ESP_OK) {
+            const bool ok = drafter.set_ngram(table, part->size);
+            ESP_LOGI(TAG, "n-gram draft table: %s", ok ? "loaded from flash" : "not flashed (lookup only)");
+        }
+    }
+    const int max_draft = cfg.max_batch - 1;
+
     while (true) {
         eng->reset();
         g_status = {};
@@ -263,21 +285,40 @@ extern "C" void app_main(void) {
         }
         ESP_LOGI(TAG, "prefill %d tokens: %.1f s", n_prompt, (esp_timer_get_time() - t0) / 1e6);
 
-        // Generate until EOS or the context is full.
+        // Generate until EOS or the context is full: speculative steps, each
+        // one pass over the weights for the newest token plus its drafts.
         set_phase("generating");
+        drafter.reset();
+        for (int i = 0; i < n_prompt; ++i) drafter.push(prompt[i]);
+        lfm::SpecStats spec;
         int64_t t_gen = esp_timer_get_time();
-        while (next >= 0) {
-            show_token(*eng, next, TFT_WHITE);
+        int32_t fed = next;
+        if (fed >= 0) {
+            show_token(*eng, fed, TFT_WHITE);
             ++g_status.tokens;
-            if (next == lfm::kEosId) break;
-            next = eng->forward(next, true);
-            g_status.sec_per_tok = (esp_timer_get_time() - t_gen) / 1e6f / g_status.tokens;
+            drafter.push(fed);
+        }
+        while (fed >= 0 && fed != lfm::kEosId) {
+            int32_t produced[lfm::Engine::kMaxBatch];
+            const int got = lfm::speculative_step(*eng, drafter, fed, max_draft, produced, &spec);
+            if (got < 0) {
+                next = got;
+                break;
+            }
+            for (int i = 0; i < got; ++i) {
+                show_token(*eng, produced[i], i + 1 < got ? TFT_GREENYELLOW : TFT_WHITE);  // accepted drafts tinted
+                ++g_status.tokens;
+                fed = produced[i];
+                if (fed == lfm::kEosId) break;
+            }
+            g_status.sec_per_tok = (esp_timer_get_time() - t_gen) / 1e6f / (g_status.tokens - 1);
             const double total = (esp_timer_get_time() - t0) / 1e6;
-            ESP_LOGI(TAG, "token %d: %.1f s/tok avg | so far %.1f s: SD busy %.1f s (%.0f%%, %.2f MB/s), "
-                     "compute stalled on SD %.1f s (%.0f%%)",
-                     g_status.tokens, g_status.sec_per_tok, total, src.sd_busy_seconds(),
+            ESP_LOGI(TAG, "token %d: %.1f s/tok avg | pass %d: %.2f tok/pass, drafts %d/%d accepted | "
+                     "so far %.1f s: SD busy %.0f%% (%.2f MB/s), compute stalled on SD %.0f%%",
+                     g_status.tokens, g_status.sec_per_tok, spec.passes,
+                     static_cast<double>(spec.tokens) / spec.passes, spec.accepted, spec.drafted, total,
                      100.0 * src.sd_busy_seconds() / total, src.bytes_read() / 1e6 / src.sd_busy_seconds(),
-                     src.stall_seconds(), 100.0 * src.stall_seconds() / total);
+                     100.0 * src.stall_seconds() / total);
         }
         if (next == lfm::Engine::kIoError) fatal("SD read error", "check the card");
         set_phase(next == lfm::Engine::kContextFull ? "context full  G0: again" : "done  G0: again");

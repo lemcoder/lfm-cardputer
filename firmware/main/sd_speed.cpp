@@ -11,6 +11,8 @@
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
+#include "driver/sdmmc_host.h"
+#include "esp_rom_sys.h"
 #include "sd_card.hpp"
 
 namespace {
@@ -99,6 +101,30 @@ static esp_err_t read_no_status(sdmmc_card_t* card, void* dst, std::size_t lba, 
     return err != ESP_OK ? err : cmd.error;
 }
 
+// One CMD18 for the whole 8 MB, through two 32 KB buffers fed back as they're
+// consumed; `work_us` of busy CPU per block stands in for the engine's compute.
+static double stream_test(sdmmc_card_t* card, uint8_t* bufs[2], std::size_t lba, std::size_t total, int work_us,
+                          uint32_t* crc, esp_err_t* err) {
+    const uint32_t arg = (card->ocr & (1u << 30)) ? lba : lba * 512;
+    const int64_t t0 = esp_timer_get_time();
+    *crc = 0;
+    *err = sdmmc_host_stream_begin(card->host.slot, arg, total);
+    std::size_t fed = 0;
+    for (int i = 0; i < 2 && *err == ESP_OK && fed < total; ++i, fed += kChunk) *err = sdmmc_host_stream_feed(bufs[i], kChunk);
+    for (std::size_t done = 0, i = 0; done < total && *err == ESP_OK; done += kChunk, i ^= 1) {
+        *err = sdmmc_host_stream_wait(bufs[i], 1000);
+        if (*err != ESP_OK) break;
+        *crc = esp_rom_crc32_le(*crc, bufs[i], kChunk);
+        if (work_us > 0) esp_rom_delay_us(work_us);
+        if (fed < total) {
+            *err = sdmmc_host_stream_feed(bufs[i], kChunk);
+            fed += kChunk;
+        }
+    }
+    if (*err == ESP_OK) *err = sdmmc_host_stream_end();
+    return total / 1e6 / ((esp_timer_get_time() - t0) / 1e6);
+}
+
 void sd_raw_test(PrintFn print, const SdCard& sd) {
     auto* card = const_cast<sdmmc_card_t*>(sd.card());
     constexpr std::size_t kMax = 128 * 1024;
@@ -154,6 +180,34 @@ void sd_raw_test(PrintFn print, const SdCard& sd) {
                       crc_a == crc_b ? "" : " CRC MISMATCH");
         print(line);
         ESP_LOGI(TAG, "%s", line);
+    }
+    // Streamed reads vs per-block commands over the same 8 MB.
+    {
+        uint8_t* bufs[2] = {buf, buf + kChunk};
+        const std::size_t lba0 = (64u << 20) / 512;
+        uint32_t ref = 0;
+        std::size_t lba = lba0;
+        for (std::size_t done = 0; done < kTotal; done += kChunk, lba += kChunk / 512) {
+            read_no_status(card, buf, lba, kChunk / 512);
+            ref = esp_rom_crc32_le(ref, buf, kChunk);
+        }
+        for (int work : {0, 3000, 5000}) {
+            uint32_t crc = 0;
+            esp_err_t err = ESP_OK;
+            const double mbps = stream_test(card, bufs, lba0, kTotal, work, &crc, &err);
+            // Same work per block with one command per 32 KB, for comparison.
+            const int64_t t0 = esp_timer_get_time();
+            lba = lba0;
+            for (std::size_t done = 0; done < kTotal; done += kChunk, lba += kChunk / 512) {
+                read_no_status(card, buf, lba, kChunk / 512);
+                if (work > 0) esp_rom_delay_us(work);
+            }
+            const double per_cmd = kTotal / 1e6 / ((esp_timer_get_time() - t0) / 1e6);
+            std::snprintf(line, sizeof(line), "stream work %4d us: %5.2f MB/s (per-cmd sync %5.2f) %s %s", work, mbps,
+                          per_cmd, err == ESP_OK ? "ok" : esp_err_to_name(err), crc == ref ? "crc ok" : "CRC BAD");
+            print(line);
+            ESP_LOGI(TAG, "%s", line);
+        }
     }
     heap_caps_free(buf);
 }

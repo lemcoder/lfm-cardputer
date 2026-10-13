@@ -20,6 +20,12 @@ public:
     virtual void start_read(uint64_t offset, void* dst, std::size_t n) { pending_ok_ = read_at(offset, dst, n); }
     virtual bool wait() { return pending_ok_; }
 
+    // Hint: the next start_read() calls will cover [offset, offset + bytes)
+    // in order, each picked up with wait() before the next. A Source that
+    // can stream (one SD command for all of it) may use it; the default
+    // ignores it.
+    virtual void stream_hint(uint64_t offset, std::size_t bytes) { (void)offset; (void)bytes; }
+
 private:
     bool pending_ok_ = true;
 };

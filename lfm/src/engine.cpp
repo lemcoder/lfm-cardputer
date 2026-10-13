@@ -356,6 +356,7 @@ bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&&
         pf_pending_ = true;
     }
     pf_valid_ = false;
+    if (two && total > len) src_->stream_hint(offset + len, total - len);  // the rest, block by block
     for (std::size_t done = 0; done < total;) {
         drain();
         if (!pf_ok_) return false;

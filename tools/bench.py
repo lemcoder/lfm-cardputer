@@ -64,14 +64,19 @@ def main():
     want = args.results or int(knobs.get("runs", 1))
     t0 = time.time()
     lines = []
+    tokens = []
     while time.time() - t0 < args.timeout:
         for line in dev.lines():
+            if line.startswith("TOK "):
+                tokens.append(int(line.split()[1]))
+                continue
             if " lfm:" in line or "E (" in line:
                 lines.append(line)
                 print(line, flush=True)
             if "RESULT" in line:
                 res = parse_result(line)
-                res.update(label=args.label, cfg=knobs, prompt=args.prompt, time=time.strftime("%H:%M:%S"))
+                res.update(label=args.label, cfg=knobs, prompt=args.prompt, time=time.strftime("%H:%M:%S"), tokens=tokens)
+                tokens = []
                 with open(ROOT / "out" / "bench_log.jsonl", "a") as f:
                     f.write(json.dumps(res) + "\n")
                 print(json.dumps(res))

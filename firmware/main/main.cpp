@@ -222,6 +222,7 @@ struct RunConfig {
     int max_reply = 256;  // chat: longest answer, tokens
     int draft_head = 1;   // use a draft head flashed in the "ngram" partition
     int worker = 1;       // split the LM head scan with core 1
+    int stream = 1;       // one SD command per matrix (AsyncFile::enable_streaming)
 };
 
 RunConfig read_run_config() {
@@ -247,6 +248,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "max_reply")) rc.max_reply = value;
         else if (!std::strcmp(key, "draft_head")) rc.draft_head = value;
         else if (!std::strcmp(key, "worker")) rc.worker = value;
+        else if (!std::strcmp(key, "stream")) rc.stream = value;
     }
     std::fclose(f);
     return rc;
@@ -580,6 +582,8 @@ extern "C" void app_main(void) {
     if (!src.ok()) fatal("missing /lfm.lfm", "uv run tools/upload.py");
 
     const RunConfig rc = read_run_config();
+    const bool streaming = rc.stream && src.enable_streaming(card.card(), "0:/lfm.lfm");
+    ESP_LOGI(TAG, "weight reads: %s", streaming ? "streamed (one SD command per matrix)" : "one SD command per block");
     ESP_LOGI(TAG, "run config: spec %d max_draft %d max_batch %d io_kb %d gen %d ignore_eos %d progress %d runs %d",
              rc.spec, rc.max_draft, rc.max_batch, rc.io_kb, rc.gen, rc.ignore_eos, rc.progress, rc.runs);
 
@@ -689,6 +693,7 @@ extern "C" void app_main(void) {
         const double proj0 = eng->stats().flash_proj_s, topk0 = eng->stats().topk_s;
         const double dh0 = eng->stats().draft_head_s;
         const lfm::Engine::FileIo io0 = eng->file_io();
+        const long streams0 = src.streams();
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
         drafter.reset();
@@ -783,7 +788,7 @@ extern "C" void app_main(void) {
         ESP_LOGI(TAG, "RESULT run=%d prompt_tokens=%d prefill_s=%.2f gen_tokens=%d gen_s=%.2f s_per_tok=%.3f "
                  "total_s=%.2f passes=%d drafted=%d accepted=%d batch=%d read_mb=%.1f sd_busy=%.3f stall=%.3f heap_free=%u "
                  "lm_head_s=%.2f rescore_reads=%ld flash_scan_s=%.2f proj_s=%.2f topk_s=%.2f draft_head_s=%.2f "
-                 "kv_s=%.2f kv_ops=%ld conv_s=%.2f conv_write_s=%.2f conv_reads=%ld conv_writes=%ld",
+                 "kv_s=%.2f kv_ops=%ld conv_s=%.2f conv_write_s=%.2f conv_reads=%ld conv_writes=%ld streams=%ld",
                  run, n_prompt, prefill_s, g_status.tokens, gen_s,
                  g_status.tokens > 1 ? gen_s / (g_status.tokens - 1) : 0.0, total_s, spec.passes, spec.drafted,
                  spec.accepted, cfg.max_batch, (src.bytes_read() - read0) / 1e6, (src.sd_busy_seconds() - sd0) / total_s,
@@ -793,7 +798,7 @@ extern "C" void app_main(void) {
                  eng->stats().flash_proj_s - proj0, eng->stats().topk_s - topk0, eng->stats().draft_head_s - dh0,
                  eng->file_io().kv_s - io0.kv_s, eng->file_io().kv_ops - io0.kv_ops, eng->file_io().conv_s - io0.conv_s,
                  eng->file_io().conv_write_s - io0.conv_write_s, eng->file_io().conv_reads - io0.conv_reads,
-                 eng->file_io().conv_writes - io0.conv_writes);
+                 eng->file_io().conv_writes - io0.conv_writes, src.streams() - streams0);
 
         if (run + 1 < rc.runs) continue;
         do {

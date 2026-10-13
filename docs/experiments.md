@@ -39,6 +39,7 @@ head: 99.5% next-token agreement with the full head on the host).
 | B2 total (20 + 12 tokens) | ~215 s (14.06 s × 12 + 46.5) | **115.5 s** | −46% |
 | *after #30 (draft head)*: B1 total | | **23.6 s** | −43% |
 | *after #30*: B2 per token / total | | **5.61 s / 95.0 s** | −60% / −56% |
+| *after #31–35 (flash 120 MHz, two-core scan, streamed SD)*: B1 / B2 per token / B2 total | | **21.0 s / 4.97 s / 84.6 s** | |
 
 Biggest wins: self-generated n-gram drafts (#5), LM head table in flash
 (#11–18, #23), prompt batch 7 (#19), prompt cache (#27). Rejected: layer
@@ -84,6 +85,8 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 31 | Flash at 120 MHz (quad SDR, GD25Q64 high-performance mode): the LM head table scans and draft head reads come from flash | B2: flash scans 4.97 → 4.06 s, drafting 2.58 → 2.01 s, **5.61 → 5.52 s/token**, total 95.0 → 93.9 s. Boots and runs stably | yes |
 | 32 | Where the ~10% idle SD time goes (B2, per pass ~12.1 s; 93.6 MB at 9.31 MB/s = 10.05 s): LM head table scans ~0.3 s per verify + ~0.2 s per draft (half flash waits, half compute), ~700 small re-score reads (~0.25 s), file I/O of KV / conv state / conv history only ~0.09 s (~70 small writes at ~0.9 ms). The rest can't be overlapped: reading ahead would need megabytes of RAM | measurement | — |
 | 33 | LM head table scan split over both cores (core 1 only runs the SD reader, idle during the LM head); each core keeps its own top-k, merged after | B2: scans 4.06 → 3.26 s, drafting 2.01 → 1.45 s, **5.52 → 5.45 s/token**, total 93.9 → 93.2 s. Both cores share the flash bus, so far from 2× | yes |
+| 34 | SD driver: what a read costs (raw test mode, `sd_raw_test`). Per read command ~183 µs fixed + ~103 µs/KB; FATFS adds nothing at 32 KB (3492 vs 3489 µs); IDF's `sdmmc_read_sectors` sends an extra CMD13 status round-trip per read (~20 µs). One long read: 9.9 MB/s (bus limit ~9.8–10) | measurement | — |
+| 35 | **Streamed weight reads**: one SD multi-block command per matrix instead of one per 32 KB block. Project copy of IDF's `esp_driver_sdmmc` with `sdmmc_host_stream_begin/feed/wait/end`: the DMA ring takes the engine's two buffers as they're handed back; while none is free the host stops the card clock. `AsyncFile` streams the ranges the engine hints (`Source::stream_hint`), the model file being contiguous on the card (FAT cluster map) | Test: 9.46 → 9.91 MB/s, data CRC-identical also when the consumer is slower than the card. B2 93.7 → **84.6 s** (prompt 33.2 → 29.9 s, **5.49 → 4.97 s/token**, same tokens); B1 23.6 → **21.0 s** | **yes** |
 
 
 ## 29 in detail: Wi-Fi + SD in parallel

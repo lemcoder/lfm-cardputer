@@ -63,3 +63,8 @@ gtest_discover_tests(lfm_tests)
 add_executable(lfm_eval eval.cpp)
 target_link_libraries(lfm_eval PRIVATE lfm)
 target_compile_options(lfm_eval PRIVATE -Wall -Wextra)
+
+# On-device tokenizer, checked against the HF tokenizer by tools/check_tokenizer.py.
+add_executable(lfm_tok tok.cpp)
+target_link_libraries(lfm_tok PRIVATE lfm)
+target_compile_options(lfm_tok PRIVATE -Wall -Wextra)

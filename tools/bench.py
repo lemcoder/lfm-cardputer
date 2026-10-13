@@ -51,7 +51,8 @@ def main():
     ids = tok.encode(args.prompt).ids
     (OUT / "prompt.txt").write_text(" ".join(map(str, ids)) + "\n")
     knobs = dict(kv.split("=") for kv in args.cfg.split(",") if kv)
-    (OUT / "cfg.txt").write_text("".join(f"{k}={v}\n" for k, v in knobs.items()))
+    # chat=0: run prompt.txt instead of waiting at the keyboard.
+    (OUT / "cfg.txt").write_text("".join(f"{k}={v}\n" for k, v in {"chat": "0", **knobs}.items()))
 
     port = args.port or upload.find_port()
     dev = upload.connect(port)

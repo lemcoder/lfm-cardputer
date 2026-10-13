@@ -41,10 +41,12 @@
 #include "lfm.hpp"
 #include "lfm/draft.hpp"
 #include "lfm/engine.hpp"
+#include "lfm/tokenizer.hpp"
 #include "async_file.hpp"
 #include "sd_card.hpp"
 #include "sd_speed.hpp"
 #include "kernel_test.hpp"
+#include "keyboard.hpp"
 #include "usb_upload.hpp"
 #include "wifi_test.hpp"
 
@@ -58,6 +60,7 @@ constexpr const char* kConvHistPath = "/sdcard/conv.bin";
 constexpr const char* kConvStatePath = "/sdcard/cstate.bin";
 constexpr const char* kRunConfigPath = "/sdcard/cfg.txt";
 constexpr const char* kPrefixPath = "/sdcard/prefix.bin";
+constexpr const char* kTokenizerPath = "/sdcard/tok.bin";  // tools/export_tokenizer.py
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
 constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
@@ -114,6 +117,13 @@ void text_begin() {
     lcd.setScrollRect(0, kTextY, kW, kTextH);
     lcd.fillRect(0, kTextY, kW, kTextH, TFT_BLACK);
     lcd.setCursor(0, kTextY);
+}
+
+// Generated tokens also go to the serial console as "TOK <id>" lines, for
+// tools/chat.py (which decodes them with the real tokenizer).
+void emit_token(int32_t id) {
+    std::printf("TOK %ld\n", static_cast<long>(id));
+    std::fflush(stdout);
 }
 
 void show_token(lfm::Engine& eng, int32_t id, uint16_t color) {
@@ -173,6 +183,8 @@ struct RunConfig {
     int reserve_kb = 24;  // heap kept free when choosing the prompt batch
     int spec_prefill = 0; // drafts in the last prompt batch (no gain on B1/B2: experiment 20)
     int prompt_cache = 1; // reuse the prompt's state when a run repeats the previous prompt
+    int chat = 1;         // keyboard chat (needs /tok.bin); 0 = run /prompt.txt (benchmarks)
+    int max_reply = 256;  // chat: longest answer, tokens
 };
 
 RunConfig read_run_config() {
@@ -194,6 +206,8 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "reserve_kb")) rc.reserve_kb = value;
         else if (!std::strcmp(key, "spec_prefill")) rc.spec_prefill = value;
         else if (!std::strcmp(key, "prompt_cache")) rc.prompt_cache = value;
+        else if (!std::strcmp(key, "chat")) rc.chat = value;
+        else if (!std::strcmp(key, "max_reply")) rc.max_reply = value;
     }
     std::fclose(f);
     return rc;
@@ -211,6 +225,181 @@ int read_prompt(int32_t* out, int cap) {
         for (int32_t id : kDefaultPrompt) out[n++] = id;
     }
     return n;
+}
+
+// ---------------------------------------------------------------- chat
+
+// Input line, drawn in the status bar while waiting for the user.
+void draw_input(const char* text, std::size_t n) {
+    lcd.setTextScroll(false);
+    lcd.clearScrollRect();
+    lcd.fillRect(0, kH - kStatusH, kW, kStatusH, TFT_BLACK);
+    lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+    constexpr std::size_t kCols = kW / 6 - 3;  // "> " and the cursor
+    const std::size_t from = n > kCols ? n - kCols : 0;  // keep the end visible
+    char line[64];
+    std::snprintf(line, sizeof(line), "> %.*s_", static_cast<int>(n - from), text + from);
+    lcd.drawString(line, 0, kH - kStatusH);
+    lcd.setScrollRect(0, kTextY, kW, kTextH);
+    lcd.setTextScroll(true);
+}
+
+// Chat with the ChatML template the model was trained on:
+//   <|startoftext|><|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n{reply}<|im_end|>\n<|im_start|>user\n...
+// Turns continue in the same KV cache: each one only prefills the new part.
+// The reply's closing <|im_end|> is produced but not run through the model,
+// so the next turn starts with it. fn+` (escape) starts a new chat.
+struct ChatContext {
+    lfm::Engine& eng;
+    lfm::Drafter& drafter;
+    lfm::Tokenizer& tok;
+    Keyboard& kbd;
+    int max_batch;
+    int max_draft;
+    bool spec;
+    int max_reply;
+};
+
+constexpr int32_t kBos = 1, kImStart = 6, kImEnd = 7;
+
+void run_chat(ChatContext& c) {
+    static char input[256];
+    static int32_t turn[640];
+    bool fresh = true;
+    c.eng.reset();
+    c.drafter.reset();
+    text_begin();
+    lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    lcd.print("Type a message, Enter to send.\nfn+` starts a new chat.\n");
+
+    while (true) {
+        // Read a line.
+        std::size_t n = 0;
+        draw_input(input, n);
+        while (true) {
+            const char ch = c.kbd.poll();
+            if (ch == 0) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            if (ch == 27) {  // new chat
+                c.eng.reset();
+                c.drafter.reset();
+                fresh = true;
+                n = 0;
+                text_begin();
+                lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
+                lcd.print("New chat.\n");
+            } else if (ch == '\b') {
+                if (n > 0) --n;
+            } else if (ch == '\n') {
+                if (n > 0) break;
+            } else if (n + 1 < sizeof(input)) {
+                input[n++] = ch;
+            }
+            draw_input(input, n);
+        }
+        input[n] = '\0';
+        const int64_t t0 = esp_timer_get_time();
+        lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+        lcd.printf("%s> %s\n", lcd.getCursorX() > 0 ? "\n" : "", input);
+
+        // Tokens of this turn (the template around the text, as HF tokenizes it:
+        // special tokens by id, the text between them encoded per segment).
+        static char seg[sizeof(input) + 8];
+        int m = 0;
+        auto add = [&](int32_t id) { if (m < static_cast<int>(sizeof(turn) / sizeof(turn[0]))) turn[m++] = id; };
+        auto add_text = [&](const char* text) {
+            const int got = c.tok.encode(text, turn + m, static_cast<int>(sizeof(turn) / sizeof(turn[0])) - m);
+            if (got < 0) return false;
+            m += got;
+            return true;
+        };
+        if (fresh) {
+            add(kBos);
+        } else {
+            add(kImEnd);
+            add_text("\n");
+        }
+        add(kImStart);
+        std::snprintf(seg, sizeof(seg), "user\n%s", input);
+        const bool ok = add_text(seg);
+        add(kImEnd);
+        add_text("\n");
+        add(kImStart);
+        add_text("assistant\n");
+        if (!ok) {
+            set_phase("tokenizer error (tok.bin?)");
+            continue;
+        }
+        if (c.eng.pos() + m + c.max_reply > c.eng.max_ctx()) {
+            lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+            lcd.print("Context full: fn+` for a new chat.\n");
+            continue;
+        }
+        fresh = false;
+        ESP_LOGI(TAG, "chat turn: %d tokens at position %d", m, c.eng.pos());
+
+        // Prefill the turn, max_batch tokens per pass.
+        g_status = {};
+        int32_t next = lfm::Engine::kNoToken;
+        char phase[40];
+        for (int i = 0; i < m && next >= lfm::Engine::kNoToken;) {
+            const int k = m - i < c.max_batch ? m - i : c.max_batch;
+            std::snprintf(phase, sizeof(phase), "reading %d-%d/%d", i + 1, i + k, m);
+            set_phase(phase);
+            next = c.eng.prefill({turn + i, static_cast<std::size_t>(k)}, i + k == m);
+            i += k;
+        }
+        for (int i = 0; i < m; ++i) c.drafter.push(turn[i]);
+        if (next < 0) {
+            if (next == lfm::Engine::kIoError) fatal("SD read error", "check the card");
+            set_phase("prefill failed");
+            continue;
+        }
+        const double prefill_s = (esp_timer_get_time() - t0) / 1e6;
+        c.drafter.push(next);
+
+        // Reply.
+        set_phase("thinking");
+        lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+        const int64_t t_gen = esp_timer_get_time();
+        lfm::SpecStats spec;
+        int32_t fed = next;
+        auto show = [&](int32_t id) {
+            ++g_status.tokens;
+            if (id != kImEnd) show_token(c.eng, id, TFT_WHITE);
+            emit_token(id);
+        };
+        show(fed);
+        while (fed != kImEnd && g_status.tokens < c.max_reply) {
+            int32_t produced[lfm::Engine::kMaxBatch];
+            int got;
+            if (c.spec) {
+                got = lfm::speculative_step(c.eng, c.drafter, fed, c.max_draft, produced, &spec);
+            } else {
+                produced[0] = c.eng.forward(fed, true);
+                got = produced[0] < 0 ? produced[0] : 1;
+                if (got > 0) c.drafter.push(produced[0]);
+            }
+            if (got < 0) {
+                if (got == lfm::Engine::kIoError) fatal("SD read error", "check the card");
+                break;
+            }
+            for (int i = 0; i < got && fed != kImEnd; ++i) {
+                fed = produced[i];
+                show(fed);
+            }
+            g_status.sec_per_tok = (esp_timer_get_time() - t_gen) / 1e6f / g_status.tokens;
+            set_phase("thinking");
+        }
+        lcd.print("\n");
+        const double total_s = (esp_timer_get_time() - t0) / 1e6;
+        ESP_LOGI(TAG, "chat reply: %d tokens, prefill %d in %.1f s, total %.1f s (%.1f s/tok), drafts %d/%d",
+                 g_status.tokens, m, prefill_s, total_s, g_status.sec_per_tok, spec.accepted, spec.drafted);
+        std::snprintf(phase, sizeof(phase), "%.0f s", total_s);
+        set_phase(phase);
+    }
 }
 
 }  // namespace
@@ -339,6 +528,23 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "LM head table: %s", head_ok ? "from flash" : "from the SD card");
     const int max_draft = rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
 
+    if (rc.chat) {
+        static lfm::FileSource tok_file(kTokenizerPath);
+        static lfm::Tokenizer tok;
+        static Keyboard kbd;
+        const bool tok_ok = tok_file.ok() && tok.open(tok_file);
+        const bool kbd_ok = kbd.begin();
+        ESP_LOGI(TAG, "chat: tokenizer %s, keyboard %s", tok_ok ? "ok" : "missing", kbd_ok ? "ok" : "not found");
+        if (tok_ok && kbd_ok) {
+            ChatContext chat{*eng, drafter, tok, kbd, cfg.max_batch, max_draft, rc.spec != 0, rc.max_reply};
+            run_chat(chat);
+        }
+        if (!tok_ok) {
+            lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+            lcd.println("No /tok.bin for chat. On the Mac:\n  uv run tools/export_tokenizer.py\n  uv run tools/upload.py out/tok.bin:tok.bin");
+        }
+    }
+
     for (int run = 0;; ++run) {
         eng->reset();
         g_status = {};
@@ -401,6 +607,7 @@ extern "C" void app_main(void) {
         int32_t fed = next;
         for (int i = 0; i < n_first; ++i) {
             show_token(*eng, first[i], i + 1 < n_first ? TFT_GREENYELLOW : TFT_WHITE);
+            emit_token(first[i]);
             ++g_status.tokens;
         }
         auto finished = [&] {
@@ -424,6 +631,7 @@ extern "C" void app_main(void) {
             }
             for (int i = 0; i < got; ++i) {
                 show_token(*eng, produced[i], i + 1 < got ? TFT_GREENYELLOW : TFT_WHITE);  // accepted drafts tinted
+                emit_token(produced[i]);
                 ++g_status.tokens;
                 fed = produced[i];
                 if (finished()) break;

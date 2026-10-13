@@ -69,6 +69,20 @@ struct DraftHeadHeader {
 static_assert(sizeof(DraftHeadHeader) == 40);
 inline constexpr char kDraftHeadMagic[8] = {'L', 'F', 'M', 'D', 'H', 'E', 'D', '\0'};
 
+// A draft tree's shape: node i (1 .. n-1) is the rank[i]-th guess (0 = best,
+// at most 2) of the head after node parent[i]; node 0 is the fed token.
+// Parents come before children.
+struct DraftShape {
+    int n;
+    int8_t parent[8];
+    int8_t rank[8];
+};
+// Chain of 2 (the head's best guess, then its best guess after that).
+inline constexpr DraftShape kChain2 = {3, {-1, 0, 1}, {0, 0, 0}};
+// Top 3 first guesses, one more under each of the best two, one more under
+// the best path (tools/tree_sim.py "3x1+": 1.95 tokens per pass on chat).
+inline constexpr DraftShape kTree3x1 = {7, {-1, 0, 0, 0, 1, 2, 4}, {0, 0, 1, 2, 0, 0, 0}};
+
 class DraftHead {
 public:
     // The whole file contents, kept by the caller (memory-mapped flash).
@@ -81,7 +95,16 @@ public:
     // Returns how many (0 if there's no hidden state), or a negative Engine code.
     int draft(Engine& eng, int32_t fed, int k, int32_t* out) const;
 
+    // A tree of drafts: tokens[0] = fed, tokens[i] for the shape's nodes,
+    // parents[i] = shape.parent[i]. One head step per node with children.
+    // Returns the node count (shape.n), 0 without a hidden state, or a
+    // negative Engine code. Needs max_batch >= 5 (scratch for the states).
+    int draft_tree(Engine& eng, int32_t fed, const DraftShape& shape, int32_t* tokens, int8_t* parents) const;
+
 private:
+    // One step: h' = h + up(silu(down([h, rmsnorm(embedding(tok))]))) into out.
+    bool step(Engine& eng, const float* h, int32_t tok, float* out) const;
+
     DraftHeadHeader h_{};
     const std::byte* down_ = nullptr;
     const std::byte* up_ = nullptr;
@@ -109,6 +132,9 @@ public:
     // n-gram table). Kept by the caller.
     void set_head(const DraftHead* head) { head_ = head; }
     const DraftHead* head() const { return head_; }
+    // Tree shape for the head's drafts (nullptr: a chain of max_draft).
+    void set_shape(const DraftShape* shape) { shape_ = shape; }
+    const DraftShape* shape() const { return shape_; }
 
 private:
     int ngram(int32_t* out, int k) const;
@@ -122,6 +148,7 @@ private:
     uint32_t vocab_ = 0;
     uint32_t tri_slots_ = 0;
     const DraftHead* head_ = nullptr;
+    const DraftShape* shape_ = nullptr;
 };
 
 // Speculative decoding statistics.

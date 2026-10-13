@@ -223,6 +223,7 @@ struct RunConfig {
     int draft_head = 1;   // use a draft head flashed in the "ngram" partition
     int worker = 1;       // split the LM head scan with core 1
     int stream = 1;       // one SD command per matrix (AsyncFile::enable_streaming)
+    int tree = 1;         // draft head proposes a tree (lfm::kTree3x1) instead of a chain
 };
 
 RunConfig read_run_config() {
@@ -249,6 +250,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "draft_head")) rc.draft_head = value;
         else if (!std::strcmp(key, "worker")) rc.worker = value;
         else if (!std::strcmp(key, "stream")) rc.stream = value;
+        else if (!std::strcmp(key, "tree")) rc.tree = value;
     }
     std::fclose(f);
     return rc;
@@ -657,7 +659,10 @@ extern "C" void app_main(void) {
         const bool ngram_ok = drafter.set_ngram(ngram, ngram_size);
         ESP_LOGI(TAG, "drafts: prompt lookup, then %s", ngram_ok ? "the n-gram table in flash" : "nothing (not flashed)");
     }
-    const int max_draft = rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
+    const bool tree = rc.tree && drafter.head() != nullptr && cfg.max_batch >= lfm::kTree3x1.n;
+    if (tree) drafter.set_shape(&lfm::kTree3x1);  // 6 drafts per pass; prompt lookup may use as many
+    const int max_draft = tree ? lfm::kTree3x1.n - 1 : rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
+    ESP_LOGI(TAG, "draft shape: %s", tree ? "tree (3 first guesses, 6 drafts)" : "chain");
 
     if (rc.chat) {
         static lfm::FileSource tok_file(kTokenizerPath);

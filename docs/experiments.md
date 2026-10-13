@@ -40,6 +40,7 @@ head: 99.5% next-token agreement with the full head on the host).
 | *after #30 (draft head)*: B1 total | | **23.6 s** | −43% |
 | *after #30*: B2 per token / total | | **5.61 s / 95.0 s** | −60% / −56% |
 | *after #31–35 (flash 120 MHz, two-core scan, streamed SD)*: B1 / B2 per token / B2 total | | **21.0 s / 4.97 s / 84.6 s** | |
+| *after #39–40 (tree drafts, lazy re-score)*: B2 per token / B2 total / chat per token | | **4.39 s / 78.2 s / 6.10 s** | |
 
 Biggest wins: self-generated n-gram drafts (#5), LM head table in flash
 (#11–18, #23), prompt batch 7 (#19), prompt cache (#27). Rejected: layer
@@ -90,6 +91,8 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 36 | SD clock 160 MHz: the PLL's 160 MHz straight through (divider 1; the next step above 80) | Card doesn't answer at any sampling phase (SCR read times out); fine again at 80 MHz. The SDMMC source is a fixed 160 MHz PLL with an integer divider, and faster SD modes need 1.8 V signalling the board lacks: 80 MHz is the ceiling | no |
 | 37 | Tree drafts, simulated (`tools/tree_sim.py`, current head): the pass verifies a tree of guesses instead of a chain | Chat: chain of 2 1.67 → best tree (top-3 first guesses, chains under them) **1.95 tokens/pass**; clean 1.69 → 2.04. With ~0.2 s per verified position and ~0.15 s per head step: **−6 to −9% s/token**. Longer chains don't pay | built next |
 | 38 | 2-bit / 3-bit layer weights (`tools/quant2_study.py`; RTN and GPTQ; WikiText-2 perplexity, next-token agreement with the Q4 model on chat) | BF16 47.3 / Q4 53.5. 2-bit: RTN 2569, GPTQ 284 (b64) / 224 (b32), MLP-only 143 — agreement 15–58%: broken. 3-bit GPTQ b64 (3.5 bits, −22% bytes): 68.6, 74% agreement; b32: 65.0 | no (2-bit); 3-bit parked |
+| 39 | **Tree drafts on the device**: the draft head proposes a tree (top 3 first guesses, one more under the best two, one more under the best path: `lfm::kTree3x1`, 6 drafts); `Engine::verify_tree` places each node at its depth, attention sees context + ancestors, conv windows follow the ancestry, `accept_path` rebuilds the conv state and moves accepted K/V rows. Host tests: every node's prediction equals decoding its own path; output identical to greedy | Chat (48 tokens): 1.71 → **2.00 tokens/pass**, but 7 verified positions cost ~1 s more LM head per pass: 6.52 → 6.35 s/token. B2: 4.97 → 4.55 s/token | yes |
+| 40 | **Lazy re-score in verification**: the shared LM head table scan still covers every position, but exact re-scoring follows only the path that can still be accepted (root, then the child matching its prediction, ...) | Chat 48 tokens: 6.35 → **6.10 s/token** (total 336 → 317 s with #39); B2 4.55 → **4.39 s/token**, total 84.6 → 78.2 s; same tokens | yes |
 
 
 ## 29 in detail: Wi-Fi + SD in parallel

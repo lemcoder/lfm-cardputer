@@ -99,12 +99,12 @@ struct HeadRun {
     std::vector<int32_t> plain, spec;
     lfm::SpecStats st;
 };
-HeadRun RunWithDraftHead(int n, int max_draft, lfm::Worker* worker = nullptr) {
+HeadRun RunWithDraftHead(int n, int max_draft, lfm::Worker* worker = nullptr, const lfm::DraftShape* shape = nullptr) {
     const auto flash = ReadFile(kFlashHead);
     const auto dhead = ReadFile(kDraftHead);
     // "<|startoftext|><|im_start|>user\nTell me about the planets.<|im_end|>\n<|im_start|>assistant\n"
     const std::vector<int32_t> prompt = {1, 6, 6423, 708, 52486, 1123, 1337, 779, 19603, 523, 7, 708, 6, 64015, 708};
-    lfm::EngineConfig cfg{.max_ctx = 256, .kv_bf16 = true, .kv_path = kKvPath2.c_str(), .max_batch = 4,
+    lfm::EngineConfig cfg{.max_ctx = 256, .kv_bf16 = true, .kv_path = kKvPath2.c_str(), .max_batch = 7,
                           .int8_activations = true, .speculative = true, .conv_history_path = kHistPath.c_str(),
                           .conv_state_path = kStatePath.c_str()};
     HeadRun r;
@@ -129,6 +129,7 @@ HeadRun RunWithDraftHead(int n, int max_draft, lfm::Worker* worker = nullptr) {
     std::vector<int32_t> hist(1024);
     lfm::Drafter drafter(hist.data(), static_cast<int>(hist.size()));
     drafter.set_head(&head);
+    drafter.set_shape(shape);
     for (int32_t t : prompt) drafter.push(t);
     int32_t fed = eng.prefill(prompt, true);
     r.spec.push_back(fed);
@@ -226,6 +227,21 @@ TEST(Speculative, DraftHeadSameTokensAsGreedy) {
     EXPECT_GT(r.st.accepted, 0);
 }
 
+// Tree drafts (the device's shape): same tokens, more per pass than the chain.
+TEST(Speculative, DraftTreeSameTokensAsGreedy) {
+    for (const auto& p : {kDevice, kFlashHead, kDraftHead}) {
+        if (!Exists(p)) GTEST_SKIP() << p << " missing";
+    }
+    const HeadRun chain = RunWithDraftHead(64, 2);
+    const HeadRun tree = RunWithDraftHead(64, 6, nullptr, &lfm::kTree3x1);
+    EXPECT_EQ(tree.spec, tree.plain);
+    const double tc = static_cast<double>(chain.st.tokens) / chain.st.passes;
+    const double tt = static_cast<double>(tree.st.tokens) / tree.st.passes;
+    std::printf("chain: %.2f tokens/pass, tree: %.2f tokens/pass (%d passes, drafts %d/%d)\n", tc, tt,
+                tree.st.passes, tree.st.accepted, tree.st.drafted);
+    EXPECT_GT(tt, tc);
+}
+
 // The LM head scan split over two "cores" finds the same tokens.
 TEST(Speculative, DraftHeadWithWorkerSameTokens) {
     for (const auto& p : {kDevice, kFlashHead, kDraftHead}) {
@@ -290,6 +306,58 @@ TEST(Speculative, PerfectDraftsAllAccepted) {
         ASSERT_TRUE(eng.accept(4));
         ASSERT_EQ(preds[3], want[i + 4]);
         i += 4;
+    }
+}
+
+// Tree verification: every node's prediction equals plain greedy decoding of
+// the context plus that node's own path; accepting a side branch leaves the
+// engine exactly where decoding that path would (conv state, K/V moved).
+TEST(Speculative, TreeMatchesPathByPath) {
+    REQUIRE(kQ4);
+    lfm::EngineConfig cfg{.max_ctx = 128, .kv_bf16 = true, .kv_path = kKvPath2.c_str(), .max_batch = 7,
+                          .int8_activations = true, .speculative = true, .conv_history_path = kHistPath.c_str(),
+                          .conv_state_path = kStatePath.c_str()};
+    const auto prompt = Prompt();
+    // Root 0, three children (1, 2, 3), a grandchild under 1 and under 2, and one under 4.
+    const int8_t parents[7] = {-1, 0, 0, 0, 1, 2, 4};
+    const std::vector<int32_t> tree = {1098, 5706, 803, 779, 4481, 856, 523};
+    auto path_of = [&](int b) {
+        std::vector<int32_t> p;
+        for (int a = b; a >= 0; a = parents[a]) p.insert(p.begin(), tree[static_cast<std::size_t>(a)]);
+        return p;
+    };
+    auto greedy_after = [&](const std::vector<int32_t>& extra) {
+        lfm::FileSource src(kQ4.c_str());
+        lfm::Engine eng;
+        lfm::EngineConfig c = cfg;
+        static const std::string kv3 = kRoot + "/out/test-kv3.bin";
+        c.kv_path = kv3.c_str();
+        c.conv_history_path = nullptr;
+        c.conv_state_path = nullptr;
+        EXPECT_EQ(eng.open(src, c), lfm::Status::Ok);
+        eng.prefill(prompt, false);
+        return eng.prefill(extra, true);
+    };
+
+    lfm::FileSource src(kQ4.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, cfg), lfm::Status::Ok);
+    eng.prefill(prompt, false);
+    int32_t preds[7];
+    ASSERT_GE(eng.verify_tree(tree, parents, preds), 0);
+    for (int b = 0; b < 7; ++b) EXPECT_EQ(preds[b], greedy_after(path_of(b))) << "node " << b;
+
+    // Keep the side branch 0 -> 2 -> 5, then decode on: same as plain greedy.
+    const int8_t path[3] = {0, 2, 5};
+    ASSERT_TRUE(eng.accept_path(path, 3));
+    EXPECT_EQ(eng.pos(), static_cast<int>(prompt.size()) + 3);
+    std::vector<int32_t> extra = path_of(5);
+    int32_t next = preds[5];
+    for (int i = 0; i < 6; ++i) {
+        extra.push_back(next);
+        const int32_t mine = eng.forward(next, true);
+        EXPECT_EQ(mine, greedy_after(extra)) << "step " << i;
+        next = mine;
     }
 }
 

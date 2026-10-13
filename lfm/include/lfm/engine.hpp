@@ -99,6 +99,7 @@ public:
 
     const FileHeader& header() const { return h_; }
     int max_ctx() const { return cfg_.max_ctx; }
+    int max_batch() const { return cfg_.max_batch; }
     int pos() const { return pos_; }  // tokens consumed so far
 
     // Forget all tokens (new sequence).
@@ -132,6 +133,16 @@ public:
     int32_t verify(std::span<const int32_t> tokens, int32_t* preds, int first_pred = 0);
     bool accept(int keep);
 
+    // Tree verification: the drafts form a tree instead of a chain.
+    // tokens[0] is the last real token; parents[b] (b >= 1) is the index of
+    // token b's parent, always < b. Token b sits at position pos() + its depth
+    // and sees the context plus its own ancestors, so preds[b] is the greedy
+    // token after the path root..b. Then accept_path(path, len) keeps one
+    // root-to-node path (path[0] == 0, each entry the parent of the next) and
+    // rolls the rest back. verify() is the chain case.
+    int32_t verify_tree(std::span<const int32_t> tokens, const int8_t* parents, int32_t* preds);
+    bool accept_path(const int8_t* path, int len);
+
     // Bytes of token `id` (UTF-8 / raw bytes) into buf. Returns the length,
     // truncated to cap. Not NUL-terminated.
     std::size_t token_text(int32_t id, char* buf, std::size_t cap);
@@ -161,7 +172,8 @@ public:
     // Greedy token for a raw (not yet final-normed) hidden state h, for drafts.
     // With the flash head: its low-rank scan, top kDraftCandidates re-scored
     // exactly (close to, not always, the exact argmax). work: dim floats.
-    int32_t draft_token(const float* h, float* work);
+    // top (optional): the m <= 4 best of the re-scored candidates, best first.
+    int32_t draft_token(const float* h, float* work, int32_t* top = nullptr, int m = 0);
     static constexpr int kDraftCandidates = 16;
 
     // Counters for experiments (since open()).
@@ -216,7 +228,10 @@ private:
     // logits (n == 1 only) gets every vocab score.
     bool lm_head(const Ptrs& xs, int n, int32_t* out, float* logits);
     bool lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits);
-    bool lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates);
+    // lazy_tokens (verify): re-score only along the path that can still be
+    // accepted (the batch's tokens and parent_); other outputs stay kNoToken.
+    bool lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates, int32_t* top = nullptr, int m = 0,
+                       const int32_t* lazy_tokens = nullptr);
     struct ScanJob {
         const std::byte* table;
         std::size_t trb, rank;
@@ -233,7 +248,8 @@ private:
     static void scan_job(void* arg);
     void quantize_inputs(const Ptrs& in, int n, std::size_t cols);
     float score_row(int b, Dtype dt, const std::byte* row, const float* in, std::size_t cols) const;
-    bool rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out);
+    bool rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out, int32_t* top = nullptr,
+                 int m = 0);
 
     // n tokens at positions pos_ .. pos_+n-1: read xn_[b], write tmp_[b].
     // preds != nullptr: next token after every position (verify).
@@ -252,6 +268,17 @@ private:
     // KV cache: one row per (position, attention layer) = [K | V], each
     // n_kv*head_dim values of kv_bf16 ? bf16 : f32.
     std::size_t kv_row_bytes() const;
+    bool kv_copy(int attn_idx, int from, int to);
+
+    // The batch's shape (run_batch): per token its parent in the batch (-1:
+    // the context before it), depth, and ancestors-or-self as a bit mask. A
+    // chain unless verify_tree() set a tree.
+    int8_t parent_[kMaxBatch] = {};
+    int8_t depth_[kMaxBatch] = {};
+    uint8_t anc_[kMaxBatch] = {};
+    bool tree_ = false;
+    void set_chain(int n);
+    bool set_tree(const int8_t* parents, int n);
     bool kv_put(int attn_idx, int pos, std::span<const float> k, std::span<const float> v);
     bool kv_load(int attn_idx, int j0, int count, std::byte* dst);
 

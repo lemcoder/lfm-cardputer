@@ -484,7 +484,7 @@ float Engine::score_row(int b, Dtype dt, const std::byte* row, const float* in, 
 // token takes the best over the union. Nearby rows are fetched together in
 // one sector-aligned read: a separate small read costs ~0.5 ms (rows straddle
 // 512-byte sectors), about the same as reading 4 KB more. xs must be quantized.
-bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out) {
+bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out, int32_t* top, int m) {
     cancel_prefetch();  // uses io_ and io2_
     const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
     constexpr uint64_t kSector = 512;
@@ -522,12 +522,25 @@ bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* coun
         out[b] = n_uni > 0 ? uni[0] : 0;
     }
     auto row_off = [&](int32_t id) { return h_.embed + static_cast<uint64_t>(id) * erb; };
+    // top: the m best for token 0, best first (ties: lower id).
+    float top_s[4];
+    int n_top_m = 0;
+    if (m > 4) m = 4;
     auto score_all = [&](const std::byte* row, int32_t id) {
         for (int b = 0; b < n; ++b) {
             const float v = score_row(b, h_.embed_dtype, row, xs.p[b], h_.dim);
             if (v > best[b]) {  // ascending ids: strict > keeps the lowest id on ties
                 best[b] = v;
                 out[b] = id;
+            }
+            if (b == 0 && top != nullptr && (n_top_m < m || v > top_s[n_top_m - 1])) {
+                int i = n_top_m < m ? n_top_m++ : m - 1;
+                for (; i > 0 && v > top_s[i - 1]; --i) {
+                    top_s[i] = top_s[i - 1];
+                    top[i] = top[i - 1];
+                }
+                top_s[i] = v;
+                top[i] = id;
             }
         }
     };
@@ -611,7 +624,8 @@ void Engine::scan_job(void* arg) {
 
 // LM head from the memory-mapped flash table: no SD reads except the
 // exact re-score of the shortlist.
-bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates) {
+bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates, int32_t* top, int m,
+                           const int32_t* lazy_tokens) {
     const std::size_t rank = fh_.rank;
     const std::size_t prb = row_bytes(fh_.proj_dtype, h_.dim);
     const std::size_t trb = row_bytes(fh_.table_dtype, rank);
@@ -681,7 +695,23 @@ bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates) 
     stats_.flash_scan_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_scan).count();
     stats_.topk_s += topk_s;
     if (xq_ != nullptr) quantize_inputs(xs, n, h_.dim);
-    return rescore(xs, n, ti, n_top, out);
+    if (lazy_tokens == nullptr) return rescore(xs, n, ti, n_top, out, top, m);
+    // Verification: a token's prediction only matters if its path is still
+    // alive. Re-score the root, then the child (if any) whose token is what
+    // the root predicts, and so on.
+    for (int b = 0; b < n; ++b) out[b] = kNoToken;
+    for (int node = 0;;) {
+        Ptrs one{};
+        one.p[0] = xs.p[node];
+        if (xq_ != nullptr) quantize_inputs(one, 1, h_.dim);
+        if (!rescore(one, 1, &ti[node], &n_top[node], &out[node])) return false;
+        int next = -1;
+        for (int c = node + 1; c < n && next < 0; ++c) {
+            if (parent_[c] == node && lazy_tokens[c] == out[node]) next = c;
+        }
+        if (next < 0) return true;
+        node = next;
+    }
 }
 
 bool Engine::lm_head(const Ptrs& xs, int n, int32_t* out, float* logits) {
@@ -817,25 +847,50 @@ bool Engine::conv_op(int layer, int n) {
             if (!hist_put(cs, static_cast<int>(j), state + j * d.dim)) return false;
         }
     }
+    // Token b's window: the inputs (bx) of its hist predecessors along its
+    // ancestry, older ones from the state rows. Each token's bx replaces its X
+    // in tmp_ (X[c] is only needed for bx[c]), where its children find it.
+    constexpr std::size_t kMaxHist = 8;
+    if (hist > kMaxHist) return false;
+    auto window = [&](int b, const float** win) {  // win[0] oldest .. win[hist-1] newest
+        int a = b;
+        std::size_t s_row = hist;  // state rows not used yet: 0 .. s_row-1
+        for (std::size_t j = hist; j-- > 0;) {
+            if (a >= 0) a = parent_[a];
+            if (a >= 0) {
+                win[j] = tmp_[a];
+            } else {
+                win[j] = state + (--s_row) * d.dim;
+            }
+        }
+    };
     for (int b = 0; b < n; ++b) {
         float* B = slot(b);
         const float* C = B + d.dim;
-        const float* X = tmp_[b];
+        float* X = tmp_[b];
+        const float* win[kMaxHist];
+        window(b, win);
         for (std::size_t c = 0; c < d.dim; ++c) {
             const float* k = kernel + c * d.conv_l;
             const float bx = B[c] * X[c];
             float y = k[hist] * bx;
-            for (std::size_t j = 0; j < hist; ++j) {
-                y += k[j] * state[j * d.dim + c];
-            }
-            // Shift history: drop the oldest, append this token's bx.
-            for (std::size_t j = 0; j + 1 < hist; ++j) {
-                state[j * d.dim + c] = state[(j + 1) * d.dim + c];
-            }
-            state[(hist - 1) * d.dim + c] = bx;
+            for (std::size_t j = 0; j < hist; ++j) y += k[j] * win[j][c];
+            X[c] = bx;
             B[c] = C[c] * y;  // B is no longer needed: reuse it for out_proj's input
         }
-        if (recording_ && !hist_put(cs, static_cast<int>(hist) + b, state + (hist - 1) * d.dim)) return false;
+        if (recording_ && !hist_put(cs, static_cast<int>(hist) + b, X)) return false;
+    }
+    // New state: the last token's window shifted by its own bx (for a tree,
+    // accept_path() replaces it with the accepted path's).
+    {
+        const float* src[kMaxHist];
+        const float* win[kMaxHist];
+        window(n - 1, win);
+        for (std::size_t j = 0; j + 1 < hist; ++j) src[j] = win[j + 1];
+        src[hist - 1] = tmp_[n - 1];
+        for (std::size_t j = 0; j < hist; ++j) {  // ascending: a state source row is never below j
+            if (src[j] != state + j * d.dim) std::memmove(state + j * d.dim, src[j], d.dim * sizeof(float));
+        }
     }
     if (!state_store(cs, state)) return false;  // before out_proj reuses io_
     return matvec(acts(tmp_), d.dim, L.conv_out, h_.dtype(layer, kConvOut), d.dim, slots(0), n);
@@ -864,6 +919,19 @@ bool Engine::kv_put(int attn_idx, int pos, std::span<const float> k, std::span<c
     }
     std::memcpy(kv_ram_[attn_idx] + static_cast<std::size_t>(pos) * rb, io_, rb);
     return true;
+}
+
+// Move one position's K/V row (accept_path: an accepted tree node to its depth).
+bool Engine::kv_copy(int attn_idx, int from, int to) {
+    const std::size_t rb = kv_row_bytes();
+    if (kv_file_ == nullptr) {
+        std::memcpy(kv_ram_[attn_idx] + static_cast<std::size_t>(to) * rb,
+                    kv_ram_[attn_idx] + static_cast<std::size_t>(from) * rb, rb);
+        return true;
+    }
+    if (!kv_load(attn_idx, from, 1, io_)) return false;
+    const uint64_t row = static_cast<uint64_t>(attn_idx) * static_cast<uint64_t>(cfg_.max_ctx) + static_cast<uint64_t>(to);
+    return kv_file_->write_at(row * rb, io_, rb);
 }
 
 // Rows j0 .. j0+count-1 of one attention layer into dst.
@@ -920,7 +988,7 @@ bool Engine::attn_op(int layer, int n) {
             std::span<float> kh{k + g * d.head_dim, d.head_dim};
             m::rmsnorm(kh, kh, {k_norm, d.head_dim}, h_.norm_eps);
         }
-        const std::size_t p = static_cast<std::size_t>(pos_ + b);
+        const std::size_t p = static_cast<std::size_t>(pos_ + depth_[b]);  // = pos_ + b for a chain
         m::rope({q, d.q_dim}, d.head_dim, p, h_.rope_theta);
         m::rope({k, d.kv_dim}, d.head_dim, p, h_.rope_theta);
         if (!kv_put(ai, pos_ + b, {k, d.kv_dim}, {q + v_off, d.kv_dim})) return false;
@@ -941,7 +1009,8 @@ bool Engine::attn_op(int layer, int n) {
     };
 
     // Each chunk of K/V rows is loaded once and used by every token of the
-    // batch (token b sees positions 0 .. pos_+b). Per token: running max and
+    // batch (token b sees the context, rows 0 .. pos_-1, and the batch rows of
+    // itself and its ancestors: pos_ .. pos_+b for a chain). Per token: running max and
     // sum per head (mx, sum: [n][heads]) and ctx accumulated in xn_[b] (no
     // longer needed once q, k, v exist).
     for (int b = 0; b < n; ++b) {
@@ -962,7 +1031,7 @@ bool Engine::attn_op(int layer, int n) {
                 const float* kr = slice(row, false, g, k_row);
                 const float* vr = slice(row, true, g, v_row);
                 for (int b = 0; b < n; ++b) {
-                    if (j > pos_ + b) continue;  // causal
+                    if (j >= pos_ && !((anc_[b] >> (j - pos_)) & 1)) continue;  // causal: context + own ancestors
                     const float* q = slot(b);
                     float* ctx = xn_[b];
                     float* mxb = mx + b * d.heads;
@@ -1024,8 +1093,32 @@ bool Engine::mlp(int layer, int n) {
 
 // ---------------------------------------------------------------- forward
 
+void Engine::set_chain(int n) {
+    for (int b = 0; b < n; ++b) {
+        parent_[b] = static_cast<int8_t>(b - 1);
+        depth_[b] = static_cast<int8_t>(b);
+        anc_[b] = static_cast<uint8_t>((1u << (b + 1)) - 1);
+    }
+}
+
+bool Engine::set_tree(const int8_t* parents, int n) {
+    parent_[0] = -1;
+    depth_[0] = 0;
+    anc_[0] = 1;
+    for (int b = 1; b < n; ++b) {
+        const int p = parents[b];
+        if (p < 0 || p >= b) return false;
+        parent_[b] = static_cast<int8_t>(p);
+        depth_[b] = static_cast<int8_t>(depth_[p] + 1);
+        anc_[b] = static_cast<uint8_t>(anc_[p] | (1u << b));
+    }
+    return true;
+}
+
 int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds, int first_pred) {
     if (pos_ + n > cfg_.max_ctx) return kContextFull;
+    if (!tree_) set_chain(n);
+    tree_ = false;
     const Dims d(h_);
     std::span<float> norm_w{norm_w_, d.dim};
 
@@ -1088,8 +1181,18 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
             m::rmsnorm({act(xn_, b), d.dim}, {act(x_, b), d.dim}, norm_w, h_.norm_eps);
             heads.p[b - first_pred] = act(xn_, b);
         }
-        if (!lm_head(heads, n - first_pred, preds + first_pred, nullptr)) return kIoError;
-        next = preds[n - 1];
+        if (fh_table_ != nullptr && first_pred == 0) {
+            // verify / verify_tree: only along the path that can be accepted.
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = lm_head_flash(heads, n, preds, static_cast<int>(fh_.candidates), nullptr, 0, tokens);
+            stats_.lm_head_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!ok) return kIoError;
+            next = kNoToken;
+            for (int b = n - 1; b >= 0 && next < 0; --b) next = preds[b];  // the deepest one computed
+        } else {
+            if (!lm_head(heads, n - first_pred, preds + first_pred, nullptr)) return kIoError;
+            next = preds[n - 1];
+        }
         hidden_slot_ = n - 1;  // accept() moves it to the last kept position
     } else {
         // Only the last token's prediction is needed.
@@ -1143,7 +1246,7 @@ bool Engine::embedding(int32_t token, float* out) {
     return true;
 }
 
-int32_t Engine::draft_token(const float* h, float* work) {
+int32_t Engine::draft_token(const float* h, float* work, int32_t* top, int m) {
     std::span<float> norm_w{norm_w_, h_.dim};
     if (!read_f32(h_.final_norm, norm_w)) return kIoError;
     m::rmsnorm({work, h_.dim}, {h, h_.dim}, norm_w, h_.norm_eps);
@@ -1151,7 +1254,13 @@ int32_t Engine::draft_token(const float* h, float* work) {
     xs.p[0] = work;
     int32_t tok = kNoToken;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = fh_table_ != nullptr ? lm_head_flash(xs, 1, &tok, kDraftCandidates) : lm_head_impl(xs, 1, &tok, nullptr);
+    bool ok;
+    if (fh_table_ != nullptr) {
+        ok = lm_head_flash(xs, 1, &tok, kDraftCandidates, top, m);
+    } else {
+        ok = lm_head_impl(xs, 1, &tok, nullptr);  // exact, top-1 only
+        for (int i = 0; i < m; ++i) top[i] = i == 0 ? tok : kNoToken;
+    }
     stats_.draft_head_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return ok ? tok : kIoError;
 }
@@ -1175,25 +1284,63 @@ int32_t Engine::verify(std::span<const int32_t> tokens, int32_t* preds, int firs
     return r;
 }
 
+int32_t Engine::verify_tree(std::span<const int32_t> tokens, const int8_t* parents, int32_t* preds) {
+    assert(pending_n_ == 0 && "verify_tree() must be followed by accept_path()");
+    const int n = static_cast<int>(tokens.size());
+    if (n < 1 || n > cfg_.max_batch || !cfg_.speculative || !set_tree(parents, n)) return kInvalid;
+    tree_ = true;
+    const int start = pos_;
+    recording_ = true;
+    const int32_t r = run_batch(tokens.data(), n, true, nullptr, preds, 0);
+    recording_ = false;
+    if (r < 0) return r;
+    pending_start_ = start;
+    pending_n_ = n;
+    return r;
+}
+
 bool Engine::accept(int keep) {
     if (pending_n_ == 0 || keep < 1 || keep > pending_n_) return false;
+    int8_t path[kMaxBatch];
+    for (int i = 0; i < keep; ++i) path[i] = static_cast<int8_t>(i);
+    return accept_path(path, keep);
+}
+
+bool Engine::accept_path(const int8_t* path, int len) {
+    if (pending_n_ == 0 || len < 1 || len > pending_n_ || path[0] != 0) return false;
+    bool chain = true;
+    for (int i = 1; i < len; ++i) {
+        if (path[i] <= path[i - 1] || path[i] >= pending_n_ || parent_[path[i]] != path[i - 1]) return false;
+        chain = chain && path[i] == i;
+    }
     cancel_prefetch();  // the rollback stages state in io_
-    if (keep < pending_n_) {
-        // Conv state after `keep` tokens = history rows keep .. keep+hist-1
-        // (history = the state before verify(), then each token's bx).
+    if (!(chain && len == pending_n_)) {
+        // Conv state after the path = the last hist entries of
+        // [state before verify, bx of path[0], bx of path[1], ...]; history
+        // rows hold the old state (0 .. hist-1), then token b's bx at hist+b.
         const std::size_t hist = h_.conv_l - 1;
         for (int s = 0; s < n_conv_; ++s) {
             float* state = state_file_ != nullptr ? reinterpret_cast<float*>(io_) : conv_state_[s];
             for (std::size_t j = 0; j < hist; ++j) {
-                if (!hist_get(s, static_cast<int>(static_cast<std::size_t>(keep) + j), state + j * h_.dim)) return false;
+                const std::size_t q = static_cast<std::size_t>(len) + j;  // index in that sequence
+                const int row = q < hist ? static_cast<int>(q) : static_cast<int>(hist) + path[q - hist];
+                if (!hist_get(s, row, state + j * h_.dim)) return false;
             }
             if (!state_store(s, state)) return false;
         }
-        // Rejected K/V rows are simply overwritten by the next positions.
     }
-    pos_ = pending_start_ + keep;
+    // K/V rows of accepted tree nodes move to their positions (a chain's
+    // already are there). path is increasing, so no row is overwritten
+    // before it's copied.
+    for (int i = 1; i < len; ++i) {
+        if (path[i] == i) continue;
+        for (int a = 0; a < n_attn_; ++a) {
+            if (!kv_copy(a, pending_start_ + path[i], pending_start_ + i)) return false;
+        }
+    }
+    pos_ = pending_start_ + len;
     pending_n_ = 0;
-    hidden_slot_ = keep - 1;
+    hidden_slot_ = path[len - 1];
     return true;
 }
 

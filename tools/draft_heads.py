@@ -162,8 +162,13 @@ def make_head(variant: str, dim: int, rank: int, depth: int):
     return (Medusa if variant == "medusa" else Recurrent)(dim, rank, depth)
 
 
+DRAFT_VOCAB = None  # eval --draft-vocab: drafts only from token ids below this
+
+
 def head_logits(hk, E, norm_w):
     hn = hk * torch.rsqrt(hk.pow(2).mean(-1, keepdim=True) + 1e-5) * norm_w
+    if DRAFT_VOCAB is not None and not hk.requires_grad:
+        return hn @ E[:DRAFT_VOCAB].T
     return hn @ E.T
 
 
@@ -295,6 +300,8 @@ def chat_ids(tok, text: str) -> list[int]:
 
 
 def evaluate(args):
+    global DRAFT_VOCAB
+    DRAFT_VOCAB = args.draft_vocab
     import spec_eval
     from huggingface_hub import hf_hub_download
     from tokenizers import Tokenizer
@@ -399,6 +406,7 @@ def main():
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--tokens", type=int, default=128, help="eval: greedy tokens per clean prompt")
+    ap.add_argument("--draft-vocab", type=int, default=None, help="eval: drafts only from ids below this")
     ap.add_argument("--head-quant", nargs="+", default=["f32"], choices=["f32", "q8", "q4"],
                     help="eval: head weights as stored on the device")
     ap.add_argument("--corpus", type=Path, nargs="+", default=[ROOT / "out" / "spec" / "selfgen.npy"],

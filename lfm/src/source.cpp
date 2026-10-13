@@ -42,6 +42,7 @@ bool FileSource::seek(uint64_t offset) {
 
 bool FileSource::read_at(uint64_t offset, void* dst, std::size_t n) {
     IoTimer timer(io_seconds_);
+    ++reads_;
     if (fd_ < 0 || !seek(offset)) return false;
     auto* out = static_cast<unsigned char*>(dst);
     std::size_t done = 0;
@@ -60,6 +61,8 @@ bool FileSource::read_at(uint64_t offset, void* dst, std::size_t n) {
 
 bool FileSource::write_at(uint64_t offset, const void* src, std::size_t n) {
     IoTimer timer(io_seconds_);
+    IoTimer wtimer(write_seconds_);
+    ++writes_;
     if (fd_ < 0 || !seek(offset)) return false;
     const auto* in = static_cast<const unsigned char*>(src);
     std::size_t done = 0;

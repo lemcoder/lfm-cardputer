@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <thread>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -82,13 +83,23 @@ std::vector<int32_t> Speculative(const std::string& path, lfm::EngineConfig cfg,
     return out;
 }
 
+// The device's second core, as a thread.
+class ThreadWorker final : public lfm::Worker {
+public:
+    void start(void (*fn)(void*), void* arg) override { t_ = std::thread(fn, arg); }
+    void wait() override { t_.join(); }
+
+private:
+    std::thread t_;
+};
+
 // The device setup: flash LM head, draft head after prompt lookup. Greedy
 // (with the same flash LM head) vs speculative, on a chat turn.
 struct HeadRun {
     std::vector<int32_t> plain, spec;
     lfm::SpecStats st;
 };
-HeadRun RunWithDraftHead(int n, int max_draft) {
+HeadRun RunWithDraftHead(int n, int max_draft, lfm::Worker* worker = nullptr) {
     const auto flash = ReadFile(kFlashHead);
     const auto dhead = ReadFile(kDraftHead);
     // "<|startoftext|><|im_start|>user\nTell me about the planets.<|im_end|>\n<|im_start|>assistant\n"
@@ -102,7 +113,7 @@ HeadRun RunWithDraftHead(int n, int max_draft) {
         lfm::Engine eng;
         EXPECT_EQ(eng.open(src, cfg), lfm::Status::Ok);
         EXPECT_TRUE(eng.set_flash_head(flash.data(), flash.size()));
-        int32_t next = eng.prefill(prompt, true);
+        int32_t next = eng.prefill(prompt, true);  // plain greedy: serial scan
         while (next >= 0 && static_cast<int>(r.plain.size()) < n) {
             r.plain.push_back(next);
             next = eng.forward(next, true);
@@ -112,6 +123,7 @@ HeadRun RunWithDraftHead(int n, int max_draft) {
     lfm::Engine eng;
     EXPECT_EQ(eng.open(src, cfg), lfm::Status::Ok);
     EXPECT_TRUE(eng.set_flash_head(flash.data(), flash.size()));
+    eng.set_worker(worker);
     lfm::DraftHead head;
     EXPECT_TRUE(head.set(dhead.data(), dhead.size(), eng));
     std::vector<int32_t> hist(1024);
@@ -211,6 +223,17 @@ TEST(Speculative, DraftHeadSameTokensAsGreedy) {
     RecordProperty("tokens_per_pass", std::to_string(tpp));
     std::printf("draft head: %d passes, %d tokens (%.2f per pass), drafts %d/%d accepted\n", r.st.passes,
                 r.st.tokens, tpp, r.st.accepted, r.st.drafted);
+    EXPECT_GT(r.st.accepted, 0);
+}
+
+// The LM head scan split over two "cores" finds the same tokens.
+TEST(Speculative, DraftHeadWithWorkerSameTokens) {
+    for (const auto& p : {kDevice, kFlashHead, kDraftHead}) {
+        if (!Exists(p)) GTEST_SKIP() << p << " missing";
+    }
+    ThreadWorker worker;
+    const HeadRun r = RunWithDraftHead(48, 2, &worker);
+    EXPECT_EQ(r.spec, r.plain);
     EXPECT_GT(r.st.accepted, 0);
 }
 

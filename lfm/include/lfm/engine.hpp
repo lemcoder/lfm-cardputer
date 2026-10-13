@@ -70,6 +70,15 @@ struct EngineConfig {
     const char* prefix_path = nullptr;
 };
 
+// Runs a job on another core while the caller works on its own share (the
+// device: a task on core 1, idle in the LM head; host tests: a thread).
+class Worker {
+public:
+    virtual ~Worker() = default;
+    virtual void start(void (*fn)(void*), void* arg) = 0;  // one job at a time
+    virtual void wait() = 0;                               // until it has finished
+};
+
 class Engine {
 public:
     static constexpr int kMaxBatch = 8;  // EngineConfig::max_batch cap
@@ -166,6 +175,14 @@ public:
     };
     const Stats& stats() const { return stats_; }
 
+    // The engine's own files (KV cache, conv state + history): time and
+    // operation counts since open().
+    struct FileIo {
+        double kv_s = 0, conv_s = 0, conv_write_s = 0;
+        long kv_ops = 0, conv_reads = 0, conv_writes = 0;
+    };
+    FileIo file_io() const;
+
     // Prompt cache. snapshot_prefix() remembers the state after the tokens
     // fed so far (pos()); restore_prefix() returns to it later, as long as
     // nothing has been written at positions below it since (generation only
@@ -174,6 +191,9 @@ public:
     bool snapshot_prefix();
     bool restore_prefix();
     int prefix_pos() const { return prefix_pos_; }  // -1: none
+
+    // The flash LM head table scan is split with this worker (optional).
+    void set_worker(Worker* w) { worker_ = w; }
 
     void set_layer_hook(LayerHook fn, void* ctx) { layer_hook_ = fn; layer_ctx_ = ctx; }
     void set_progress_hook(ProgressHook fn, void* ctx) { progress_hook_ = fn; progress_ctx_ = ctx; }
@@ -197,6 +217,20 @@ private:
     bool lm_head(const Ptrs& xs, int n, int32_t* out, float* logits);
     bool lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits);
     bool lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates);
+    struct ScanJob {
+        const std::byte* table;
+        std::size_t trb, rank;
+        uint32_t v_begin, v_end;
+        int n, k;
+        const int8_t* xq;
+        std::size_t xq_cols;
+        const float* xs;
+        float* ts[kMaxBatch];
+        int32_t* ti[kMaxBatch];
+        int n_top[kMaxBatch];
+        double topk_s;
+    };
+    static void scan_job(void* arg);
     void quantize_inputs(const Ptrs& in, int n, std::size_t cols);
     float score_row(int b, Dtype dt, const std::byte* row, const float* in, std::size_t cols) const;
     bool rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out);
@@ -299,6 +333,7 @@ private:
     int pending_n_ = 0;
 
     Stats stats_;
+    Worker* worker_ = nullptr;
     LayerHook layer_hook_ = nullptr;
     void* layer_ctx_ = nullptr;
     ProgressHook progress_hook_ = nullptr;

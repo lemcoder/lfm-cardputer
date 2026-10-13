@@ -81,6 +81,9 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 28 | Re-tune drafts per pass after #11–25 made extra positions cheaper | B2: k=1 8.31, **k=2 7.48**, k=3 7.67, k=4 7.88 s/token | k=2 stays |
 | 29 | **Wi-Fi + SD in parallel**: part of each weight block from the Mac over Wi-Fi while the card reads the rest (details below) | Combined 10.3–10.8 MB/s vs 9.3 from the card alone, but Wi-Fi needs 73–121 KB of RAM: prompt batch 7 → 3–4, B2 total ~115 → ~145 s (est.) | no, code removed |
 | 30 | **Draft head** (Medusa / Hydra style) instead of the n-gram table: a small network guesses the next tokens from the model's own final hidden state (details below) | B1 34.7 → **23.6 s**; B2 7.48 → **5.61 s/token** (total 115.5 → 95.0 s); chat, 48-token reply: **7.4 s/token** (1.71 tokens/pass) vs 11.1 with lookup only | **yes** |
+| 31 | Flash at 120 MHz (quad SDR, GD25Q64 high-performance mode): the LM head table scans and draft head reads come from flash | B2: flash scans 4.97 → 4.06 s, drafting 2.58 → 2.01 s, **5.61 → 5.52 s/token**, total 95.0 → 93.9 s. Boots and runs stably | yes |
+| 32 | Where the ~10% idle SD time goes (B2, per pass ~12.1 s; 93.6 MB at 9.31 MB/s = 10.05 s): LM head table scans ~0.3 s per verify + ~0.2 s per draft (half flash waits, half compute), ~700 small re-score reads (~0.25 s), file I/O of KV / conv state / conv history only ~0.09 s (~70 small writes at ~0.9 ms). The rest can't be overlapped: reading ahead would need megabytes of RAM | measurement | — |
+| 33 | LM head table scan split over both cores (core 1 only runs the SD reader, idle during the LM head); each core keeps its own top-k, merged after | B2: scans 4.06 → 3.26 s, drafting 2.01 → 1.45 s, **5.52 → 5.45 s/token**, total 93.9 → 93.2 s. Both cores share the flash bus, so far from 2× | yes |
 
 
 ## 29 in detail: Wi-Fi + SD in parallel

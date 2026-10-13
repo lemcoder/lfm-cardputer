@@ -47,6 +47,9 @@ public:
     // inside read_at / write_at (waiting on the disk / SD card).
     uint64_t bytes_read() const { return bytes_read_; }
     double io_seconds() const { return io_seconds_; }
+    double write_seconds() const { return write_seconds_; }  // part of io_seconds
+    long reads() const { return reads_; }
+    long writes() const { return writes_; }
 
 private:
     bool seek(uint64_t offset);
@@ -55,6 +58,9 @@ private:
     uint64_t pos_ = 0;
     uint64_t bytes_read_ = 0;
     double io_seconds_ = 0.0;
+    double write_seconds_ = 0.0;
+    long reads_ = 0;
+    long writes_ = 0;
 };
 
 }  // namespace lfm

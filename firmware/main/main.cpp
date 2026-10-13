@@ -37,6 +37,7 @@
 #include "esp_partition.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lfm.hpp"
 #include "lfm/draft.hpp"
@@ -167,6 +168,38 @@ long st_size(const char* path) {
     while (true) vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
+// ---------------------------------------------------------------- core 1 worker
+
+// Takes half of the LM head table scan (Engine::set_worker). Core 1 otherwise
+// only runs the SD reader, which is idle while the LM head runs.
+class CoreWorker final : public lfm::Worker {
+public:
+    CoreWorker() {
+        start_ = xSemaphoreCreateBinary();
+        done_ = xSemaphoreCreateBinary();
+        xTaskCreatePinnedToCore(task, "lm_worker", 4096, this, 4, nullptr, 1);
+    }
+    void start(void (*fn)(void*), void* arg) override {
+        fn_ = fn;
+        arg_ = arg;
+        xSemaphoreGive(start_);
+    }
+    void wait() override { xSemaphoreTake(done_, portMAX_DELAY); }
+
+private:
+    static void task(void* p) {
+        auto* self = static_cast<CoreWorker*>(p);
+        while (true) {
+            xSemaphoreTake(self->start_, portMAX_DELAY);
+            self->fn_(self->arg_);
+            xSemaphoreGive(self->done_);
+        }
+    }
+    SemaphoreHandle_t start_ = nullptr, done_ = nullptr;
+    void (*fn_)(void*) = nullptr;
+    void* arg_ = nullptr;
+};
+
 // ---------------------------------------------------------------- setup
 
 // Experiment knobs, read from /sdcard/cfg.txt so a config change needs an
@@ -187,6 +220,7 @@ struct RunConfig {
     int chat = 1;         // keyboard chat (needs /tok.bin); 0 = run /prompt.txt (benchmarks)
     int max_reply = 256;  // chat: longest answer, tokens
     int draft_head = 1;   // use a draft head flashed in the "ngram" partition
+    int worker = 1;       // split the LM head scan with core 1
 };
 
 RunConfig read_run_config() {
@@ -211,6 +245,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "chat")) rc.chat = value;
         else if (!std::strcmp(key, "max_reply")) rc.max_reply = value;
         else if (!std::strcmp(key, "draft_head")) rc.draft_head = value;
+        else if (!std::strcmp(key, "worker")) rc.worker = value;
     }
     std::fclose(f);
     return rc;
@@ -570,6 +605,10 @@ extern "C" void app_main(void) {
         fatal("engine open failed", lfm::to_string(status));
     }
     if (rc.progress) eng->set_progress_hook(&on_progress, nullptr);
+    if (rc.worker) {
+        static CoreWorker worker;
+        eng->set_worker(&worker);
+    }
     ESP_LOGI(TAG, "engine: ctx %d, prompt batch %d, %u KB RAM; heap free %u, largest %u", eng->max_ctx(),
              cfg.max_batch, (unsigned)(eng->ram_bytes(cfg) / 1024), (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -641,6 +680,7 @@ extern "C" void app_main(void) {
         const double scan0 = eng->stats().flash_scan_s;
         const double proj0 = eng->stats().flash_proj_s, topk0 = eng->stats().topk_s;
         const double dh0 = eng->stats().draft_head_s;
+        const lfm::Engine::FileIo io0 = eng->file_io();
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
         drafter.reset();
@@ -734,14 +774,18 @@ extern "C" void app_main(void) {
         // One machine-readable line per run (tools/bench.py).
         ESP_LOGI(TAG, "RESULT run=%d prompt_tokens=%d prefill_s=%.2f gen_tokens=%d gen_s=%.2f s_per_tok=%.3f "
                  "total_s=%.2f passes=%d drafted=%d accepted=%d batch=%d read_mb=%.1f sd_busy=%.3f stall=%.3f heap_free=%u "
-                 "lm_head_s=%.2f rescore_reads=%ld flash_scan_s=%.2f proj_s=%.2f topk_s=%.2f draft_head_s=%.2f",
+                 "lm_head_s=%.2f rescore_reads=%ld flash_scan_s=%.2f proj_s=%.2f topk_s=%.2f draft_head_s=%.2f "
+                 "kv_s=%.2f kv_ops=%ld conv_s=%.2f conv_write_s=%.2f conv_reads=%ld conv_writes=%ld",
                  run, n_prompt, prefill_s, g_status.tokens, gen_s,
                  g_status.tokens > 1 ? gen_s / (g_status.tokens - 1) : 0.0, total_s, spec.passes, spec.drafted,
                  spec.accepted, cfg.max_batch, (src.bytes_read() - read0) / 1e6, (src.sd_busy_seconds() - sd0) / total_s,
                  (src.stall_seconds() - stall0) / total_s,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), eng->stats().lm_head_s - head0,
                  eng->stats().rescore_reads - rescore0, eng->stats().flash_scan_s - scan0,
-                 eng->stats().flash_proj_s - proj0, eng->stats().topk_s - topk0, eng->stats().draft_head_s - dh0);
+                 eng->stats().flash_proj_s - proj0, eng->stats().topk_s - topk0, eng->stats().draft_head_s - dh0,
+                 eng->file_io().kv_s - io0.kv_s, eng->file_io().kv_ops - io0.kv_ops, eng->file_io().conv_s - io0.conv_s,
+                 eng->file_io().conv_write_s - io0.conv_write_s, eng->file_io().conv_reads - io0.conv_reads,
+                 eng->file_io().conv_writes - io0.conv_writes);
 
         if (run + 1 < rc.runs) continue;
         do {

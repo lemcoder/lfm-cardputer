@@ -588,6 +588,26 @@ static inline void topk_insert(float* hs, int32_t* hi, int& size, int k, float v
     hi[i] = id;
 }
 
+// One share of the flash table scan: rows [v_begin, v_end) for n tokens,
+// each into its own top-k heap. Runs on either core (only reads shared data).
+void Engine::scan_job(void* arg) {
+    auto* j = static_cast<ScanJob*>(arg);
+    constexpr std::size_t kChunk = 256;
+    float scores[kChunk];
+    for (uint32_t v0 = j->v_begin; v0 < j->v_end; v0 += kChunk) {
+        const std::size_t cnt = std::min<std::size_t>(kChunk, j->v_end - v0);
+        for (int b = 0; b < j->n; ++b) {
+            m::scan_q4_0_q8(j->table + static_cast<std::size_t>(v0) * j->trb, cnt, j->rank, j->xq + b * j->xq_cols,
+                            j->xs + b * (j->xq_cols / 32), scores);
+            const auto tk = std::chrono::steady_clock::now();
+            for (std::size_t r = 0; r < cnt; ++r) {
+                topk_insert(j->ts[b], j->ti[b], j->n_top[b], j->k, scores[r], static_cast<int32_t>(v0 + r));
+            }
+            j->topk_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tk).count();
+        }
+    }
+}
+
 // LM head from the memory-mapped flash table: no SD reads except the
 // exact re-score of the shortlist.
 bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates) {
@@ -616,21 +636,38 @@ bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates) 
     double topk_s = 0;
     if (xq_ != nullptr) quantize_inputs(z, n, rank);
     if (xq_ != nullptr && fh_.table_dtype == Dtype::Q4_0) {
-        // Chunks of rows through the scan kernel (one call per chunk, not per row).
-        constexpr std::size_t kChunk = 256;
-        float scores[kChunk];
-        for (uint32_t v0 = 0; v0 < h_.vocab; v0 += kChunk) {
-            const std::size_t cnt = std::min<std::size_t>(kChunk, h_.vocab - v0);
+        // Rows [0, mid) here, [mid, vocab) on the worker with its own top-k
+        // heaps (in the I/O buffers, idle until the re-score), merged after.
+        ScanJob mine{fh_table_, trb, rank, 0, h_.vocab, n, k, xq_, xq_cols_, xs_, {}, {}, {}, 0};
+        ScanJob other = mine;
+        const std::size_t heap_bytes = static_cast<std::size_t>(k) * (sizeof(float) + sizeof(int32_t));
+        const int per_buf = static_cast<int>(cfg_.io_bytes / heap_bytes);
+        const bool split = worker_ != nullptr && io2_ != io_ && 2 * per_buf >= n;
+        for (int b = 0; b < n; ++b) {
+            mine.ts[b] = ts[b];
+            mine.ti[b] = ti[b];
+        }
+        if (split) {
+            cancel_prefetch();  // the heaps go where a prefetch may be landing
+            mine.v_end = other.v_begin = (h_.vocab / 2) & ~255u;
             for (int b = 0; b < n; ++b) {
-                m::scan_q4_0_q8(fh_table_ + static_cast<std::size_t>(v0) * trb, cnt, rank, xq_ + b * xq_cols_,
-                                xs_ + b * (xq_cols_ / 32), scores);
-                const auto tk = std::chrono::steady_clock::now();
-                for (std::size_t r = 0; r < cnt; ++r) {
-                    topk_insert(ts[b], ti[b], n_top[b], k, scores[r], static_cast<int32_t>(v0 + r));
+                std::byte* base = (b < per_buf ? io_ : io2_) + static_cast<std::size_t>(b % per_buf) * heap_bytes;
+                other.ts[b] = reinterpret_cast<float*>(base);
+                other.ti[b] = reinterpret_cast<int32_t*>(base + static_cast<std::size_t>(k) * sizeof(float));
+            }
+            worker_->start(&Engine::scan_job, &other);
+        }
+        scan_job(&mine);
+        if (split) {
+            worker_->wait();
+            for (int b = 0; b < n; ++b) {
+                for (int i = 0; i < other.n_top[b]; ++i) {
+                    topk_insert(mine.ts[b], mine.ti[b], mine.n_top[b], k, other.ts[b][i], other.ti[b][i]);
                 }
-                topk_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tk).count();
             }
         }
+        for (int b = 0; b < n; ++b) n_top[b] = mine.n_top[b];
+        topk_s += mine.topk_s;
     } else {
         for (uint32_t v = 0; v < h_.vocab; ++v) {
             const std::byte* row = fh_table_ + static_cast<std::size_t>(v) * trb;
@@ -1063,6 +1100,22 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
     }
     progress(static_cast<int>(h_.n_layers) + 1);
     return next;
+}
+
+Engine::FileIo Engine::file_io() const {
+    FileIo r;
+    if (kv_file_ != nullptr) {
+        r.kv_s = kv_file_->io_seconds();
+        r.kv_ops = kv_file_->reads() + kv_file_->writes();
+    }
+    for (const FileSource* f : {hist_file_, state_file_}) {
+        if (f == nullptr) continue;
+        r.conv_s += f->io_seconds();
+        r.conv_write_s += f->write_seconds();
+        r.conv_reads += f->reads();
+        r.conv_writes += f->writes();
+    }
+    return r;
 }
 
 // ---------------------------------------------------------------- draft heads

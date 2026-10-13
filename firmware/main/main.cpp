@@ -33,6 +33,7 @@
 #include "lfm/engine.hpp"
 #include "async_file.hpp"
 #include "sd_card.hpp"
+#include "sd_speed.hpp"
 #include "usb_upload.hpp"
 
 namespace {
@@ -41,7 +42,8 @@ constexpr const char* TAG = "lfm";
 constexpr const char* kModelPath = "/sdcard/lfm.lfm";
 constexpr const char* kPromptPath = "/sdcard/prompt.txt";
 constexpr const char* kKvPath = "/sdcard/kv.bin";
-constexpr int kMaxCtx = 1024;  // KV file grows 12 KB per token: 12 MB at most
+constexpr int kMaxCtx = 1024;
+constexpr bool kSdSpeedTest = false;  // run the SD clock experiment instead of the model  // KV file grows 12 KB per token: 12 MB at most
 constexpr int32_t kDefaultPrompt[] = {1, 1098, 5706, 803, 4481, 856};  // "The capital of France is"
 constexpr int kMaxPrompt = 64;
 
@@ -168,8 +170,19 @@ extern "C" void app_main(void) {
     text_begin();
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
 
+    if (kSdSpeedTest) {
+        set_phase("SD clock test");
+        vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log after flashing
+        vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log after flashing
+        sd_speed_test([](const char* line) { lcd.println(line); });
+        set_phase("SD clock test done");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
     set_phase("mounting SD");
-    static SdCard card(40'000);
+    // 53.3 MHz (overclock, +25% read speed). Measured on this card: CRC-clean
+    // at sampling phases 0-3 with the default duty cycle; phase 1 is mid-window.
+    static SdCard card(SdCard::Config{.host_div = 3, .delay_phase = 1});
     if (!card.ok()) fatal("SD mount failed", esp_err_to_name(card.err()));
 
     struct stat st;

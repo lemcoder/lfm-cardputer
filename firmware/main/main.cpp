@@ -314,6 +314,7 @@ struct ChatInput {
     std::size_t n = 0;
     bool submit = false;    // Enter on a non-empty line
     bool new_chat = false;  // fn+`
+    uint32_t version = 0;   // bumped on every edit of text
 };
 ChatInput g_in;
 
@@ -333,12 +334,15 @@ void pump_chat_input() {
             g_in.text[g_in.n++] = ch;
         }
     }
-    if (changed) draw_input(g_in.text, g_in.n);
+    if (changed) {
+        ++g_in.version;
+        draw_input(g_in.text, g_in.n);
+    }
 }
 
 void run_chat(ChatContext& c) {
     static int32_t turn[640];
-    static int32_t header[16];
+    static int32_t ahead[400];  // tokens already run for the turn being typed
     bool fresh = true;
     g_in.kbd = &c.kbd;
     c.eng.reset();
@@ -347,47 +351,116 @@ void run_chat(ChatContext& c) {
     lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
     lcd.print("Type a message, Enter to send.\nfn+` starts a new chat.\n");
 
-    // The part of the next turn before the user's text never depends on it:
-    //   first turn:  <|startoftext|><|im_start|>user\n
-    //   later turns: <|im_end|>\n<|im_start|>user\n   (closes the reply)
-    // It's run through the model while the user reads and types (keys still
-    // arrive through the progress hook). If the turn's tokens don't start with
-    // it after all (text that merges with the "\n"), the state rolls back.
-    auto encode_into = [&](int32_t* out, int cap, const char* text) { return c.tok.encode(text, out, cap); };
-    int header_n = 0;
+    // Work done before Enter, while the user reads and types (keys keep
+    // arriving through the progress hook):
+    //  1. the part of the turn before the text, which never depends on it:
+    //       first turn:  <|startoftext|><|im_start|>user\n
+    //       later turns: <|im_end|>\n<|im_start|>user\n   (closes the reply)
+    //  2. the typed words, as soon as they can't change any more: all but the
+    //     last two pre-tokenizer pieces (typing at the end can only change
+    //     the piece being typed and the one before it: one character of
+    //     look-ahead). A pass is the same cost for 1 or 7 tokens, so each one
+    //     takes everything that's ready.
+    // ahead[0 .. ahead_n) is what has been run. If the turn's tokens don't
+    // start with it after all (an edit of earlier words, text that merges
+    // with the "\n"), the state rolls back to before the header.
+    auto encode_into = [&](int32_t* out, int cap, const char* text, std::size_t len) {
+        return c.tok.encode(std::string_view(text, len), out, cap);
+    };
+    constexpr int kAheadCap = static_cast<int>(sizeof(ahead) / sizeof(ahead[0]));
+    int ahead_n = 0;
+    int spec_n = 0;  // special tokens at the start of ahead (before "user\n")
+    auto run_ahead = [&](const int32_t* toks, int n, const char* what) {
+        const int64_t t = esp_timer_get_time();
+        draw_input(g_in.text, g_in.n);
+        const int32_t r = c.eng.prefill({toks, static_cast<std::size_t>(n)}, false);
+        ESP_LOGI(TAG, "chat ahead: %d %s tokens at position %d, %.1f s%s", n, what, c.eng.pos() - n,
+                 (esp_timer_get_time() - t) / 1e6, r == lfm::Engine::kNoToken ? "" : " (failed)");
+        draw_input(g_in.text, g_in.n);
+        return r == lfm::Engine::kNoToken;
+    };
     auto run_header = [&] {
-        header_n = 0;
+        ahead_n = 0;
         int h = 0;
+        static const char kNl[] = "\n", kUser[] = "user\n";
         if (fresh) {
-            header[h++] = kBos;
+            ahead[h++] = kBos;
         } else {
-            header[h++] = kImEnd;
-            h += std::max(0, encode_into(header + h, 16 - h, "\n"));
+            ahead[h++] = kImEnd;
+            h += std::max(0, encode_into(ahead + h, 16 - h, kNl, 1));
         }
-        header[h++] = kImStart;
-        h += std::max(0, encode_into(header + h, 16 - h, "user\n"));
+        ahead[h++] = kImStart;
+        spec_n = h;
+        h += std::max(0, encode_into(ahead + h, 32 - h, kUser, 5));
         if (c.eng.pos() + h + 16 + c.max_reply > c.eng.max_ctx() || !c.eng.snapshot_prefix()) return;
         set_phase("");
-        draw_input(g_in.text, g_in.n);
-        const int64_t t = esp_timer_get_time();
-        const int32_t r = c.eng.prefill({header, static_cast<std::size_t>(h)}, false);
-        if (r == lfm::Engine::kNoToken) {
-            header_n = h;
+        if (run_ahead(ahead, h, "header")) {
+            ahead_n = h;
         } else {
             c.eng.restore_prefix();
         }
-        ESP_LOGI(TAG, "chat header: %d tokens ahead at position %d, %.1f s%s", h, c.eng.pos() - header_n,
-                 (esp_timer_get_time() - t) / 1e6, header_n ? "" : " (failed)");
-        draw_input(g_in.text, g_in.n);
+    };
+    bool header_tried = false;
+    auto roll_back = [&] {
+        ESP_LOGI(TAG, "chat ahead: text changed under %d tokens: back to before the header", ahead_n);
+        c.eng.restore_prefix();
+        ahead_n = 0;
+        header_tried = false;
+    };
+    // Run the typed words that can't change any more (at most one pass).
+    static char seg[sizeof(g_in.text) + 8];
+    static int32_t stable[kAheadCap];
+    auto run_typed = [&] {
+        const int len = std::snprintf(seg, sizeof(seg), "user\n%.*s", static_cast<int>(g_in.n), g_in.text);
+        // Start of the second-to-last piece.
+        std::size_t starts[2] = {0, 0};
+        int pieces = 0;
+        for (std::size_t at = 0; at < static_cast<std::size_t>(len);) {
+            starts[0] = starts[1];
+            starts[1] = at;
+            ++pieces;
+            at += lfm::Tokenizer::piece_length(std::string_view(seg + at, static_cast<std::size_t>(len) - at));
+        }
+        if (pieces < 4) return;  // "user", "\n", and the two pieces still open
+        const std::size_t cut = starts[0];
+        std::memcpy(stable, ahead, static_cast<std::size_t>(spec_n) * sizeof(int32_t));
+        const int got = encode_into(stable + spec_n, kAheadCap - spec_n, seg, cut);
+        if (got < 0) return;
+        const int stable_n = spec_n + got;
+        for (int i = 0; i < ahead_n && i < stable_n; ++i) {
+            if (stable[i] != ahead[i]) {
+                roll_back();
+                return;
+            }
+        }
+        if (stable_n < ahead_n) {  // words deleted that had been run
+            roll_back();
+            return;
+        }
+        int k = stable_n - ahead_n;
+        if (k == 0) return;
+        if (k > c.max_batch) k = c.max_batch;
+        if (c.eng.pos() + k + 16 + c.max_reply > c.eng.max_ctx()) return;
+        std::memcpy(ahead + ahead_n, stable + ahead_n, static_cast<std::size_t>(k) * sizeof(int32_t));
+        if (run_ahead(ahead + ahead_n, k, "typed")) {
+            ahead_n += k;
+        } else {
+            roll_back();
+        }
     };
 
     while (true) {
-        // Read a line; the header pass runs first (keys are read meanwhile).
+        // Read a line; the header and finished words run meanwhile.
         g_in.n = 0;
         g_in.submit = false;
         g_in.new_chat = false;
         g_in.active = true;
-        if (header_n == 0) run_header();  // still in place after a turn that was refused
+        uint32_t seen = g_in.version - 1;
+        header_tried = false;
+        if (ahead_n == 0) {
+            run_header();
+            header_tried = true;
+        }
         while (true) {
             pump_chat_input();
             if (g_in.new_chat) {
@@ -403,6 +476,20 @@ void run_chat(ChatContext& c) {
                 continue;
             }
             if (g_in.submit) break;
+            if (ahead_n == 0) {
+                if (!header_tried) {  // after a roll-back
+                    run_header();
+                    header_tried = true;
+                    continue;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            if (g_in.version != seen) {  // something new to look at
+                seen = g_in.version;
+                run_typed();
+                continue;
+            }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         g_in.active = false;
@@ -438,21 +525,23 @@ void run_chat(ChatContext& c) {
         add_text("assistant\n");
         if (!ok) {
             set_phase("tokenizer error (tok.bin?)");
+            if (ahead_n > 0) roll_back();
             continue;
         }
-        if (c.eng.pos() + m + c.max_reply > c.eng.max_ctx()) {
+        if (c.eng.pos() - ahead_n + m + c.max_reply > c.eng.max_ctx()) {
             lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
             lcd.print("Context full: fn+` for a new chat.\n");
+            if (ahead_n > 0) roll_back();
             continue;
         }
         fresh = false;
-        // Skip what the header pass already did, if the turn starts with it.
+        // Skip what already ran while typing, if the turn starts with it.
         int done = 0;
-        if (header_n > 0) {
-            bool same = header_n <= m;
-            for (int i = 0; same && i < header_n; ++i) same = turn[i] == header[i];
+        if (ahead_n > 0) {
+            bool same = ahead_n <= m;
+            for (int i = 0; same && i < ahead_n; ++i) same = turn[i] == ahead[i];
             if (same) {
-                done = header_n;
+                done = ahead_n;
             } else {
                 c.eng.restore_prefix();
             }
@@ -474,7 +563,7 @@ void run_chat(ChatContext& c) {
         if (next < 0) {
             if (next == lfm::Engine::kIoError) fatal("SD read error", "check the card");
             set_phase("prefill failed");
-            header_n = 0;
+            ahead_n = 0;
             continue;
         }
         const double prefill_s = (esp_timer_get_time() - t0) / 1e6;
@@ -519,7 +608,7 @@ void run_chat(ChatContext& c) {
                  g_status.tokens, m, prefill_s, total_s, g_status.sec_per_tok, spec.accepted, spec.drafted);
         std::snprintf(phase, sizeof(phase), "%.0f s", total_s);
         set_phase(phase);
-        header_n = 0;  // the next turn's header comes after this reply
+        ahead_n = 0;  // the next turn's header comes after this reply
     }
 }
 

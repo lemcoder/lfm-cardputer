@@ -6,3 +6,8 @@
 using PrintFn = void (*)(const char* line);
 
 void sd_speed_test(PrintFn print);
+
+class SdCard;
+// Driver overhead: raw sector reads (no FATFS) of several sizes vs a 32 KB
+// FATFS read of /lfm.lfm, on the mounted card. Enabled with kSdRawTest.
+void sd_raw_test(PrintFn print, const SdCard& card);

@@ -225,7 +225,7 @@ reads the file back and checks size and CRC-32.
 - **Weights in RAM:** ~70 KB spare is 0.03% of a token's reads.
 - **Weights in internal flash:** ~5.9 MB at ~40 MB/s saves ~3% of reads.
   Better spent on the speculative-decoding table.
-- **SD + Wi-Fi in parallel:** measured later (experiments.md #29): 10.3–10.8 MB/s
+- **SD + Wi-Fi in parallel:** measured later (experiments.md #29, code removed): 10.3–10.8 MB/s
   combined vs 9.3, but Wi-Fi needs 73–121 KB of RAM, which costs the prompt
   batch (7 → 3–4) and makes short answers slower overall.
 - **64 KB read blocks:** need a contiguous 64 KB block the heap doesn't have.

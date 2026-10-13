@@ -77,7 +77,56 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 26 | Flash at 120 MHz (LM head table scan reads 4.7 MB per call at 26 MB/s) | Needs the flash chip's high-performance mode, unverified for this board; ≤ 0.06 s per pass (0.5%) at stake, and a failed boot needs manual download mode | skipped |
 | 27 | **Prompt cache**: after the prompt, snapshot the conv state + position (K/V rows stay valid in kv.bin); a run with the same prompt restores instead of recomputing | B1 run again (G0 / `runs=2`): **34.70 → 23.39 s**, prompt 11.32 → 0.02 s, same tokens | yes |
 | 28 | Re-tune drafts per pass after #11–25 made extra positions cheaper | B2: k=1 8.31, **k=2 7.48**, k=3 7.67, k=4 7.88 s/token | k=2 stays |
-| 29 | **Wi-Fi + SD in parallel**: fetch part of each block from the Mac (`tools/weight_server.py`) while the card reads the rest. Measured with `firmware/main/wifi_test.cpp` (16 MB, 32 KB requests, CRC-checked against the card) | SD alone 9.3 MB/s. Big Wi-Fi buffers: 2.1 + 8.7 = **10.8 MB/s (+16%)** but ~121 KB of RAM at peak. Small buffers (8/16 RX, 16 KB window): 1.6 + 8.7 = 10.3 MB/s (+10%), 48 KB connected / ~73 KB at peak. IRAM opts off: +17 KB heap, 9.8 MB/s (+5%). lwIP must sit on core 0 (unpinned: SD drops to 6.9). Engine has ~35 KB free and a prompt-batch step is 25 KB, so Wi-Fi costs batch 7 → 3–4: ~9% faster generation, ~2× slower prompt; B2 total ~115 → ~145 s (est.), break-even ≈ 45+ generated tokens. Not integrated into the engine | no |
+| 29 | **Wi-Fi + SD in parallel**: part of each weight block from the Mac over Wi-Fi while the card reads the rest (details below) | Combined 10.3–10.8 MB/s vs 9.3 from the card alone, but Wi-Fi needs 73–121 KB of RAM: prompt batch 7 → 3–4, B2 total ~115 → ~145 s (est.) | no, code removed |
+
+
+## 29 in detail: Wi-Fi + SD in parallel
+
+**Idea.** The card is busy 92–93% of every pass at ~9 MB/s, so a second,
+independent source of weight bytes would cut the pass time. The ESP32-S3 has
+Wi-Fi; the Mac can serve the model file. Split each 32 KB block: the card
+reads part, a TCP stream brings the rest, both into the engine's own buffers.
+
+**Setup (code removed afterwards; it is in git history at commit 5867142).**
+- Mac: a ~60-line Python server answering requests of
+  `<uint64 offset, uint32 length>` with that range of the `.lfm` file
+  (`os.sendfile`), several requests in flight per connection.
+- Device: a test mode (no model) that joined the network from
+  `/sdcard/wifi.txt`, fetched 16 MB in 32 KB requests, CRC-checked the first
+  1 MB against the same bytes from the card, then ran Wi-Fi and SD reads at the
+  same time. Power save off (`esp_wifi_set_ps(WIFI_PS_NONE)`).
+- 2.4 GHz home router, RSSI −49 to −70 dBm across runs.
+
+**Measurements** (SD alone, same loop: 9.31 MB/s).
+
+| Wi-Fi config | Wi-Fi alone | Wi-Fi + SD together | RAM taken by Wi-Fi |
+|---|---|---|---|
+| default lwIP, 16 static / 32 dynamic RX buffers, 32 KB TCP window | 2.9 MB/s (2 requests in flight; 1: 2.2–2.7, 4: no better) | 2.1 + 8.7 = **10.8 MB/s (+16%)** | 61 KB connected, ~121 KB at peak |
+| 8 / 16 RX buffers, 16 KB window | 1.8 MB/s | 1.6 + 8.7 = 10.3 MB/s (+10%) | 48 KB connected, ~73 KB at peak |
+| same, Wi-Fi IRAM optimisations off | 1.4 MB/s | 1.2 + 8.5 = 9.8 MB/s (+5%) | same, but +17 KB heap at boot |
+
+**What the test runs showed.**
+- *Where lwIP runs matters.* Unpinned, the lwIP task lands on core 1 next to
+  the SD reader: Wi-Fi 2.8 + SD 6.9 = 9.7 MB/s, barely above the card alone.
+  Pinned to core 0 (`CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0`): SD keeps 8.7.
+- *A first version of the test was wrong.* The SD loop ran in the main task
+  (priority 1, core 0) and starved behind the Wi-Fi tasks: the card sat idle
+  between reads (SD 5.4 MB/s, total 8.3, *less* than the card alone). The
+  real reader runs at high priority on core 1; the test had to do the same.
+- *Heap "minimum since boot" lies* when an earlier stage (the USB upload
+  buffers) dipped lower; the peak has to be measured with
+  `heap_caps_monitor_local_minimum_free_size_start()`.
+- Wi-Fi throughput moves with the radio conditions; a split ratio would have
+  to adapt per block, or a slow stretch stalls the whole matrix.
+
+**Why it was not built into the engine.** RAM. With the engine loaded the
+heap has ~35 KB free, and every step of prompt batch costs 25 KB. Even the
+small Wi-Fi config (~73 KB at peak) forces the prompt batch from 7 down to
+3–4. Estimates for B2 (20-token prompt, 12 tokens): generation ~9% faster
+(7.5 → ~6.8 s/token), the prompt ~2× slower (33 → ~60 s), total
+~115 → ~145 s. It only pays off past ~45 generated tokens per prompt, and it
+makes the device depend on a Mac running a server. The bigger buffers that
+gave +16% need RAM the device doesn't have.
 
 ## Not tried (and why)
 

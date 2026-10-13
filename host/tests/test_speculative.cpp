@@ -22,6 +22,7 @@ const std::string kBf16 = kRoot + "/out/lfm-bf16.lfm";
 const std::string kNgram = kRoot + "/out/ngram.bin";
 const std::string kHistPath = kRoot + "/out/test-conv-hist.bin";
 const std::string kKvPath2 = kRoot + "/out/test-kv2.bin";
+const std::string kStatePath = kRoot + "/out/test-conv-state.bin";
 
 bool Exists(const std::string& p) { return std::ifstream(p).good(); }
 
@@ -127,6 +128,7 @@ TEST(Speculative, DeviceConfigSameTokensAsGreedy) {
                           .int8_activations = true};
     const auto want = Plain(kQ4, cfg, 48);
     cfg.conv_history_path = kHistPath.c_str();
+    cfg.conv_state_path = kStatePath.c_str();  // device: conv state on the card too
     lfm::SpecStats st;
     EXPECT_EQ(Speculative(kQ4, cfg, 48, 3, table.empty() ? nullptr : &table, &st), want);
     RecordProperty("tokens_per_pass", std::to_string(static_cast<double>(st.tokens) / st.passes));
@@ -199,4 +201,16 @@ TEST(Speculative, VerifyNeedsSpeculativeConfig) {
     int32_t preds[2];
     EXPECT_EQ(eng.verify(tokens, preds), lfm::Engine::kInvalid);
     EXPECT_FALSE(eng.accept(1));
+}
+
+// Conv state in a file gives exactly the same tokens as in RAM, with batched
+// prompt and speculative rollbacks.
+TEST(Speculative, ConvStateFileSameTokens) {
+    REQUIRE(kQ4);
+    lfm::EngineConfig cfg{.max_ctx = 64, .max_batch = 6, .int8_activations = true};
+    const auto want = Plain(kQ4, cfg, 24);
+    cfg.conv_state_path = kStatePath.c_str();
+    EXPECT_EQ(Plain(kQ4, cfg, 24), want);
+    lfm::SpecStats st;
+    EXPECT_EQ(Speculative(kQ4, cfg, 24, 3, nullptr, &st), want);
 }

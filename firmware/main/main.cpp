@@ -5,6 +5,7 @@
 //   /prompt.txt    out/prompt.txt  (token ids; optional, defaults below)
 //   /kv.bin        created at boot: the KV cache lives on the card, not in RAM
 //   /conv.bin      created at boot: conv state history for speculative rollback
+//   /cstate.bin    created at boot: the conv layers' state (frees 64 KB of RAM)
 //
 // Flash partition "weights": the n-gram draft table (tools/flash_ngram.sh).
 // Without it, speculative decoding still runs with prompt-lookup drafts.
@@ -50,6 +51,7 @@ constexpr const char* kModelPath = "/sdcard/lfm.lfm";
 constexpr const char* kPromptPath = "/sdcard/prompt.txt";
 constexpr const char* kKvPath = "/sdcard/kv.bin";
 constexpr const char* kConvHistPath = "/sdcard/conv.bin";
+constexpr const char* kConvStatePath = "/sdcard/cstate.bin";
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
 constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
@@ -218,7 +220,8 @@ extern "C" void app_main(void) {
     // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
     constexpr std::size_t kReserve = 24 * 1024;
     lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath,
-                          .int8_activations = true, .speculative = true, .conv_history_path = kConvHistPath};
+                          .int8_activations = true, .speculative = true, .conv_history_path = kConvHistPath,
+                          .conv_state_path = kConvStatePath};
     static lfm::Engine* eng = nullptr;
     lfm::Status status = lfm::Status::OutOfMemory;
     for (int batch = 6; batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {

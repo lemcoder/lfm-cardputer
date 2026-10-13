@@ -64,8 +64,9 @@ LAYER_FIELDS = ["operator_norm", "ffn_norm", "w1", "w2", "w3",
 # 4 x u64 (lands on offset 128, so no padding in the C++ struct either).
 HEADER_HEAD = struct.Struct("<8s12I2f16I4Q")
 # Then LayerOffsets[16], then uint8 layer_dtype[16][16] (Dtype per LAYER_FIELDS index),
-# then the LM head shortlist: u64 offset, u32 dtype, u32 candidates.
-HEADER_TAIL = struct.Struct("<QII")
+# then the LM head shortlist: u64 offset, u32 dtype, u32 candidates,
+# u64 low-rank projection offset, u32 rank, u32 reserved.
+HEADER_TAIL = struct.Struct("<QIIQII")
 HEADER_SIZE = HEADER_HEAD.size + MAX_LAYERS * len(LAYER_FIELDS) * 8 + MAX_LAYERS * 16 + HEADER_TAIL.size
 
 
@@ -189,10 +190,12 @@ class Writer:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quant", default="q8", help="e.g. q8 | bf16 | q8,mlp=q4,embed=q4")
-    ap.add_argument("--lm-head", choices=["none", "q4"], default="q4",
+    ap.add_argument("--lm-head", choices=["none", "q4", "lowrank"], default="q4",
                     help="q4: also store a Q4 copy of the embedding to shortlist LM head candidates "
-                         "(exact top-1, ~half the LM head reads); skipped if embed is already q4")
-    ap.add_argument("--lm-head-candidates", type=int, default=32)
+                         "(exact top-1, ~half the LM head reads); skipped if embed is already q4. "
+                         "lowrank: shortlist with a rank-r table (out/lm_basis.npy, tools/lm_basis.py); "
+                         "~17 MB instead of 38, the true token is in the shortlist ~99.8% of the time")
+    ap.add_argument("--lm-head-candidates", type=int, default=None, help="default 32 (q4) / 256 (lowrank)")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--prompt", default="The capital of France is")
     args = ap.parse_args()
@@ -214,6 +217,11 @@ def main():
     quant = parse_quant(args.quant)
     name = args.quant.replace(",", "-").replace("=", "-")
     use_lm_head = args.lm_head == "q4" and quant["embed"] != DTYPE_Q4_0
+    use_lowrank = args.lm_head == "lowrank"
+    candidates = args.lm_head_candidates or (256 if use_lowrank else 32)
+    if use_lowrank:
+        basis = torch.from_numpy(np.load(ROOT / "out" / "lm_basis.npy"))  # [dim, r]
+        name += f"-head-lr{basis.shape[1]}"
     if use_lm_head:
         name += "-head-q4"
     out = args.out or ROOT / "out" / f"lfm-{name}.lfm"
@@ -250,6 +258,13 @@ def main():
         final_norm = wr.f32(w["model.embedding_norm.weight"])
         embed = wr.matrix(w["model.embed_tokens.weight"], quant["embed"])
         lm_head = wr.matrix(w["model.embed_tokens.weight"], DTYPE_Q4_0) if use_lm_head else 0
+        lm_proj = lm_rank = 0
+        if use_lowrank:
+            # z = V^T h (rank floats), then approx logit[v] = (E V)[v] . z
+            lm_rank = basis.shape[1]
+            lm_proj = wr.matrix(basis.T.contiguous(), DTYPE_Q8_0)                          # [rank, dim]
+            lm_head = wr.matrix(w["model.embed_tokens.weight"].float() @ basis, DTYPE_Q8_0)  # [vocab, rank]
+            print(f"low-rank head    @ {f.tell() / 1e6:7.1f} MB (rank {lm_rank})", flush=True)
         print(f"embed            @ {f.tell() / 1e6:7.1f} MB", flush=True)
 
         pieces = vocab_pieces(tok_json, vocab)
@@ -271,7 +286,8 @@ def main():
         for i in range(MAX_LAYERS):
             row = [quant.get(k, DTYPE_F32) if i < n_layers else 0 for k in LAYER_FIELDS]
             dtypes += bytes(row + [0] * (16 - len(row)))
-        tail = HEADER_TAIL.pack(lm_head, DTYPE_Q4_0 if use_lm_head else 0, args.lm_head_candidates)
+        head_dtype = DTYPE_Q8_0 if use_lowrank else DTYPE_Q4_0 if use_lm_head else 0
+        tail = HEADER_TAIL.pack(lm_head, head_dtype, candidates, lm_proj, lm_rank, 0)
         f.seek(0)
         f.write(head + table + dtypes + tail)
         assert f.tell() == HEADER_SIZE

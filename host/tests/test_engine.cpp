@@ -551,3 +551,46 @@ TEST(EngineQ4, DeviceConfigConsistent) {
     EXPECT_EQ(got, want);
     EXPECT_EQ(want.front(), 5242) << "first token should still be ' Paris'";
 }
+
+// ---------------------------------------------------------------- low-rank LM head shortlist
+
+const std::string kQ4LowRank = std::string(LFM_REPO_ROOT) + "/out/lfm-q4-head-lr256.lfm";
+
+// Shortlist with the rank-256 table, re-score the top 256 exactly: the next
+// token matches the full head scan at nearly every position of real text
+// (tools/sparsity_eval.py predicted 99.8%).
+TEST(EngineQ4, LowRankHeadAgreesWithFullScan) {
+    MODEL_REQUIRED(kQ4LowRank);
+    MODEL_REQUIRED(kQ4Path);
+    std::vector<int32_t> text;
+    {
+        std::ifstream f(kEvalPath);
+        int32_t id;
+        while (f >> id) text.push_back(id);
+    }
+    if (text.size() < 2) GTEST_SKIP() << kEvalPath << " missing: uv run tools/eval_text.py";
+
+    lfm::FileSource src_full(kQ4Path.c_str()), src_lr(kQ4LowRank.c_str());
+    lfm::Engine full, lr;
+    const lfm::EngineConfig cfg{.max_ctx = 512, .int8_activations = true};
+    ASSERT_EQ(full.open(src_full, cfg), lfm::Status::Ok);
+    ASSERT_EQ(lr.open(src_lr, cfg), lfm::Status::Ok);
+    ASSERT_GT(lr.header().lm_rank, 0u);
+    int agree = 0, total = 0;
+    for (std::size_t t = 0; t + 1 < text.size(); ++t) {
+        agree += lr.forward(text[t], true) == full.forward(text[t], true);
+        ++total;
+    }
+    RecordProperty("agreement", std::to_string(static_cast<double>(agree) / total));
+    EXPECT_GE(agree, total * 98 / 100) << agree << " / " << total;
+}
+
+TEST(EngineQ4, LowRankHeadDeviceConfigGeneratesGolden) {
+    MODEL_REQUIRED(kQ4LowRank);
+    ThreadedSource src(kQ4LowRank.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_ctx = 64, .kv_bf16 = true, .kv_path = kKvPath.c_str(), .max_batch = 4,
+                             .int8_activations = true, .speculative = true}),
+              lfm::Status::Ok);
+    EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
+}

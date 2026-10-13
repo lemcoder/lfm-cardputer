@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["torch", "transformers>=4.57", "numpy", "huggingface_hub", "tokenizers"]
+# dependencies = ["torch", "transformers>=4.57", "numpy", "huggingface_hub", "tokenizers", "datasets"]
 # ///
 """Simulate two ways to read fewer weight bytes per token, before building them.
 
@@ -85,6 +85,63 @@ def lm_head_eval(model, ids, device):
         print(f"       (k-means {time.time() - t0:.0f} s, cluster sizes {sizes.min().item()}-{sizes.max().item()})")
 
 
+# ------------------------------------------------------------------ C. low-rank shortlist
+
+def lowrank_eval(model, ids, device):
+    """Shortlist LM head candidates with a rank-r copy of the embedding.
+
+    approx score = (E V) (V^T h): a [vocab, r] table (int8 + per-row scale on
+    the device) scanned instead of [vocab, 1024]; the top S candidates are
+    then re-scored exactly. Reported: how often the true greedy token is in
+    the shortlist, and MB read per token (table + S Q4 rows).
+    """
+    from datasets import load_dataset
+    from tokenizers import Tokenizer
+    from huggingface_hub import hf_hub_download
+
+    with torch.no_grad():
+        E = model.model.embed_tokens.weight                       # [V, 1024]
+        h = model.model(ids).last_hidden_state[0]                 # eval positions
+        truth = (h @ E.T).argmax(1)
+
+        # Fit hidden-state statistics on different text (wikitext validation).
+        tok = Tokenizer.from_file(hf_hub_download(MODEL, "tokenizer.json"))
+        ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="validation")
+        texts = [t for t in ds["text"] if len(t) > 300][:60]
+        hs = []
+        for t in texts:
+            x = torch.tensor([[1] + tok.encode(t, add_special_tokens=False).ids[:256]], device=device)
+            hs.append(model.model(x).last_hidden_state[0])
+        H = torch.cat(hs)                                         # [N, 1024]
+        print(f"\nC. low-rank shortlist ({h.shape[0]} eval positions; basis fit on {H.shape[0]} other positions)")
+
+        # Bases: right singular vectors of E, or of E weighted by hidden-state covariance.
+        _, _, VE = torch.linalg.svd(E.cpu(), full_matrices=False)
+        VE = VE.T.to(device)                                      # [1024, 1024], columns
+        C = (H.T @ H / H.shape[0]).cpu()
+        L = torch.linalg.cholesky(C + 1e-4 * torch.eye(C.shape[0]))
+        _, _, W = torch.linalg.svd((E.cpu() @ L), full_matrices=False)  # directions mattering for typical h
+        VH = torch.linalg.solve(L.T, W.T).to(device)              # [1024, 1024]
+        VH = VH / VH.norm(dim=0, keepdim=True)
+        Q, _ = torch.linalg.qr(VH)
+
+        print(f"{'basis':>6} {'r':>4} {'S':>5} {'hit':>7} {'MB':>6}")
+        for name, V in (("E-svd", VE), ("h-wtd", Q)):
+            for r in (64, 128, 256):
+                Vr = V[:, :r]
+                T = E @ Vr                                        # [V, r]
+                # int8 per row, as stored on the device
+                sc = T.abs().amax(1, keepdim=True) / 127
+                Tq = (T / sc).round().clamp(-127, 127) * sc
+                approx = (h @ Vr) @ Tq.T                          # [P, V]
+                order = approx.argsort(1, descending=True)
+                rank = (order == truth.unsqueeze(1)).float().argmax(1)
+                for S in (32, 64, 128, 256):
+                    hit = (rank < S).float().mean().item()
+                    mb = (E.shape[0] * (r + 4) + S * Q4_ROW) / 1e6
+                    print(f"{name:>6} {r:4d} {S:5d} {hit:7.1%} {mb:6.2f}")
+
+
 # ------------------------------------------------------------------ B. MLP sparsity
 
 def keep_blocks(t: torch.Tensor, keep: float) -> torch.Tensor:
@@ -143,9 +200,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-head", action="store_true")
     ap.add_argument("--skip-mlp", action="store_true")
+    ap.add_argument("--lowrank", action="store_true", help="only part C")
     args = ap.parse_args()
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     model, ids = load(device)
+    if args.lowrank:
+        lowrank_eval(model, ids, device)
+        return
     if not args.skip_head:
         lm_head_eval(model, ids, device)
     if not args.skip_mlp:

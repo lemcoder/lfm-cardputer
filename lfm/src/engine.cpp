@@ -114,6 +114,7 @@ Engine::~Engine() {
     delete kv_file_;
     std::free(hist_ram_);
     delete hist_file_;
+    delete state_file_;
 }
 
 // 16-byte aligned (SIMD loads), and 16 bytes of slack at the end: the SIMD
@@ -134,7 +135,8 @@ std::size_t Engine::ram_bytes(const EngineConfig& cfg) const {
         ? static_cast<std::size_t>(cfg.max_batch) * std::max({d.dim, d.ff, d.q_dim}) * (1 + sizeof(float) / 32.0)
         : 0;
     return cfg.io_bytes * (cfg.double_buffer ? 2 : 1) + row_bytes(Dtype::BF16, d.ff) + xq + d.floats(cfg.max_batch) * sizeof(float)
-           + static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float) + kv;
+           + (cfg.conv_state_path != nullptr ? 0 : static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float))
+           + kv;
 }
 
 Status Engine::open(Source& src, const EngineConfig& cfg) {
@@ -151,6 +153,8 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
             for (auto& dt : row) dt = static_cast<uint8_t>(h_.embed_dtype);
         }
         h_.lm_head = 0;
+        h_.lm_proj = 0;
+        h_.lm_rank = 0;
     } else if (h_.version != kFormatVersion) {
         return Status::BadVersion;
     }
@@ -159,11 +163,13 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     bool ok = is_matrix_dtype(h_.embed_dtype) &&
               (h_.lm_head == 0 || (is_matrix_dtype(h_.lm_head_dtype) && h_.lm_head_candidates >= 1 &&
                                    h_.lm_head_candidates <= kMaxCandidates)) &&
+              (h_.lm_rank == 0 || (h_.lm_proj != 0 && h_.lm_rank % 32 == 0 && h_.lm_rank <= kTopKOffset)) &&
               h_.n_layers >= 1 && h_.n_layers <= static_cast<uint32_t>(kMaxLayers) &&
               d.dim % kQ8BlockSize == 0 && d.ff % kQ8BlockSize == 0 && d.q_dim % kQ8BlockSize == 0 &&
               d.heads % d.kv_heads == 0 && d.head_dim % 2 == 0 && d.conv_l >= 2 &&
               row_bytes(Dtype::BF16, d.ff) <= cfg.io_bytes &&  // widest row we stream
-              2 * d.kv_dim * sizeof(float) <= cfg.io_bytes && cfg.max_ctx >= 1 && cfg.max_batch >= 1 &&
+              2 * d.kv_dim * sizeof(float) <= cfg.io_bytes &&
+              (d.conv_l - 1) * d.dim * sizeof(float) <= cfg.io_bytes &&  // conv state staged in io_ cfg.max_ctx >= 1 && cfg.max_batch >= 1 &&
               cfg.max_batch <= kMaxBatch;
     for (uint32_t i = 0; ok && i < h_.n_layers; ++i) {
         const bool conv = h_.layer_kind[i] == LayerKind::Conv;
@@ -185,7 +191,7 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     io_ = static_cast<std::byte*>(alloc(cfg.io_bytes));
     io2_ = cfg.double_buffer ? static_cast<std::byte*>(alloc(cfg.io_bytes)) : io_;
     const std::size_t B = static_cast<std::size_t>(cfg.max_batch);
-    slot_floats_ = d.slot();
+    slot_floats_ = std::max(d.slot(), kTopKOffset + 2 * kMaxCandidates);  // LM head top-k lives here too
     for (std::size_t b = 0; b < B; ++b) {
         slots_[b] = static_cast<float*>(alloc(slot_floats_ * sizeof(float)));
         if (slots_[b] == nullptr) return Status::OutOfMemory;
@@ -208,8 +214,12 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     shared_ = norm_w_ + d.dim;
 
     if (n_conv_ > 0) {
+        if (cfg.conv_state_path != nullptr) {
+            state_file_ = new FileSource(cfg.conv_state_path, FileSource::Mode::ReadWrite);
+            if (!state_file_->ok()) return Status::KvFileError;
+        }
         // One block per conv layer: small blocks fit a fragmented heap.
-        for (int i = 0; i < n_conv_; ++i) {
+        for (int i = 0; state_file_ == nullptr && i < n_conv_; ++i) {
             conv_state_[i] = static_cast<float*>(std::malloc((d.conv_l - 1) * d.dim * sizeof(float)));
             if (conv_state_[i] == nullptr) return Status::OutOfMemory;
         }
@@ -241,8 +251,13 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
 void Engine::reset() {
     pos_ = 0;
     pending_n_ = 0;
+    const std::size_t state_floats = (h_.conv_l - 1) * h_.dim;
     for (int i = 0; i < n_conv_; ++i) {
-        if (conv_state_[i] != nullptr) std::memset(conv_state_[i], 0, (h_.conv_l - 1) * h_.dim * sizeof(float));
+        if (conv_state_[i] != nullptr) std::memset(conv_state_[i], 0, state_floats * sizeof(float));
+    }
+    if (state_file_ != nullptr) {
+        std::memset(io_, 0, state_floats * sizeof(float));
+        for (int i = 0; i < n_conv_; ++i) state_store(i, reinterpret_cast<const float*>(io_));
     }
 }
 
@@ -348,33 +363,49 @@ bool Engine::matvec(const Ptrs& out, std::size_t rows, uint64_t offset, Dtype dt
 bool Engine::lm_head(const Ptrs& xs, int n, int32_t* out, float* logits) {
     assert(n >= 1 && n <= cfg_.max_batch && (logits == nullptr || n == 1));
     const bool shortlist = h_.lm_head != 0 && logits == nullptr;
+    const bool lowrank = shortlist && h_.lm_rank > 0;
     const Dtype scan_dt = shortlist ? h_.lm_head_dtype : h_.embed_dtype;
     const uint64_t scan_off = shortlist ? h_.lm_head : h_.embed;
-    const std::size_t rb = row_bytes(scan_dt, h_.dim);
+    const std::size_t scan_cols = lowrank ? h_.lm_rank : h_.dim;
+    const std::size_t rb = row_bytes(scan_dt, scan_cols);
 
-    // Integer path (see matvec): quantize each x once for the scan and the re-score.
-    const bool int8 = xq_ != nullptr && logits == nullptr;
-    if (int8) {
-        for (int b = 0; b < n; ++b) m::quantize_q8({xs.p[b], h_.dim}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
+    // What the scan dots each row with: x itself, or (low rank) z = proj . x.
+    Ptrs scan_in = xs;
+    if (lowrank) {
+        scan_in = slots(0);  // z lives at the start of each token's scratch slot
+        if (!matvec(scan_in, h_.lm_rank, h_.lm_proj, h_.lm_head_dtype, h_.dim, xs, n)) return false;
     }
-    auto score = [&](int b, Dtype dt, const std::byte* row) {
+
+    // Integer path (see matvec): quantize the inputs once per stage.
+    const bool int8 = xq_ != nullptr && logits == nullptr;
+    auto quantize = [&](const Ptrs& in, std::size_t cols) {
+        if (!int8) return;
+        for (int b = 0; b < n; ++b) m::quantize_q8({in.p[b], cols}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
+    };
+    auto score = [&](int b, Dtype dt, const std::byte* row, const Ptrs& in, std::size_t cols) {
         const int8_t* q = xq_ + b * xq_cols_;
         const float* sc = xs_ + b * (xq_cols_ / 32);
-        if (int8 && dt == Dtype::Q8_0) return m::dot_q8_0_q8(row, q, sc, h_.dim);
-        if (int8 && dt == Dtype::Q4_0) return m::dot_q4_0_q8(row, q, sc, h_.dim);
-        return dot_row(dt, row, {xs.p[b], h_.dim});
+        if (int8 && dt == Dtype::Q8_0) return m::dot_q8_0_q8(row, q, sc, cols);
+        if (int8 && dt == Dtype::Q4_0) return m::dot_q4_0_q8(row, q, sc, cols);
+        return dot_row(dt, row, {in.p[b], cols});
     };
 
-    // Per token: top-k by (approximate) score, kept sorted descending; ties
-    // keep the lower id first, like argmax.
+    // Per token: top-k by (approximate) score, sorted descending; ties keep
+    // the lower id first, like argmax. Kept in the token's scratch slot,
+    // after z (open() checks it fits).
     const int k = shortlist ? static_cast<int>(h_.lm_head_candidates) : 1;
-    float top_score[kMaxBatch][kMaxCandidates];
-    int32_t top_id[kMaxBatch][kMaxCandidates];
+    float* top_score[kMaxBatch];
+    int32_t* top_id[kMaxBatch];
     int n_top[kMaxBatch] = {};
+    for (int b = 0; b < n; ++b) {
+        top_score[b] = slots_[b] + kTopKOffset;
+        top_id[b] = reinterpret_cast<int32_t*>(slots_[b] + kTopKOffset + kMaxCandidates);
+    }
 
+    quantize(scan_in, scan_cols);
     const bool ok = stream_rows(scan_off, h_.vocab, rb, [&](std::size_t r, const std::byte* row) {
         for (int b = 0; b < n; ++b) {
-            const float v = score(b, scan_dt, row);
+            const float v = score(b, scan_dt, row, scan_in, scan_cols);
             if (logits != nullptr) logits[r] = v;
             float* ts = top_score[b];
             int32_t* ti = top_id[b];
@@ -390,23 +421,31 @@ bool Engine::lm_head(const Ptrs& xs, int n, int32_t* out, float* logits) {
         }
     });
     if (!ok) return false;
+    if (!shortlist) {
+        for (int b = 0; b < n; ++b) out[b] = top_id[b][0];
+        return true;
+    }
 
+    // Re-score each shortlist with the exact rows, in file order (the SD
+    // only seeks forward).
+    quantize(xs, h_.dim);
+    const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
     for (int b = 0; b < n; ++b) {
-        if (!shortlist) {
-            out[b] = top_id[b][0];
-            continue;
+        int32_t* ids = top_id[b];
+        for (int i = 1; i < n_top[b]; ++i) {  // insertion sort ascending
+            const int32_t id = ids[i];
+            int j = i;
+            for (; j > 0 && ids[j - 1] > id; --j) ids[j] = ids[j - 1];
+            ids[j] = id;
         }
-        // Re-score the shortlist with the exact rows.
-        const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
         float best = -INFINITY;
-        int32_t best_id = top_id[b][0];
+        int32_t best_id = ids[0];
         for (int i = 0; i < n_top[b]; ++i) {
-            const int32_t id = top_id[b][i];
-            if (!src_->read_at(h_.embed + static_cast<uint64_t>(id) * erb, io_, erb)) return false;
-            const float v = score(b, h_.embed_dtype, io_);
-            if (v > best || (v == best && id < best_id)) {
+            if (!src_->read_at(h_.embed + static_cast<uint64_t>(ids[i]) * erb, io_, erb)) return false;
+            const float v = score(b, h_.embed_dtype, io_, xs, h_.dim);
+            if (v > best) {  // ascending ids: strict > keeps the lowest id on ties
                 best = v;
-                best_id = id;
+                best_id = ids[i];
             }
         }
         out[b] = best_id;
@@ -431,7 +470,8 @@ bool Engine::conv_op(int layer, int n) {
     if (!read_f32(L.conv_kernel, {kernel, d.dim * d.conv_l})) return false;
 
     const int cs = layer_slot_[layer];
-    float* state = conv_state_[cs];
+    float* state = state_load(cs);
+    if (state == nullptr) return false;
     const std::size_t hist = d.conv_l - 1;  // previous tokens kept
     if (recording_) {  // speculative verify: keep what accept() may need to roll back to
         for (std::size_t j = 0; j < hist; ++j) {
@@ -458,6 +498,7 @@ bool Engine::conv_op(int layer, int n) {
         }
         if (recording_ && !hist_put(cs, static_cast<int>(hist) + b, state + (hist - 1) * d.dim)) return false;
     }
+    if (!state_store(cs, state)) return false;  // before out_proj reuses io_
     return matvec(acts(tmp_), d.dim, L.conv_out, h_.dtype(layer, kConvOut), d.dim, slots(0), n);
 }
 
@@ -725,17 +766,32 @@ bool Engine::accept(int keep) {
         // (history = the state before verify(), then each token's bx).
         const std::size_t hist = h_.conv_l - 1;
         for (int s = 0; s < n_conv_; ++s) {
+            float* state = state_file_ != nullptr ? reinterpret_cast<float*>(io_) : conv_state_[s];
             for (std::size_t j = 0; j < hist; ++j) {
-                if (!hist_get(s, static_cast<int>(static_cast<std::size_t>(keep) + j), conv_state_[s] + j * h_.dim)) {
-                    return false;
-                }
+                if (!hist_get(s, static_cast<int>(static_cast<std::size_t>(keep) + j), state + j * h_.dim)) return false;
             }
+            if (!state_store(s, state)) return false;
         }
         // Rejected K/V rows are simply overwritten by the next positions.
     }
     pos_ = pending_start_ + keep;
     pending_n_ = 0;
     return true;
+}
+
+// Conv state: in RAM, or (conv_state_path) in a file, loaded into io_ while
+// a conv layer runs (io_ is free between that layer's two matvecs).
+float* Engine::state_load(int slot) {
+    if (state_file_ == nullptr) return conv_state_[slot];
+    const std::size_t bytes = (h_.conv_l - 1) * h_.dim * sizeof(float);
+    auto* buf = reinterpret_cast<float*>(io_);
+    return state_file_->read_at(static_cast<uint64_t>(slot) * bytes, buf, bytes) ? buf : nullptr;
+}
+
+bool Engine::state_store(int slot, const float* state) {
+    if (state_file_ == nullptr) return true;  // RAM state was updated in place
+    const std::size_t bytes = (h_.conv_l - 1) * h_.dim * sizeof(float);
+    return state_file_->write_at(static_cast<uint64_t>(slot) * bytes, state, bytes);
 }
 
 // Conv history for speculative rollback: per conv layer, rows of dim floats:

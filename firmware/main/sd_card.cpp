@@ -35,7 +35,7 @@ SdCard::SdCard(const Config& cfg) {
     g_cfg = cfg;
     const esp_vfs_fat_sdmmc_mount_config_t mount = {
         .format_if_mount_failed = false,
-        .max_files = 5,  // model, KV, conv history, prompt, upload
+        .max_files = 6,  // model, KV, conv history, conv state, prompt, upload
         .allocation_unit_size = 512,
         .disk_status_check_enable = false,
         .use_one_fat = false,

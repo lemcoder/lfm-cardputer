@@ -57,6 +57,11 @@ struct EngineConfig {
     // per conv layer, in RAM, or in this file if set (the device: ~160 KB).
     bool speculative = false;
     const char* conv_history_path = nullptr;
+    // Keep the conv layers' state (conv_l-1 rows of dim floats each, 64 KB
+    // for LFM2.5-230M) in this file instead of RAM. Each conv layer then
+    // reads and writes its 8 KB once per pass: ~128 KB of I/O per pass,
+    // traded for RAM that a bigger prompt batch can use.
+    const char* conv_state_path = nullptr;
 };
 
 class Engine {
@@ -144,6 +149,8 @@ private:
     std::size_t hist_rows() const;
     bool hist_put(int slot, int row, const float* src);
     bool hist_get(int slot, int row, float* dst);
+    float* state_load(int slot);                       // conv state, in RAM or staged in io_
+    bool state_store(int slot, const float* state);
     bool conv_op(int layer, int n);
     bool attn_op(int layer, int n);
     bool mlp(int layer, int n);
@@ -158,7 +165,10 @@ private:
 
     void progress(int done);
 
-    static constexpr int kMaxCandidates = 64;  // LM head shortlist cap
+    static constexpr int kMaxCandidates = 256;  // LM head shortlist cap
+    // LM head scratch inside each token's slot: z (low-rank projection, up
+    // to kTopKOffset floats), then the top-k scores and ids.
+    static constexpr std::size_t kTopKOffset = 512;
 
     Source* src_ = nullptr;
     FileHeader h_{};
@@ -195,6 +205,7 @@ private:
     // Speculative decoding: conv history, verify() state.
     float* hist_ram_ = nullptr;
     FileSource* hist_file_ = nullptr;
+    FileSource* state_file_ = nullptr;
     bool recording_ = false;
     int pending_start_ = 0;
     int pending_n_ = 0;

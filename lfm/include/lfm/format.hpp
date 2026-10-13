@@ -86,18 +86,24 @@ struct FileHeader {
     uint64_t vocab_bytes;
     LayerOffsets layers[kMaxLayers];
     uint8_t layer_dtype[kMaxLayers][16];  // Dtype of each LayerField (first kNumLayerFields used)
-    // Optional low-precision copy of the embedding, used only to shortlist
-    // the LM head's top candidates, which are then re-scored with `embed`.
-    // 0 = none (scan `embed` directly).
+    // Optional cheap copy of the LM head, used only to shortlist the top
+    // `lm_head_candidates` tokens, which are then re-scored with `embed`.
+    // 0 = none (scan `embed` directly). Two kinds:
+    //   lm_rank == 0: [vocab, dim] low-precision copy of the embedding
+    //   lm_rank  > 0: low rank: z = lm_proj . h ([rank, dim] matrix), then
+    //                 approx logit[v] = lm_head row v . z ([vocab, rank])
     uint64_t lm_head;
     Dtype lm_head_dtype;
     uint32_t lm_head_candidates;
+    uint64_t lm_proj;
+    uint32_t lm_rank;
+    uint32_t reserved_tail;
 
     Dtype dtype(int layer, LayerField f) const { return static_cast<Dtype>(layer_dtype[layer][f]); }
 };
 
 static_assert(sizeof(LayerOffsets) == kNumLayerFields * 8);
 static_assert(offsetof(FileHeader, embed) == 128, "must match export.py HEADER_HEAD");
-static_assert(sizeof(FileHeader) == 160 + kMaxLayers * (sizeof(LayerOffsets) + 16) + 16, "must match export.py HEADER_SIZE");
+static_assert(sizeof(FileHeader) == 160 + kMaxLayers * (sizeof(LayerOffsets) + 16) + 32, "must match export.py HEADER_SIZE");
 
 }  // namespace lfm

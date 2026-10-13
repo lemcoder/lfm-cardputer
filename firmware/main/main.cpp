@@ -6,6 +6,7 @@
 //   /kv.bin        created at boot: the KV cache lives on the card, not in RAM
 //   /conv.bin      created at boot: conv state history for speculative rollback
 //   /cstate.bin    created at boot: the conv layers' state (frees 64 KB of RAM)
+//   /cfg.txt       optional experiment knobs, key=value per line (RunConfig)
 //
 // Flash partition "weights": the n-gram draft table (tools/flash_ngram.sh).
 // Without it, speculative decoding still runs with prompt-lookup drafts.
@@ -52,6 +53,7 @@ constexpr const char* kPromptPath = "/sdcard/prompt.txt";
 constexpr const char* kKvPath = "/sdcard/kv.bin";
 constexpr const char* kConvHistPath = "/sdcard/conv.bin";
 constexpr const char* kConvStatePath = "/sdcard/cstate.bin";
+constexpr const char* kRunConfigPath = "/sdcard/cfg.txt";
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
 constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
@@ -151,6 +153,39 @@ long st_size(const char* path) {
 
 // ---------------------------------------------------------------- setup
 
+// Experiment knobs, read from /sdcard/cfg.txt so a config change needs an
+// upload (seconds) instead of a rebuild. tools/bench.py writes it.
+struct RunConfig {
+    int spec = 1;         // speculative decoding
+    int max_draft = -1;   // drafts per pass; -1 = batch - 1
+    int max_batch = 6;    // largest prompt batch to try
+    int io_kb = 32;       // weight streaming buffer (x2)
+    int gen = 0;          // stop after this many generated tokens (0 = at EOS)
+    int ignore_eos = 0;   // keep generating past EOS (with gen > 0)
+    int progress = 1;     // LCD progress bar per layer
+    int runs = 1;         // run the prompt this many times without waiting for G0
+};
+
+RunConfig read_run_config() {
+    RunConfig rc;
+    FILE* f = std::fopen(kRunConfigPath, "r");
+    if (f == nullptr) return rc;
+    char key[32];
+    int value;
+    while (std::fscanf(f, " %31[^=]=%d", key, &value) == 2) {
+        if (!std::strcmp(key, "spec")) rc.spec = value;
+        else if (!std::strcmp(key, "max_draft")) rc.max_draft = value;
+        else if (!std::strcmp(key, "max_batch")) rc.max_batch = value;
+        else if (!std::strcmp(key, "io_kb")) rc.io_kb = value;
+        else if (!std::strcmp(key, "gen")) rc.gen = value;
+        else if (!std::strcmp(key, "ignore_eos")) rc.ignore_eos = value;
+        else if (!std::strcmp(key, "progress")) rc.progress = value;
+        else if (!std::strcmp(key, "runs")) rc.runs = value;
+    }
+    std::fclose(f);
+    return rc;
+}
+
 int read_prompt(int32_t* out, int cap) {
     FILE* f = std::fopen(kPromptPath, "r");
     int n = 0;
@@ -217,14 +252,19 @@ extern "C" void app_main(void) {
     static AsyncFile src(kModelPath);  // reads on core 1 while core 0 computes
     if (!src.ok()) fatal("missing /lfm.lfm", "uv run tools/upload.py");
 
+    const RunConfig rc = read_run_config();
+    ESP_LOGI(TAG, "run config: spec %d max_draft %d max_batch %d io_kb %d gen %d ignore_eos %d progress %d runs %d",
+             rc.spec, rc.max_draft, rc.max_batch, rc.io_kb, rc.gen, rc.ignore_eos, rc.progress, rc.runs);
+
     // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
     constexpr std::size_t kReserve = 24 * 1024;
-    lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath,
-                          .int8_activations = true, .speculative = true, .conv_history_path = kConvHistPath,
+    lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true,
+                          .io_bytes = static_cast<std::size_t>(rc.io_kb) * 1024, .kv_path = kKvPath,
+                          .int8_activations = true, .speculative = rc.spec != 0, .conv_history_path = kConvHistPath,
                           .conv_state_path = kConvStatePath};
     static lfm::Engine* eng = nullptr;
     lfm::Status status = lfm::Status::OutOfMemory;
-    for (int batch = 6; batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {
+    for (int batch = rc.max_batch; batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {
         void* reserve = std::malloc(kReserve);
         cfg.max_batch = batch;
         delete eng;
@@ -245,7 +285,7 @@ extern "C" void app_main(void) {
         if (fd >= 0) close(fd);
         fatal("engine open failed", lfm::to_string(status));
     }
-    eng->set_progress_hook(&on_progress, nullptr);
+    if (rc.progress) eng->set_progress_hook(&on_progress, nullptr);
     ESP_LOGI(TAG, "engine: ctx %d, prompt batch %d, %u KB RAM; heap free %u, largest %u", eng->max_ctx(),
              cfg.max_batch, (unsigned)(eng->ram_bytes(cfg) / 1024), (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -266,9 +306,9 @@ extern "C" void app_main(void) {
             ESP_LOGI(TAG, "n-gram draft table: %s", ok ? "loaded from flash" : "not flashed (lookup only)");
         }
     }
-    const int max_draft = cfg.max_batch - 1;
+    const int max_draft = rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
 
-    while (true) {
+    for (int run = 0;; ++run) {
         eng->reset();
         g_status = {};
         text_begin();
@@ -277,6 +317,8 @@ extern "C" void app_main(void) {
         // Prefill: the prompt goes through the layers max_batch tokens at a
         // time (one weight read per batch); only the last needs the LM head.
         int64_t t0 = esp_timer_get_time();
+        const double sd0 = src.sd_busy_seconds(), stall0 = src.stall_seconds();
+        const uint64_t read0 = src.bytes_read();
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
         for (int i = 0; i < n_prompt && next >= lfm::Engine::kNoToken;) {
@@ -286,7 +328,8 @@ extern "C" void app_main(void) {
             next = eng->prefill({prompt + i, static_cast<std::size_t>(n)}, i + n == n_prompt);
             i += n;
         }
-        ESP_LOGI(TAG, "prefill %d tokens: %.1f s", n_prompt, (esp_timer_get_time() - t0) / 1e6);
+        const double prefill_s = (esp_timer_get_time() - t0) / 1e6;
+        ESP_LOGI(TAG, "prefill %d tokens: %.1f s", n_prompt, prefill_s);
 
         // Generate until EOS or the context is full: speculative steps, each
         // one pass over the weights for the newest token plus its drafts.
@@ -301,9 +344,21 @@ extern "C" void app_main(void) {
             ++g_status.tokens;
             drafter.push(fed);
         }
-        while (fed >= 0 && fed != lfm::kEosId) {
+        auto finished = [&] {
+            if (rc.gen > 0 && g_status.tokens >= rc.gen) return true;
+            return fed == lfm::kEosId && !(rc.ignore_eos && rc.gen > 0);
+        };
+        while (fed >= 0 && !finished()) {
             int32_t produced[lfm::Engine::kMaxBatch];
-            const int got = lfm::speculative_step(*eng, drafter, fed, max_draft, produced, &spec);
+            int got;
+            if (rc.spec) {
+                got = lfm::speculative_step(*eng, drafter, fed, max_draft, produced, &spec);
+            } else {
+                produced[0] = eng->forward(fed, true);
+                got = produced[0] < 0 ? produced[0] : 1;
+                ++spec.passes;
+                spec.tokens += 1;
+            }
             if (got < 0) {
                 next = got;
                 break;
@@ -312,7 +367,7 @@ extern "C" void app_main(void) {
                 show_token(*eng, produced[i], i + 1 < got ? TFT_GREENYELLOW : TFT_WHITE);  // accepted drafts tinted
                 ++g_status.tokens;
                 fed = produced[i];
-                if (fed == lfm::kEosId) break;
+                if (finished()) break;
             }
             g_status.sec_per_tok = (esp_timer_get_time() - t_gen) / 1e6f / (g_status.tokens - 1);
             const double total = (esp_timer_get_time() - t0) / 1e6;
@@ -325,9 +380,19 @@ extern "C" void app_main(void) {
         }
         if (next == lfm::Engine::kIoError) fatal("SD read error", "check the card");
         set_phase(next == lfm::Engine::kContextFull ? "context full  G0: again" : "done  G0: again");
-        ESP_LOGI(TAG, "done: %d tokens, %.1f s total, read %.0f MB", g_status.tokens,
-                 (esp_timer_get_time() - t0) / 1e6, src.bytes_read() / 1e6);
+        const double total_s = (esp_timer_get_time() - t0) / 1e6;
+        const double gen_s = (esp_timer_get_time() - t_gen) / 1e6;
+        ESP_LOGI(TAG, "done: %d tokens, %.1f s total, read %.0f MB", g_status.tokens, total_s, src.bytes_read() / 1e6);
+        // One machine-readable line per run (tools/bench.py).
+        ESP_LOGI(TAG, "RESULT run=%d prompt_tokens=%d prefill_s=%.2f gen_tokens=%d gen_s=%.2f s_per_tok=%.3f "
+                 "total_s=%.2f passes=%d drafted=%d accepted=%d batch=%d read_mb=%.1f sd_busy=%.3f stall=%.3f heap_free=%u",
+                 run, n_prompt, prefill_s, g_status.tokens, gen_s,
+                 g_status.tokens > 1 ? gen_s / (g_status.tokens - 1) : 0.0, total_s, spec.passes, spec.drafted,
+                 spec.accepted, cfg.max_batch, (src.bytes_read() - read0) / 1e6, (src.sd_busy_seconds() - sd0) / total_s,
+                 (src.stall_seconds() - stall0) / total_s,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
 
+        if (run + 1 < rc.runs) continue;
         do {
             vTaskDelay(pdMS_TO_TICKS(20));
             M5.update();

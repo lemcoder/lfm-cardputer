@@ -152,7 +152,7 @@ private:
     // For each of n tokens b: out.p[b][r] = row r · x.p[b][0..cols).
     bool matvec(const Ptrs& out, std::size_t rows, uint64_t offset, Dtype dt, std::size_t cols, const Ptrs& x, int n);
     Ptrs slots(std::size_t offset) const;  // slot b + offset, for every b
-    Ptrs acts(float* base) const;          // base + b * dim, for every b
+    Ptrs acts(float* const* base) const;   // base[b], for every b
     // Stream `rows` rows of `rb` bytes from `offset`, calling fn(row index,
     // row bytes) for each, with the next chunk's read overlapping fn's work.
     template <typename Fn>
@@ -178,7 +178,7 @@ private:
     bool attn_op(int layer, int n);
     bool mlp(int layer, int n);
     float* slot(int b) const { return slots_[b]; }
-    float* act(float* base, int b) const { return base + static_cast<std::size_t>(b) * h_.dim; }
+    float* act(float* const* base, int b) const { return base[b]; }
 
     // KV cache: one row per (position, attention layer) = [K | V], each
     // n_kv*head_dim values of kv_bf16 ? bf16 : f32.
@@ -202,16 +202,18 @@ private:
     int layer_slot_[kMaxLayers] = {};  // index among conv or attention layers
 
     // Separate allocations (a fragmented heap has no single big block).
-    static constexpr int kMaxBlocks = 12 + kMaxBatch;
+    static constexpr int kMaxBlocks = 12 + 4 * kMaxBatch;
     void* blocks_[kMaxBlocks] = {};
     int n_blocks_ = 0;
     void* alloc(std::size_t bytes);
 
     std::byte* io_ = nullptr;
     std::byte* io2_ = nullptr;   // second weight buffer (double_buffer), else == io_
-    float* x_ = nullptr;         // residual stream [max_batch][dim]
-    float* xn_ = nullptr;        // normalised input [max_batch][dim]
-    float* tmp_ = nullptr;       // operator / mlp output [max_batch][dim]
+    // Per batch token, each its own small block (a fragmented heap has no
+    // large ones): residual stream, normalised input, operator / mlp output.
+    float* x_[kMaxBatch] = {};
+    float* xn_[kMaxBatch] = {};
+    float* tmp_[kMaxBatch] = {};
     float* norm_w_ = nullptr;    // norm weights [dim]
     float* slots_[kMaxBatch] = {};  // per-token op scratch, slot_floats_ each
     float* shared_ = nullptr;    // per-op scratch shared by the batch

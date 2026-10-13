@@ -21,6 +21,7 @@
 
 #include <M5Unified.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -159,13 +160,14 @@ long st_size(const char* path) {
 struct RunConfig {
     int spec = 1;         // speculative decoding
     int max_draft = 2;    // drafts per pass (2 measured best; -1 = batch - 1)
-    int max_batch = 6;    // largest prompt batch to try
+    int max_batch = 8;    // largest prompt batch to try
     int io_kb = 32;       // weight streaming buffer (x2)
     int gen = 0;          // stop after this many generated tokens (0 = at EOS)
     int ignore_eos = 0;   // keep generating past EOS (with gen > 0)
     int progress = 1;     // LCD progress bar per layer
     int runs = 1;         // run the prompt this many times without waiting for G0
     int flash_head = 1;   // use the LM head table in flash (if flashed)
+    int reserve_kb = 24;  // heap kept free when choosing the prompt batch
 };
 
 RunConfig read_run_config() {
@@ -184,6 +186,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "progress")) rc.progress = value;
         else if (!std::strcmp(key, "runs")) rc.runs = value;
         else if (!std::strcmp(key, "flash_head")) rc.flash_head = value;
+        else if (!std::strcmp(key, "reserve_kb")) rc.reserve_kb = value;
     }
     std::fclose(f);
     return rc;
@@ -261,14 +264,14 @@ extern "C" void app_main(void) {
              rc.spec, rc.max_draft, rc.max_batch, rc.io_kb, rc.gen, rc.ignore_eos, rc.progress, rc.runs);
 
     // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
-    constexpr std::size_t kReserve = 24 * 1024;
+    const std::size_t kReserve = static_cast<std::size_t>(rc.reserve_kb) * 1024;
     lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true,
                           .io_bytes = static_cast<std::size_t>(rc.io_kb) * 1024, .kv_path = kKvPath,
                           .int8_activations = true, .speculative = rc.spec != 0, .conv_history_path = kConvHistPath,
                           .conv_state_path = kConvStatePath};
     static lfm::Engine* eng = nullptr;
     lfm::Status status = lfm::Status::OutOfMemory;
-    for (int batch = rc.max_batch; batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {
+    for (int batch = std::min(rc.max_batch, static_cast<int>(lfm::Engine::kMaxBatch)); batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {
         void* reserve = std::malloc(kReserve);
         cfg.max_batch = batch;
         delete eng;

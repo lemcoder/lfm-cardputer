@@ -41,9 +41,9 @@ struct Dims {
     // time). Independent of the context length: attention streams the KV
     // cache with an online softmax.
     std::size_t slot() const {
-        const std::size_t conv = 3 * dim;                    // in_proj output [B | C | X]
-        const std::size_t mlp = ff;                          // gate, then silu(gate) * up in place
-        const std::size_t attn = q_dim + 2 * kv_dim + q_dim;  // q, k, v, ctx
+        const std::size_t conv = 2 * dim;              // in_proj's B and C (X goes to tmp_)
+        const std::size_t mlp = ff;                    // gate, then silu(gate) * up in place
+        const std::size_t attn = q_dim + 2 * kv_dim;   // q, k, v (ctx goes to xn_)
         return std::max({conv, mlp, attn});
     }
     // Scratch shared by the whole batch.
@@ -170,7 +170,8 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
               d.heads % d.kv_heads == 0 && d.head_dim % 2 == 0 && d.conv_l >= 2 &&
               row_bytes(Dtype::BF16, d.ff) <= cfg.io_bytes &&  // widest row we stream
               2 * d.kv_dim * sizeof(float) <= cfg.io_bytes &&
-              (d.conv_l - 1) * d.dim * sizeof(float) <= cfg.io_bytes &&  // conv state staged in io_ cfg.max_ctx >= 1 && cfg.max_batch >= 1 &&
+              (d.conv_l - 1) * d.dim * sizeof(float) <= cfg.io_bytes &&  // conv state staged in io_
+              d.q_dim <= d.dim &&                                         // attention ctx reuses xn_ cfg.max_ctx >= 1 && cfg.max_batch >= 1 &&
               cfg.max_batch <= kMaxBatch;
     for (uint32_t i = 0; ok && i < h_.n_layers; ++i) {
         const bool conv = h_.layer_kind[i] == LayerKind::Conv;
@@ -197,9 +198,12 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
         slots_[b] = static_cast<float*>(alloc(slot_floats_ * sizeof(float)));
         if (slots_[b] == nullptr) return Status::OutOfMemory;
     }
-    x_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
-    xn_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
-    tmp_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
+    for (std::size_t b = 0; b < B; ++b) {
+        x_[b] = static_cast<float*>(alloc(d.dim * sizeof(float)));
+        xn_[b] = static_cast<float*>(alloc(d.dim * sizeof(float)));
+        tmp_[b] = static_cast<float*>(alloc(d.dim * sizeof(float)));
+        if (x_[b] == nullptr || xn_[b] == nullptr || tmp_[b] == nullptr) return Status::OutOfMemory;
+    }
     norm_w_ = static_cast<float*>(alloc((d.dim + d.shared()) * sizeof(float)));
     carry_ = static_cast<std::byte*>(alloc(row_bytes(Dtype::BF16, d.ff)));  // widest row we stream
     if (cfg.int8_activations) {
@@ -208,8 +212,7 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
         xs_ = static_cast<float*>(alloc(B * (xq_cols_ / 32) * sizeof(float)));
         if (xq_ == nullptr || xs_ == nullptr) return Status::OutOfMemory;
     }
-    if (io_ == nullptr || io2_ == nullptr || x_ == nullptr || xn_ == nullptr ||
-        tmp_ == nullptr || norm_w_ == nullptr || carry_ == nullptr) {
+    if (io_ == nullptr || io2_ == nullptr || norm_w_ == nullptr || carry_ == nullptr) {
         return Status::OutOfMemory;
     }
     shared_ = norm_w_ + d.dim;
@@ -330,9 +333,9 @@ Engine::Ptrs Engine::slots(std::size_t offset) const {
     return r;
 }
 
-Engine::Ptrs Engine::acts(float* base) const {
+Engine::Ptrs Engine::acts(float* const* base) const {
     Ptrs r{};
-    for (int b = 0; b < cfg_.max_batch; ++b) r.p[b] = base + static_cast<std::size_t>(b) * h_.dim;
+    for (int b = 0; b < cfg_.max_batch; ++b) r.p[b] = base[b];
     return r;
 }
 
@@ -676,7 +679,13 @@ bool Engine::conv_op(int layer, int n) {
     const LayerOffsets& L = h_.layers[layer];
     float* kernel = shared_;  // [dim * conv_l]
 
-    if (!matvec(slots(0), 3 * d.dim, L.conv_in, h_.dtype(layer, kConvIn), d.dim, acts(xn_), n)) return false;
+    // in_proj = [B | C | X]: B and C into the slot, X into tmp_ (free until
+    // out_proj writes it), as two streams over the matrix.
+    const Dtype dt_in = h_.dtype(layer, kConvIn);
+    if (!matvec(slots(0), 2 * d.dim, L.conv_in, dt_in, d.dim, acts(xn_), n)) return false;
+    if (!matvec(acts(tmp_), d.dim, L.conv_in + 2 * d.dim * row_bytes(dt_in, d.dim), dt_in, d.dim, acts(xn_), n)) {
+        return false;
+    }
     if (!read_f32(L.conv_kernel, {kernel, d.dim * d.conv_l})) return false;
 
     const int cs = layer_slot_[layer];
@@ -691,7 +700,7 @@ bool Engine::conv_op(int layer, int n) {
     for (int b = 0; b < n; ++b) {
         float* B = slot(b);
         const float* C = B + d.dim;
-        const float* X = B + 2 * d.dim;
+        const float* X = tmp_[b];
         for (std::size_t c = 0; c < d.dim; ++c) {
             const float* k = kernel + c * d.conv_l;
             const float bx = B[c] * X[c];
@@ -765,7 +774,7 @@ bool Engine::attn_op(int layer, int n) {
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
     const int ai = layer_slot_[layer];
-    const std::size_t k_off = d.q_dim, v_off = d.q_dim + d.kv_dim, ctx_off = d.q_dim + 2 * d.kv_dim;
+    const std::size_t k_off = d.q_dim, v_off = d.q_dim + d.kv_dim;
 
     float* mx = shared_;
     float* sum = mx + d.heads;
@@ -813,7 +822,7 @@ bool Engine::attn_op(int layer, int n) {
 
     for (int b = 0; b < n; ++b) {
         const float* q = slot(b);
-        float* ctx = slot(b) + ctx_off;
+        float* ctx = xn_[b];  // xn_ is no longer needed once q, k, v exist
         const int n_pos = pos_ + b + 1;
         std::memset(ctx, 0, d.q_dim * sizeof(float));
         for (std::size_t hh = 0; hh < d.heads; ++hh) {
@@ -849,7 +858,7 @@ bool Engine::attn_op(int layer, int n) {
             for (std::size_t i = 0; i < d.head_dim; ++i) ctx[hh * d.head_dim + i] *= inv;
         }
     }
-    return matvec(acts(tmp_), d.dim, L.o, h_.dtype(layer, kO), d.q_dim, slots(ctx_off), n);
+    return matvec(acts(tmp_), d.dim, L.o, h_.dtype(layer, kO), d.q_dim, acts(xn_), n);
 }
 
 // SwiGLU: out = w2 · (silu(w1 · in) * (w3 · in)). The gate is computed first;

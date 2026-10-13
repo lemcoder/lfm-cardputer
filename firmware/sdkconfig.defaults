@@ -13,3 +13,8 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_FATFS_LFN_HEAP=y
 # FATFS: seek inside the 245 MB model file without walking the FAT chain
 CONFIG_FATFS_USE_FASTSEEK=y
+# FATFS buffers are max(SD sector, wear-levelling sector) bytes per open file.
+# Wear levelling (FAT on internal flash) is unused: 512 makes them 512 bytes
+# instead of 4 KB, and the RAM goes to a bigger prompt batch.
+CONFIG_FATFS_SECTOR_512=y
+CONFIG_WL_SECTOR_SIZE_512=y

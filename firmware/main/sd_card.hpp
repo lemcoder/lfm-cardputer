@@ -4,8 +4,8 @@
 //
 // Only DAT0 is wired, so the bus is 1 bit wide: bytes/s = clock / 8. The
 // ESP32-S3 SDMMC clock is 160 MHz / divider: 40 MHz (div 4) is the fastest
-// the IDF driver offers; div 3 = 53.3 MHz is an overclock past the SD
-// high-speed limit (50 MHz), with a 2:1 duty cycle. Data is CRC-checked by
+// the IDF driver offers; div 3 = 53.3 MHz (2:1 duty) and div 2 = 80 MHz are
+// overclocks past the SD high-speed limit (50 MHz). Data is CRC-checked by
 // the card protocol, so a bad clock shows up as errors, not silent damage.
 
 #include "esp_err.h"
@@ -14,7 +14,7 @@
 class SdCard {
 public:
     struct Config {
-        int host_div = 4;         // 4 = 40 MHz, 3 = 53.3 MHz (overclock)
+        int host_div = 4;         // 4 = 40 MHz, 3 = 53.3 MHz, 2 = 80 MHz (overclocks)
         int delay_phase = 0;      // input sampling delay 0..3
         int duty_high = -1;       // div 3 only: clock-high counter value (0 or 1); -1 = driver default
     };

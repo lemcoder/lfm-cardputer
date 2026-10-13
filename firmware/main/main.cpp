@@ -180,9 +180,10 @@ extern "C" void app_main(void) {
     }
 
     set_phase("mounting SD");
-    // 53.3 MHz (overclock, +25% read speed). Measured on this card: CRC-clean
-    // at sampling phases 0-3 with the default duty cycle; phase 1 is mid-window.
-    static SdCard card(SdCard::Config{.host_div = 3, .delay_phase = 1});
+    // 80 MHz (160 / 2, overclock; SD high-speed spec is 50 MHz). Measured on
+    // this card with sd_speed.cpp: CRC-clean at sampling phases 1-3, phase 0
+    // fails; phase 2 is mid-window. 53.3 MHz (div 3) works at every phase.
+    static SdCard card(SdCard::Config{.host_div = 2, .delay_phase = 2});
     if (!card.ok()) fatal("SD mount failed", esp_err_to_name(card.err()));
 
     struct stat st;

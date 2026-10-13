@@ -41,6 +41,22 @@ inline void matvec(std::span<float> out, MatRef w, std::span<const float> x) {
 #endif
 }
 
+inline float dot_q8_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n) {
+#if defined(LFM_ESP32S3_HAS_DOT_Q8_Q8)
+    return esp32s3::dot_q8_0_q8(row, xq, xscale, n);
+#else
+    return ref::dot_q8_0_q8(row, xq, xscale, n);
+#endif
+}
+
+inline float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n) {
+#if defined(LFM_ESP32S3_HAS_DOT_Q4_Q8)
+    return esp32s3::dot_q4_0_q8(row, xq, xscale, n);
+#else
+    return ref::dot_q4_0_q8(row, xq, xscale, n);
+#endif
+}
+
 // Ops below are cheap (O(n), not O(n^2)); they only get a backend if profiling
 // says so. Add the same #if pattern when you vectorize one.
 using ref::add;
@@ -48,9 +64,7 @@ using ref::argmax;
 using ref::bf16_to_f32;
 using ref::dot_bf16;
 using ref::dot_q4_0;
-using ref::dot_q4_0_q8;
 using ref::dot_q8_0;
-using ref::dot_q8_0_q8;
 using ref::f16_to_f32;
 using ref::f32_to_bf16;
 using ref::mul;

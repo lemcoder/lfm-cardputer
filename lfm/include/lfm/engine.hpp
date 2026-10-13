@@ -56,6 +56,8 @@ struct EngineConfig {
 
 class Engine {
 public:
+    static constexpr int kMaxBatch = 8;  // EngineConfig::max_batch cap
+
     // Called after every layer, for every token, with that token's residual
     // stream (for tests/debugging). `pos` is the token's position.
     using LayerHook = void (*)(void* ctx, int layer, int pos, std::span<const float> x);
@@ -104,9 +106,14 @@ public:
 
 private:
     bool read_f32(uint64_t offset, std::span<float> out);
-    // For each of n tokens b: out[b*out_stride + r] = row r · x[b*x_stride ..][0..cols).
-    bool matvec(float* out, std::size_t out_stride, std::size_t rows, uint64_t offset, Dtype dt, std::size_t cols,
-                const float* x, std::size_t x_stride, int n);
+    // One pointer per batch token (scratch slots are separate allocations).
+    struct Ptrs {
+        float* p[kMaxBatch];
+    };
+    // For each of n tokens b: out.p[b][r] = row r · x.p[b][0..cols).
+    bool matvec(const Ptrs& out, std::size_t rows, uint64_t offset, Dtype dt, std::size_t cols, const Ptrs& x, int n);
+    Ptrs slots(std::size_t offset) const;  // slot b + offset, for every b
+    Ptrs acts(float* base) const;          // base + b * dim, for every b
     // Stream `rows` rows of `rb` bytes from `offset`, calling fn(row index,
     // row bytes) for each, with the next chunk's read overlapping fn's work.
     template <typename Fn>
@@ -118,7 +125,7 @@ private:
     bool conv_op(int layer, int n);
     bool attn_op(int layer, int n);
     bool mlp(int layer, int n);
-    float* slot(int b) const { return arena_ + static_cast<std::size_t>(b) * slot_floats_; }
+    float* slot(int b) const { return slots_[b]; }
     float* act(float* base, int b) const { return base + static_cast<std::size_t>(b) * h_.dim; }
 
     // KV cache: one row per (position, attention layer) = [K | V], each
@@ -140,7 +147,7 @@ private:
     int layer_slot_[kMaxLayers] = {};  // index among conv or attention layers
 
     // Separate allocations (a fragmented heap has no single big block).
-    static constexpr int kMaxBlocks = 12;
+    static constexpr int kMaxBlocks = 12 + kMaxBatch;
     void* blocks_[kMaxBlocks] = {};
     int n_blocks_ = 0;
     void* alloc(std::size_t bytes);
@@ -151,14 +158,14 @@ private:
     float* xn_ = nullptr;        // normalised input [max_batch][dim]
     float* tmp_ = nullptr;       // operator / mlp output [max_batch][dim]
     float* norm_w_ = nullptr;    // norm weights [dim]
-    float* arena_ = nullptr;     // per-token op scratch [max_batch][slot_floats_]
+    float* slots_[kMaxBatch] = {};  // per-token op scratch, slot_floats_ each
     float* shared_ = nullptr;    // per-op scratch shared by the batch
     std::byte* carry_ = nullptr; // one weight row split across two read blocks
     int8_t* xq_ = nullptr;       // int8_activations: [max_batch][max cols] quantized inputs
     float* xs_ = nullptr;        // ... and their per-32 scales [max_batch][max cols / 32]
     std::size_t xq_cols_ = 0;    // max cols
     std::size_t slot_floats_ = 0;
-    float* conv_state_ = nullptr;      // [n_conv][conv_l-1][dim], oldest first
+    float* conv_state_[kMaxLayers] = {};  // per conv layer: [conv_l-1][dim], oldest first
     // KV cache, either in RAM: per attention layer [max_ctx] rows,
     // or in a file: rows appended position-major, (pos * n_attn + layer).
     std::byte* kv_ram_[kMaxLayers] = {};

@@ -1,17 +1,24 @@
 #pragma once
 
 // ESP32-S3 backend. The S3's PIE SIMD unit works on 128-bit registers of
-// int8/int16 lanes (EE.VMULAS.S8.ACCX etc.), not floats, so the fast path here
-// will be the quantized matvec. Reference: ESP32-S3 TRM, "Processor Instruction
-// Extensions", and espressif/esp-dsp / esp-nn sources for examples.
+// int8/int16 lanes (EE.VMULAS.S8.ACCX etc.), not floats, so it accelerates
+// the integer (int8 activation) dot products. Kernels: esp32s3_dot.S.
+// Reference: ESP32-S3 TRM, "Processor Instruction Extensions"; esp-dsp.
 //
 // Same pattern as neon.hpp: declare, implement in lfm/src/math/esp32s3.cpp,
 // then #define LFM_ESP32S3_HAS_<OP> 1.
 
-#include <span>
-
-#include "lfm/math/types.hpp"
+#include <cstddef>
+#include <cstdint>
 
 namespace lfm::math::esp32s3 {
 
+// Same contract as ref::dot_q8_0_q8 / ref::dot_q4_0_q8, plus: xq is 16-byte
+// aligned and up to 16 bytes past the row may be read.
+float dot_q8_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n);
+float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n);
+
 }  // namespace lfm::math::esp32s3
+
+#define LFM_ESP32S3_HAS_DOT_Q8_Q8 1
+#define LFM_ESP32S3_HAS_DOT_Q4_Q8 1

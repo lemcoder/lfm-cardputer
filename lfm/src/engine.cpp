@@ -109,14 +109,17 @@ void dequant_row(Dtype dt, const std::byte* row, std::span<float> out) {
 
 Engine::~Engine() {
     for (int i = 0; i < n_blocks_; ++i) std::free(blocks_[i]);
-    std::free(conv_state_);
+    for (float* p : conv_state_) std::free(p);
     for (std::byte* p : kv_ram_) std::free(p);
     delete kv_file_;
 }
 
+// 16-byte aligned (SIMD loads), and 16 bytes of slack at the end: the SIMD
+// kernels may read up to 16 bytes past the last weight row in a buffer.
 void* Engine::alloc(std::size_t bytes) {
     assert(n_blocks_ < kMaxBlocks);
-    void* p = std::malloc(bytes);
+    void* p = nullptr;
+    if (posix_memalign(&p, 16, bytes + 16) != 0) p = nullptr;  // std::aligned_alloc isn't in ESP-IDF's libstdc++
     if (p != nullptr) blocks_[n_blocks_++] = p;
     return p;
 }
@@ -158,7 +161,8 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
               d.dim % kQ8BlockSize == 0 && d.ff % kQ8BlockSize == 0 && d.q_dim % kQ8BlockSize == 0 &&
               d.heads % d.kv_heads == 0 && d.head_dim % 2 == 0 && d.conv_l >= 2 &&
               row_bytes(Dtype::BF16, d.ff) <= cfg.io_bytes &&  // widest row we stream
-              2 * d.kv_dim * sizeof(float) <= cfg.io_bytes && cfg.max_ctx >= 1 && cfg.max_batch >= 1;
+              2 * d.kv_dim * sizeof(float) <= cfg.io_bytes && cfg.max_ctx >= 1 && cfg.max_batch >= 1 &&
+              cfg.max_batch <= kMaxBatch;
     for (uint32_t i = 0; ok && i < h_.n_layers; ++i) {
         const bool conv = h_.layer_kind[i] == LayerKind::Conv;
         for (LayerField f : {kW1, kW2, kW3}) ok = ok && is_matrix_dtype(h_.dtype(i, f));
@@ -180,7 +184,10 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     io2_ = cfg.double_buffer ? static_cast<std::byte*>(alloc(cfg.io_bytes)) : io_;
     const std::size_t B = static_cast<std::size_t>(cfg.max_batch);
     slot_floats_ = d.slot();
-    arena_ = static_cast<float*>(alloc(B * slot_floats_ * sizeof(float)));
+    for (std::size_t b = 0; b < B; ++b) {
+        slots_[b] = static_cast<float*>(alloc(slot_floats_ * sizeof(float)));
+        if (slots_[b] == nullptr) return Status::OutOfMemory;
+    }
     x_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
     xn_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
     tmp_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
@@ -192,15 +199,18 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
         xs_ = static_cast<float*>(alloc(B * (xq_cols_ / 32) * sizeof(float)));
         if (xq_ == nullptr || xs_ == nullptr) return Status::OutOfMemory;
     }
-    if (io_ == nullptr || io2_ == nullptr || arena_ == nullptr || x_ == nullptr || xn_ == nullptr ||
+    if (io_ == nullptr || io2_ == nullptr || x_ == nullptr || xn_ == nullptr ||
         tmp_ == nullptr || norm_w_ == nullptr || carry_ == nullptr) {
         return Status::OutOfMemory;
     }
     shared_ = norm_w_ + d.dim;
 
     if (n_conv_ > 0) {
-        conv_state_ = static_cast<float*>(std::malloc(n_conv_ * (d.conv_l - 1) * d.dim * sizeof(float)));
-        if (conv_state_ == nullptr) return Status::OutOfMemory;
+        // One block per conv layer: small blocks fit a fragmented heap.
+        for (int i = 0; i < n_conv_; ++i) {
+            conv_state_[i] = static_cast<float*>(std::malloc((d.conv_l - 1) * d.dim * sizeof(float)));
+            if (conv_state_[i] == nullptr) return Status::OutOfMemory;
+        }
     }
     if (cfg.kv_path != nullptr) {
         kv_file_ = new FileSource(cfg.kv_path, FileSource::Mode::ReadWrite);
@@ -219,8 +229,8 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
 
 void Engine::reset() {
     pos_ = 0;
-    if (conv_state_ != nullptr) {
-        std::memset(conv_state_, 0, n_conv_ * (h_.conv_l - 1) * h_.dim * sizeof(float));
+    for (int i = 0; i < n_conv_; ++i) {
+        if (conv_state_[i] != nullptr) std::memset(conv_state_[i], 0, (h_.conv_l - 1) * h_.dim * sizeof(float));
     }
 }
 
@@ -286,26 +296,33 @@ bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&&
 
 // Each streamed row is used by all n tokens before the next one: one read of
 // the matrix per batch.
-bool Engine::matvec(float* out, std::size_t out_stride, std::size_t rows, uint64_t offset, Dtype dt,
-                     std::size_t cols, const float* x, std::size_t x_stride, int n) {
+Engine::Ptrs Engine::slots(std::size_t offset) const {
+    Ptrs r{};
+    for (int b = 0; b < cfg_.max_batch; ++b) r.p[b] = slots_[b] + offset;
+    return r;
+}
+
+Engine::Ptrs Engine::acts(float* base) const {
+    Ptrs r{};
+    for (int b = 0; b < cfg_.max_batch; ++b) r.p[b] = base + static_cast<std::size_t>(b) * h_.dim;
+    return r;
+}
+
+bool Engine::matvec(const Ptrs& out, std::size_t rows, uint64_t offset, Dtype dt, std::size_t cols, const Ptrs& x,
+                    int n) {
     if (xq_ != nullptr && (dt == Dtype::Q8_0 || dt == Dtype::Q4_0)) {
         // Integer path: quantize each token's input once, then int8 x int8 dots.
-        for (int b = 0; b < n; ++b) {
-            m::quantize_q8({x + static_cast<std::size_t>(b) * x_stride, cols}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
-        }
+        for (int b = 0; b < n; ++b) m::quantize_q8({x.p[b], cols}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
         return stream_rows(offset, rows, row_bytes(dt, cols), [&](std::size_t r, const std::byte* row) {
             for (int b = 0; b < n; ++b) {
                 const int8_t* q = xq_ + b * xq_cols_;
                 const float* sc = xs_ + b * (xq_cols_ / 32);
-                out[static_cast<std::size_t>(b) * out_stride + r] =
-                    dt == Dtype::Q8_0 ? m::dot_q8_0_q8(row, q, sc, cols) : m::dot_q4_0_q8(row, q, sc, cols);
+                out.p[b][r] = dt == Dtype::Q8_0 ? m::dot_q8_0_q8(row, q, sc, cols) : m::dot_q4_0_q8(row, q, sc, cols);
             }
         });
     }
     return stream_rows(offset, rows, row_bytes(dt, cols), [&](std::size_t r, const std::byte* row) {
-        for (int b = 0; b < n; ++b) {
-            out[static_cast<std::size_t>(b) * out_stride + r] = dot_row(dt, row, {x + static_cast<std::size_t>(b) * x_stride, cols});
-        }
+        for (int b = 0; b < n; ++b) out.p[b][r] = dot_row(dt, row, {x.p[b], cols});
     });
 }
 
@@ -379,13 +396,12 @@ int32_t Engine::lm_head(std::span<const float> x, float* logits) {
 bool Engine::conv_op(int layer, int n) {
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
-    const std::size_t S = slot_floats_;
     float* kernel = shared_;  // [dim * conv_l]
 
-    if (!matvec(slot(0), S, 3 * d.dim, L.conv_in, h_.dtype(layer, kConvIn), d.dim, xn_, d.dim, n)) return false;
+    if (!matvec(slots(0), 3 * d.dim, L.conv_in, h_.dtype(layer, kConvIn), d.dim, acts(xn_), n)) return false;
     if (!read_f32(L.conv_kernel, {kernel, d.dim * d.conv_l})) return false;
 
-    float* state = conv_state_ + layer_slot_[layer] * (d.conv_l - 1) * d.dim;
+    float* state = conv_state_[layer_slot_[layer]];
     const std::size_t hist = d.conv_l - 1;  // previous tokens kept
     for (int b = 0; b < n; ++b) {
         float* B = slot(b);
@@ -406,7 +422,7 @@ bool Engine::conv_op(int layer, int n) {
             B[c] = C[c] * y;  // B is no longer needed: reuse it for out_proj's input
         }
     }
-    return matvec(tmp_, d.dim, d.dim, L.conv_out, h_.dtype(layer, kConvOut), d.dim, slot(0), S, n);
+    return matvec(acts(tmp_), d.dim, L.conv_out, h_.dtype(layer, kConvOut), d.dim, slots(0), n);
 }
 
 std::size_t Engine::kv_row_bytes() const {
@@ -462,7 +478,6 @@ bool Engine::attn_op(int layer, int n) {
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
     const int ai = layer_slot_[layer];
-    const std::size_t S = slot_floats_;
     const std::size_t k_off = d.q_dim, v_off = d.q_dim + d.kv_dim, ctx_off = d.q_dim + 2 * d.kv_dim;
 
     float* mx = shared_;
@@ -472,9 +487,9 @@ bool Engine::attn_op(int layer, int n) {
     float* k_row = k_norm + d.head_dim;
     float* v_row = k_row + d.head_dim;
 
-    if (!matvec(slot(0), S, d.q_dim, L.q, h_.dtype(layer, kQ), d.dim, xn_, d.dim, n)) return false;
-    if (!matvec(slot(0) + k_off, S, d.kv_dim, L.k, h_.dtype(layer, kK), d.dim, xn_, d.dim, n)) return false;
-    if (!matvec(slot(0) + v_off, S, d.kv_dim, L.v, h_.dtype(layer, kV), d.dim, xn_, d.dim, n)) return false;
+    if (!matvec(slots(0), d.q_dim, L.q, h_.dtype(layer, kQ), d.dim, acts(xn_), n)) return false;
+    if (!matvec(slots(k_off), d.kv_dim, L.k, h_.dtype(layer, kK), d.dim, acts(xn_), n)) return false;
+    if (!matvec(slots(v_off), d.kv_dim, L.v, h_.dtype(layer, kV), d.dim, acts(xn_), n)) return false;
     if (!read_f32(L.q_norm, {q_norm, d.head_dim})) return false;
     if (!read_f32(L.k_norm, {k_norm, d.head_dim})) return false;
 
@@ -547,7 +562,7 @@ bool Engine::attn_op(int layer, int n) {
             for (std::size_t i = 0; i < d.head_dim; ++i) ctx[hh * d.head_dim + i] *= inv;
         }
     }
-    return matvec(tmp_, d.dim, d.dim, L.o, h_.dtype(layer, kO), d.q_dim, slot(0) + ctx_off, S, n);
+    return matvec(acts(tmp_), d.dim, L.o, h_.dtype(layer, kO), d.q_dim, slots(ctx_off), n);
 }
 
 // SwiGLU: out = w2 · (silu(w1 · in) * (w3 · in)). The gate is computed first;
@@ -556,19 +571,27 @@ bool Engine::attn_op(int layer, int n) {
 bool Engine::mlp(int layer, int n) {
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
-    const std::size_t S = slot_floats_;
-    if (!matvec(slot(0), S, d.ff, L.w1, h_.dtype(layer, kW1), d.dim, xn_, d.dim, n)) return false;
+    if (!matvec(slots(0), d.ff, L.w1, h_.dtype(layer, kW1), d.dim, acts(xn_), n)) return false;
 
     const Dtype dt3 = h_.dtype(layer, kW3);
+    // Integer path: w1's matvec just quantized these same inputs into xq_.
+    const bool int8 = xq_ != nullptr && h_.dtype(layer, kW1) == dt3 && (dt3 == Dtype::Q8_0 || dt3 == Dtype::Q4_0);
     const bool ok = stream_rows(L.w3, d.ff, row_bytes(dt3, d.dim), [&](std::size_t r, const std::byte* row) {
         for (int b = 0; b < n; ++b) {
-            const float up = dot_row(dt3, row, {act(xn_, b), d.dim});
+            float up;
+            if (int8) {
+                const int8_t* q = xq_ + b * xq_cols_;
+                const float* sc = xs_ + b * (xq_cols_ / 32);
+                up = dt3 == Dtype::Q8_0 ? m::dot_q8_0_q8(row, q, sc, d.dim) : m::dot_q4_0_q8(row, q, sc, d.dim);
+            } else {
+                up = dot_row(dt3, row, {act(xn_, b), d.dim});
+            }
             float& g = slot(b)[r];
             g = g * (1.0f / (1.0f + std::exp(-g))) * up;  // silu(gate) * up
         }
     });
     if (!ok) return false;
-    return matvec(tmp_, d.dim, d.dim, L.w2, h_.dtype(layer, kW2), d.ff, slot(0), S, n);
+    return matvec(acts(tmp_), d.dim, L.w2, h_.dtype(layer, kW2), d.ff, slots(0), n);
 }
 
 // ---------------------------------------------------------------- forward

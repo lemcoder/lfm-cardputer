@@ -4,7 +4,8 @@
 file(GLOB_RECURSE LFM_SRCS "${CMAKE_CURRENT_LIST_DIR}/src/*.cpp")
 
 if(ESP_PLATFORM)
-    idf_component_register(SRCS ${LFM_SRCS} INCLUDE_DIRS "include")
+    file(GLOB_RECURSE LFM_ASM "${CMAKE_CURRENT_LIST_DIR}/src/*.S")  # PIE kernels
+    idf_component_register(SRCS ${LFM_SRCS} ${LFM_ASM} INCLUDE_DIRS "include")
     target_compile_options(${COMPONENT_LIB} PRIVATE -O2)
     target_compile_definitions(${COMPONENT_LIB} PUBLIC LFM_MATH_ESP32S3=1)
 else()

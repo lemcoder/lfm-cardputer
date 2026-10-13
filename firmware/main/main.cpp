@@ -34,6 +34,7 @@
 #include "async_file.hpp"
 #include "sd_card.hpp"
 #include "sd_speed.hpp"
+#include "kernel_test.hpp"
 #include "usb_upload.hpp"
 
 namespace {
@@ -42,8 +43,9 @@ constexpr const char* TAG = "lfm";
 constexpr const char* kModelPath = "/sdcard/lfm.lfm";
 constexpr const char* kPromptPath = "/sdcard/prompt.txt";
 constexpr const char* kKvPath = "/sdcard/kv.bin";
-constexpr int kMaxCtx = 1024;
-constexpr bool kSdSpeedTest = false;  // run the SD clock experiment instead of the model  // KV file grows 12 KB per token: 12 MB at most
+constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
+constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
+constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
 constexpr int32_t kDefaultPrompt[] = {1, 1098, 5706, 803, 4481, 856};  // "The capital of France is"
 constexpr int kMaxPrompt = 64;
 
@@ -170,6 +172,13 @@ extern "C" void app_main(void) {
     text_begin();
     lcd.setTextColor(TFT_WHITE, TFT_BLACK);
 
+    if (kKernelTest) {
+        set_phase("SIMD kernel test");
+        vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log after flashing
+        const bool ok = kernel_test([](const char* line) { lcd.println(line); });
+        set_phase(ok ? "SIMD kernels OK" : "SIMD kernels MISMATCH");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     if (kSdSpeedTest) {
         set_phase("SD clock test");
         vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log after flashing
@@ -212,6 +221,8 @@ extern "C" void app_main(void) {
         eng = new lfm::Engine();
         status = eng->open(src, cfg);
         std::free(reserve);
+        ESP_LOGI(TAG, "batch %d: %s (largest free block %u)", batch, lfm::to_string(status),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
     if (status != lfm::Status::Ok) {
         // Narrow it down in the log: header readable? KV file creatable?

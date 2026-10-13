@@ -314,3 +314,29 @@ TEST(Speculative, PrefillWithDraftsSameTokens) {
     out.resize(want.size());
     EXPECT_EQ(out, want);
 }
+
+// Prompt cache: generate, restore the post-prompt state, generate again:
+// same tokens, without recomputing the prompt. Conv state in RAM and in a file.
+TEST(PromptCache, RestoreGivesSameContinuation) {
+    REQUIRE(kQ4);
+    for (bool file : {false, true}) {
+        lfm::EngineConfig cfg{.max_ctx = 64, .max_batch = 4, .int8_activations = true};
+        const std::string prefix = kRoot + "/out/test-prefix.bin";
+        if (file) {
+            cfg.conv_state_path = kStatePath.c_str();
+            cfg.prefix_path = prefix.c_str();
+        }
+        lfm::FileSource src(kQ4.c_str());
+        lfm::Engine eng;
+        ASSERT_EQ(eng.open(src, cfg), lfm::Status::Ok);
+        const auto prompt = Prompt();
+        const int32_t first = eng.prefill(prompt, true);
+        ASSERT_TRUE(eng.snapshot_prefix());
+        std::vector<int32_t> a{first}, b{first};
+        for (int i = 0; i < 10; ++i) a.push_back(eng.forward(a.back(), true));
+        ASSERT_TRUE(eng.restore_prefix());
+        ASSERT_EQ(eng.pos(), static_cast<int>(prompt.size()));
+        for (int i = 0; i < 10; ++i) b.push_back(eng.forward(b.back(), true));
+        EXPECT_EQ(a, b) << (file ? "file" : "RAM");
+    }
+}

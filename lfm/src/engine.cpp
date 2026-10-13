@@ -117,6 +117,8 @@ Engine::~Engine() {
     std::free(hist_ram_);
     delete hist_file_;
     delete state_file_;
+    delete prefix_file_;
+    std::free(prefix_ram_);
 }
 
 // 16-byte aligned (SIMD loads), and 16 bytes of slack at the end: the SIMD
@@ -1113,6 +1115,45 @@ bool Engine::state_store(int slot, const float* state) {
     if (state_file_ == nullptr) return true;  // RAM state was updated in place
     const std::size_t bytes = (h_.conv_l - 1) * h_.dim * sizeof(float);
     return state_file_->write_at(static_cast<uint64_t>(slot) * bytes, state, bytes);
+}
+
+bool Engine::snapshot_prefix() {
+    if (pending_n_ != 0) return false;
+    cancel_prefetch();
+    const std::size_t floats = (h_.conv_l - 1) * h_.dim, bytes = floats * sizeof(float);
+    if (state_file_ != nullptr) {
+        if (prefix_file_ == nullptr) {
+            if (cfg_.prefix_path == nullptr) return false;
+            prefix_file_ = new FileSource(cfg_.prefix_path, FileSource::Mode::ReadWrite);
+            if (!prefix_file_->ok()) return false;
+        }
+        for (int s = 0; s < n_conv_; ++s) {
+            const float* st = state_load(s);
+            if (st == nullptr || !prefix_file_->write_at(static_cast<uint64_t>(s) * bytes, st, bytes)) return false;
+        }
+    } else if (n_conv_ > 0) {
+        if (prefix_ram_ == nullptr) prefix_ram_ = static_cast<float*>(std::malloc(n_conv_ * bytes));
+        if (prefix_ram_ == nullptr) return false;
+        for (int s = 0; s < n_conv_; ++s) std::memcpy(prefix_ram_ + s * floats, conv_state_[s], bytes);
+    }
+    prefix_pos_ = pos_;
+    return true;
+}
+
+bool Engine::restore_prefix() {
+    if (prefix_pos_ < 0 || pending_n_ != 0) return false;
+    cancel_prefetch();
+    const std::size_t floats = (h_.conv_l - 1) * h_.dim, bytes = floats * sizeof(float);
+    for (int s = 0; s < n_conv_; ++s) {
+        if (state_file_ != nullptr) {
+            auto* buf = reinterpret_cast<float*>(io_);
+            if (!prefix_file_->read_at(static_cast<uint64_t>(s) * bytes, buf, bytes) || !state_store(s, buf)) return false;
+        } else {
+            std::memcpy(conv_state_[s], prefix_ram_ + s * floats, bytes);
+        }
+    }
+    pos_ = prefix_pos_;
+    return true;
 }
 
 // Conv history for speculative rollback: per conv layer, rows of dim floats:

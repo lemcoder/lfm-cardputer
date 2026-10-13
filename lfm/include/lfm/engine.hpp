@@ -65,6 +65,9 @@ struct EngineConfig {
     // Layers to leave out entirely (bit i = layer i): their weights are never
     // read. Lossy; for experiments (docs/experiments.md).
     uint32_t skip_layers = 0;
+    // Prompt cache (snapshot_prefix / restore_prefix): where the conv state
+    // snapshot lives when the conv state is in a file. nullptr: RAM.
+    const char* prefix_path = nullptr;
 };
 
 class Engine {
@@ -141,6 +144,15 @@ public:
         double topk_s = 0;       // part of flash_scan_s: top-k inserts
     };
     const Stats& stats() const { return stats_; }
+
+    // Prompt cache. snapshot_prefix() remembers the state after the tokens
+    // fed so far (pos()); restore_prefix() returns to it later, as long as
+    // nothing has been written at positions below it since (generation only
+    // writes later positions, so "run the same prompt again" qualifies).
+    // The K/V rows stay where they are; only the conv state and pos move.
+    bool snapshot_prefix();
+    bool restore_prefix();
+    int prefix_pos() const { return prefix_pos_; }  // -1: none
 
     void set_layer_hook(LayerHook fn, void* ctx) { layer_hook_ = fn; layer_ctx_ = ctx; }
     void set_progress_hook(ProgressHook fn, void* ctx) { progress_hook_ = fn; progress_ctx_ = ctx; }
@@ -233,6 +245,9 @@ private:
     float* hist_ram_ = nullptr;
     FileSource* hist_file_ = nullptr;
     FileSource* state_file_ = nullptr;
+    FileSource* prefix_file_ = nullptr;   // conv state snapshot (state in a file)
+    float* prefix_ram_ = nullptr;         // conv state snapshot (state in RAM)
+    int prefix_pos_ = -1;
     // Cross-stream prefetch (stream_rows): the pass's matrix order, and the
     // state of an async read that may be in flight.
     struct Stream {

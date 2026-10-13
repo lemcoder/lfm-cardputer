@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--cfg", default="", help="comma-separated key=value knobs")
     ap.add_argument("--timeout", type=float, default=600)
+    ap.add_argument("--results", type=int, default=0, help="RESULT lines to wait for (default: the runs knob, or 1)")
     ap.add_argument("--port")
     args = ap.parse_args()
 
@@ -59,6 +60,7 @@ def main():
     dev.send_line("LFMUP END")
     dev.wait_for(("UP:BYE",), 5)
 
+    want = args.results or int(knobs.get("runs", 1))
     t0 = time.time()
     lines = []
     while time.time() - t0 < args.timeout:
@@ -72,7 +74,9 @@ def main():
                 with open(ROOT / "out" / "bench_log.jsonl", "a") as f:
                     f.write(json.dumps(res) + "\n")
                 print(json.dumps(res))
-                return
+                want -= 1
+                if want == 0:
+                    return
             if "Guru" in line or "panic" in line or "fatal" in line:
                 sys.exit(f"device error: {line}")
     sys.exit("timeout waiting for RESULT")

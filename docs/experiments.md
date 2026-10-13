@@ -56,4 +56,6 @@ kept or not. Starting point and context: [performance.md](performance.md).
 | 23 | LM head re-score candidates 1024 → 768 (512 checked too) | Host agreement: 768 99.5% (same as 1024), 512 98.6%. Device with 768: B1 35.25 → **34.80 s**, B2 118.5 → **117.2 s** | yes (768) |
 | 24 | Adaptive draft length (longer drafts for prompt-lookup hits) | Simulation: kl=2..6 / kn=2 all 10.46–10.49 s/token; lookup hits are rare on these prompts | no |
 | 25 | KV cache: layer-major file layout (pre-sized at open) + each K/V chunk loaded once for all batch tokens | Was one SD read per (token, layer, position): ~540 small reads per pass at 30 positions, growing with context. B1 34.80 → **34.68 s**, B2 117.2 → **115.5 s** | yes |
+| 26 | Flash at 120 MHz (LM head table scan reads 4.7 MB per call at 26 MB/s) | Needs the flash chip's high-performance mode, unverified for this board; ≤ 0.06 s per pass (0.5%) at stake, and a failed boot needs manual download mode | skipped |
+| 27 | **Prompt cache**: after the prompt, snapshot the conv state + position (K/V rows stay valid in kv.bin); a run with the same prompt restores instead of recomputing | B1 run again (G0 / `runs=2`): **34.70 → 23.39 s**, prompt 11.32 → 0.02 s, same tokens | yes |
 

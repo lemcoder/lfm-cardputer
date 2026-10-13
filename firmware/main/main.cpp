@@ -56,6 +56,7 @@ constexpr const char* kKvPath = "/sdcard/kv.bin";
 constexpr const char* kConvHistPath = "/sdcard/conv.bin";
 constexpr const char* kConvStatePath = "/sdcard/cstate.bin";
 constexpr const char* kRunConfigPath = "/sdcard/cfg.txt";
+constexpr const char* kPrefixPath = "/sdcard/prefix.bin";
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
 constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
@@ -169,6 +170,7 @@ struct RunConfig {
     int flash_head = 1;   // use the LM head table in flash (if flashed)
     int reserve_kb = 24;  // heap kept free when choosing the prompt batch
     int spec_prefill = 0; // drafts in the last prompt batch (no gain on B1/B2: experiment 20)
+    int prompt_cache = 1; // reuse the prompt's state when a run repeats the previous prompt
 };
 
 RunConfig read_run_config() {
@@ -189,6 +191,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "flash_head")) rc.flash_head = value;
         else if (!std::strcmp(key, "reserve_kb")) rc.reserve_kb = value;
         else if (!std::strcmp(key, "spec_prefill")) rc.spec_prefill = value;
+        else if (!std::strcmp(key, "prompt_cache")) rc.prompt_cache = value;
     }
     std::fclose(f);
     return rc;
@@ -270,7 +273,7 @@ extern "C" void app_main(void) {
     lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true,
                           .io_bytes = static_cast<std::size_t>(rc.io_kb) * 1024, .kv_path = kKvPath,
                           .int8_activations = true, .speculative = rc.spec != 0, .conv_history_path = kConvHistPath,
-                          .conv_state_path = kConvStatePath};
+                          .conv_state_path = kConvStatePath, .prefix_path = kPrefixPath};
     static lfm::Engine* eng = nullptr;
     lfm::Status status = lfm::Status::OutOfMemory;
     for (int batch = std::min(rc.max_batch, static_cast<int>(lfm::Engine::kMaxBatch)); batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {
@@ -347,7 +350,16 @@ extern "C" void app_main(void) {
         lfm::SpecStats spec;
         int32_t first[lfm::Engine::kMaxBatch];  // tokens produced by the prompt pass
         int n_first = 0;
-        if (rc.spec && rc.spec_prefill) {
+        // Prompt cache: the previous run had this prompt, so its K/V rows are
+        // still in kv.bin and the conv state after it was snapshotted.
+        static int32_t cached_first = -1;
+        const bool cached = rc.prompt_cache && run > 0 && cached_first >= 0 && eng->restore_prefix();
+        if (cached) {
+            first[0] = cached_first;
+            n_first = 1;
+            next = cached_first;
+            drafter.push(next);
+        } else if (rc.spec && rc.spec_prefill) {
             // Drafts for the first answer tokens ride in the last prompt batch.
             set_phase("prefill");
             n_first = lfm::speculative_prefill(*eng, drafter, {prompt, static_cast<std::size_t>(n_prompt)},
@@ -365,6 +377,7 @@ extern "C" void app_main(void) {
                 first[0] = next;
                 n_first = 1;
                 drafter.push(next);
+                if (rc.prompt_cache && eng->snapshot_prefix()) cached_first = next;
             }
         }
         const double prefill_s = (esp_timer_get_time() - t0) / 1e6;

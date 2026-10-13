@@ -46,10 +46,25 @@ bool Keyboard::begin() {
     ok = ok && write_reg(kCfg, 0x01);  // key event interrupt (the FIFO fills either way)
     while ((read_reg(kKeyLckEc) & 0x0F) != 0) read_reg(kKeyEventA);
     write_reg(kIntStat, 0x03);
-    return ok;
+    if (!ok) return false;
+    queue_ = xQueueCreate(64, sizeof(char));
+    return queue_ != nullptr && xTaskCreatePinnedToCore(task, "kbd", 3072, this, 5, nullptr, 0) == pdPASS;
+}
+
+void Keyboard::task(void* arg) {
+    auto* self = static_cast<Keyboard*>(arg);
+    while (true) {
+        for (char c = self->read_hw(); c != 0; c = self->read_hw()) xQueueSend(self->queue_, &c, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 char Keyboard::poll() {
+    char c = 0;
+    return queue_ != nullptr && xQueueReceive(queue_, &c, 0) == pdTRUE ? c : 0;
+}
+
+char Keyboard::read_hw() {
     while ((read_reg(kKeyLckEc) & 0x0F) != 0) {
         const uint8_t ev = read_reg(kKeyEventA);
         write_reg(kIntStat, 0x01);

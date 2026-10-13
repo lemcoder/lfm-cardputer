@@ -103,7 +103,10 @@ void draw_status_text() {
 
 // Engine progress hook: thin bar under the status text. Also yields so the
 // idle task (and its watchdog) gets to run between layers.
+void pump_chat_input();
+
 void on_progress(void*, int done, int total) {
+    pump_chat_input();  // typing while the next turn's header is computed
     const int w = kW * done / total;
     lcd.fillRect(0, kH - 3, w, 3, TFT_DARKGREEN);
     lcd.fillRect(w, kH - 3, kW - w, 3, TFT_BLACK);
@@ -262,51 +265,116 @@ struct ChatContext {
 
 constexpr int32_t kBos = 1, kImStart = 6, kImEnd = 7;
 
+// The line being typed. Filled from the keyboard queue by the idle loop and,
+// while the next turn's header is being computed, by the progress hook.
+struct ChatInput {
+    Keyboard* kbd = nullptr;
+    bool active = false;    // pump_chat_input() reads keys
+    char text[256] = {};
+    std::size_t n = 0;
+    bool submit = false;    // Enter on a non-empty line
+    bool new_chat = false;  // fn+`
+};
+ChatInput g_in;
+
+void pump_chat_input() {
+    if (!g_in.active || g_in.kbd == nullptr) return;
+    bool changed = false;
+    for (char ch = g_in.kbd->poll(); ch != 0 && !g_in.submit; ch = g_in.kbd->poll()) {
+        changed = true;
+        if (ch == 27) {
+            g_in.new_chat = true;
+            g_in.n = 0;
+        } else if (ch == '\b') {
+            if (g_in.n > 0) --g_in.n;
+        } else if (ch == '\n') {
+            if (g_in.n > 0) g_in.submit = true;
+        } else if (g_in.n + 1 < sizeof(g_in.text)) {
+            g_in.text[g_in.n++] = ch;
+        }
+    }
+    if (changed) draw_input(g_in.text, g_in.n);
+}
+
 void run_chat(ChatContext& c) {
-    static char input[256];
     static int32_t turn[640];
+    static int32_t header[16];
     bool fresh = true;
+    g_in.kbd = &c.kbd;
     c.eng.reset();
     c.drafter.reset();
     text_begin();
     lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
     lcd.print("Type a message, Enter to send.\nfn+` starts a new chat.\n");
 
+    // The part of the next turn before the user's text never depends on it:
+    //   first turn:  <|startoftext|><|im_start|>user\n
+    //   later turns: <|im_end|>\n<|im_start|>user\n   (closes the reply)
+    // It's run through the model while the user reads and types (keys still
+    // arrive through the progress hook). If the turn's tokens don't start with
+    // it after all (text that merges with the "\n"), the state rolls back.
+    auto encode_into = [&](int32_t* out, int cap, const char* text) { return c.tok.encode(text, out, cap); };
+    int header_n = 0;
+    auto run_header = [&] {
+        header_n = 0;
+        int h = 0;
+        if (fresh) {
+            header[h++] = kBos;
+        } else {
+            header[h++] = kImEnd;
+            h += std::max(0, encode_into(header + h, 16 - h, "\n"));
+        }
+        header[h++] = kImStart;
+        h += std::max(0, encode_into(header + h, 16 - h, "user\n"));
+        if (c.eng.pos() + h + 16 + c.max_reply > c.eng.max_ctx() || !c.eng.snapshot_prefix()) return;
+        set_phase("");
+        draw_input(g_in.text, g_in.n);
+        const int64_t t = esp_timer_get_time();
+        const int32_t r = c.eng.prefill({header, static_cast<std::size_t>(h)}, false);
+        if (r == lfm::Engine::kNoToken) {
+            header_n = h;
+        } else {
+            c.eng.restore_prefix();
+        }
+        ESP_LOGI(TAG, "chat header: %d tokens ahead at position %d, %.1f s%s", h, c.eng.pos() - header_n,
+                 (esp_timer_get_time() - t) / 1e6, header_n ? "" : " (failed)");
+        draw_input(g_in.text, g_in.n);
+    };
+
     while (true) {
-        // Read a line.
-        std::size_t n = 0;
-        draw_input(input, n);
+        // Read a line; the header pass runs first (keys are read meanwhile).
+        g_in.n = 0;
+        g_in.submit = false;
+        g_in.new_chat = false;
+        g_in.active = true;
+        if (header_n == 0) run_header();  // still in place after a turn that was refused
         while (true) {
-            const char ch = c.kbd.poll();
-            if (ch == 0) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-            if (ch == 27) {  // new chat
+            pump_chat_input();
+            if (g_in.new_chat) {
                 c.eng.reset();
                 c.drafter.reset();
                 fresh = true;
-                n = 0;
+                g_in.new_chat = false;
+                g_in.submit = false;
                 text_begin();
                 lcd.setTextColor(TFT_DARKGREY, TFT_BLACK);
                 lcd.print("New chat.\n");
-            } else if (ch == '\b') {
-                if (n > 0) --n;
-            } else if (ch == '\n') {
-                if (n > 0) break;
-            } else if (n + 1 < sizeof(input)) {
-                input[n++] = ch;
+                run_header();
+                continue;
             }
-            draw_input(input, n);
+            if (g_in.submit) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
-        input[n] = '\0';
+        g_in.active = false;
+        char* input = g_in.text;
+        input[g_in.n] = '\0';
         const int64_t t0 = esp_timer_get_time();
         lcd.setTextColor(TFT_CYAN, TFT_BLACK);
         lcd.printf("%s> %s\n", lcd.getCursorX() > 0 ? "\n" : "", input);
 
         // Tokens of this turn (the template around the text, as HF tokenizes it:
         // special tokens by id, the text between them encoded per segment).
-        static char seg[sizeof(input) + 8];
+        static char seg[sizeof(g_in.text) + 8];
         int m = 0;
         auto add = [&](int32_t id) { if (m < static_cast<int>(sizeof(turn) / sizeof(turn[0]))) turn[m++] = id; };
         auto add_text = [&](const char* text) {
@@ -338,13 +406,24 @@ void run_chat(ChatContext& c) {
             continue;
         }
         fresh = false;
-        ESP_LOGI(TAG, "chat turn: %d tokens at position %d", m, c.eng.pos());
+        // Skip what the header pass already did, if the turn starts with it.
+        int done = 0;
+        if (header_n > 0) {
+            bool same = header_n <= m;
+            for (int i = 0; same && i < header_n; ++i) same = turn[i] == header[i];
+            if (same) {
+                done = header_n;
+            } else {
+                c.eng.restore_prefix();
+            }
+        }
+        ESP_LOGI(TAG, "chat turn: %d tokens at position %d (%d done ahead)", m, c.eng.pos() - done, done);
 
-        // Prefill the turn, max_batch tokens per pass.
+        // Prefill the rest of the turn, max_batch tokens per pass.
         g_status = {};
         int32_t next = lfm::Engine::kNoToken;
         char phase[40];
-        for (int i = 0; i < m && next >= lfm::Engine::kNoToken;) {
+        for (int i = done; i < m && next >= lfm::Engine::kNoToken;) {
             const int k = m - i < c.max_batch ? m - i : c.max_batch;
             std::snprintf(phase, sizeof(phase), "reading %d-%d/%d", i + 1, i + k, m);
             set_phase(phase);
@@ -355,6 +434,7 @@ void run_chat(ChatContext& c) {
         if (next < 0) {
             if (next == lfm::Engine::kIoError) fatal("SD read error", "check the card");
             set_phase("prefill failed");
+            header_n = 0;
             continue;
         }
         const double prefill_s = (esp_timer_get_time() - t0) / 1e6;
@@ -399,6 +479,7 @@ void run_chat(ChatContext& c) {
                  g_status.tokens, m, prefill_s, total_s, g_status.sec_per_tok, spec.accepted, spec.drafted);
         std::snprintf(phase, sizeof(phase), "%.0f s", total_s);
         set_phase(phase);
+        header_n = 0;  // the next turn's header comes after this reply
     }
 }
 

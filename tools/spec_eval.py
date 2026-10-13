@@ -298,6 +298,13 @@ def main():
         row2 = " ".join(f"{simulate(seqs, plens, both, k):6.2f}" for k in (1, 2, 3))
         print(f"{f'ngram {mb} MB ({len(trigram) / 1e3:.0f}K tri)':<26} {row}")
         print(f"{f'lookup, else ngram {mb} MB':<26} {row2}   [{time.time() - t0:.0f} s]")
+        print(f"   adaptive length (lookup hits up to kl, n-gram up to kn), modelled device s/token:")
+        for kl, kn in ((2, 2), (3, 2), (4, 2), (6, 2), (4, 1), (4, 3)):
+            fn = lambda ctx, kk, kl=kl, kn=kn: draft_lookup(ctx, kl) or ng(ctx, kn)
+            st = {}
+            tpp = simulate(seqs, plens, fn, max(kl, kn), st)
+            print(f"   kl={kl} kn={kn}: {tpp:.2f} tok/pass, {st['drafted'] / st['passes']:.2f} drafts/pass "
+                  f"-> {device_s_per_tok(st):.2f} s/token")
         print(f"   confident drafts (lookup else n-gram above thresholds), modelled device s/token:")
         for k in (2, 3):
             for mt, mb_ in ((0, 0), (0.2, 0.3), (0.3, 0.5), (0.4, 0.6), (0.5, 0.7), (0.6, 0.8)):

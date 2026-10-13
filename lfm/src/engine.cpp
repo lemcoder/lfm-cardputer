@@ -47,13 +47,14 @@ struct Dims {
         return std::max({conv, mlp, attn});
     }
     // Scratch shared by the whole batch.
-    std::size_t shared() const {
-        return std::max(dim * conv_l,                // conv kernel
-                        2 * heads + 4 * head_dim);   // running max/sum, q/k norm, one K and V row
+    std::size_t shared(int batch) const {
+        return std::max(dim * conv_l,                                          // conv kernel
+                        2 * heads * static_cast<std::size_t>(batch) + 4 * head_dim);  // per-token running
+                                                                               // max/sum, q/k norm, one K and V row
     }
     // All activation + scratch floats for a batch of `batch` tokens.
     std::size_t floats(int batch) const {
-        return static_cast<std::size_t>(batch) * (3 * dim + slot()) + dim + shared();
+        return static_cast<std::size_t>(batch) * (3 * dim + slot()) + dim + shared(batch);
     }
 };
 
@@ -204,7 +205,7 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
         tmp_[b] = static_cast<float*>(alloc(d.dim * sizeof(float)));
         if (x_[b] == nullptr || xn_[b] == nullptr || tmp_[b] == nullptr) return Status::OutOfMemory;
     }
-    norm_w_ = static_cast<float*>(alloc((d.dim + d.shared()) * sizeof(float)));
+    norm_w_ = static_cast<float*>(alloc((d.dim + d.shared(cfg.max_batch)) * sizeof(float)));
     carry_ = static_cast<std::byte*>(alloc(row_bytes(Dtype::BF16, d.ff)));  // widest row we stream
     if (cfg.int8_activations) {
         xq_cols_ = std::max({d.dim, d.ff, d.q_dim});
@@ -240,6 +241,11 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     if (cfg.kv_path != nullptr) {
         kv_file_ = new FileSource(cfg.kv_path, FileSource::Mode::ReadWrite);
         if (!kv_file_->ok()) return Status::KvFileError;
+        // Layer-major layout: give the file its full size up front (one write
+        // at the end), so later writes into any layer's region are in-file.
+        const uint64_t kv_end = static_cast<uint64_t>(n_attn_) * static_cast<uint64_t>(cfg.max_ctx) * kv_row_bytes();
+        const uint32_t zero = 0;
+        if (kv_end > 0 && !kv_file_->write_at(kv_end - sizeof(zero), &zero, sizeof(zero))) return Status::KvFileError;
     } else {
         // One block per attention layer: smaller allocations fit a fragmented heap.
         for (int i = 0; i < n_attn_; ++i) {
@@ -811,7 +817,8 @@ bool Engine::kv_put(int attn_idx, int pos, std::span<const float> k, std::span<c
         std::memcpy(io_ + k.size_bytes(), v.data(), v.size_bytes());
     }
     if (kv_file_ != nullptr) {
-        const uint64_t row = static_cast<uint64_t>(pos) * static_cast<uint64_t>(n_attn_) + static_cast<uint64_t>(attn_idx);
+        // Layer-major: a layer's rows are contiguous, so attention reads many in one go.
+        const uint64_t row = static_cast<uint64_t>(attn_idx) * static_cast<uint64_t>(cfg_.max_ctx) + static_cast<uint64_t>(pos);
         return kv_file_->write_at(row * rb, io_, rb);
     }
     std::memcpy(kv_ram_[attn_idx] + static_cast<std::size_t>(pos) * rb, io_, rb);
@@ -826,11 +833,8 @@ bool Engine::kv_load(int attn_idx, int j0, int count, std::byte* dst) {
         std::memcpy(dst, kv_ram_[attn_idx] + static_cast<std::size_t>(j0) * rb, static_cast<std::size_t>(count) * rb);
         return true;
     }
-    for (int j = 0; j < count; ++j) {
-        const uint64_t row = static_cast<uint64_t>(j0 + j) * static_cast<uint64_t>(n_attn_) + static_cast<uint64_t>(attn_idx);
-        if (!kv_file_->read_at(row * rb, dst + static_cast<std::size_t>(j) * rb, rb)) return false;
-    }
-    return true;
+    const uint64_t row = static_cast<uint64_t>(attn_idx) * static_cast<uint64_t>(cfg_.max_ctx) + static_cast<uint64_t>(j0);
+    return kv_file_->read_at(row * rb, dst, static_cast<std::size_t>(count) * rb);
 }
 
 // Grouped-query attention with per-head RMSNorm on q and k, then RoPE:
@@ -851,9 +855,9 @@ bool Engine::attn_op(int layer, int n) {
     const int ai = layer_slot_[layer];
     const std::size_t k_off = d.q_dim, v_off = d.q_dim + d.kv_dim;
 
-    float* mx = shared_;
-    float* sum = mx + d.heads;
-    float* q_norm = sum + d.heads;
+    float* mx = shared_;                                                 // [max_batch][heads]
+    float* sum = mx + d.heads * static_cast<std::size_t>(cfg_.max_batch);  // [max_batch][heads]
+    float* q_norm = sum + d.heads * static_cast<std::size_t>(cfg_.max_batch);
     float* k_norm = q_norm + d.head_dim;
     float* k_row = k_norm + d.head_dim;
     float* v_row = k_row + d.head_dim;
@@ -895,42 +899,54 @@ bool Engine::attn_op(int layer, int n) {
         return tmp;
     };
 
+    // Each chunk of K/V rows is loaded once and used by every token of the
+    // batch (token b sees positions 0 .. pos_+b). Per token: running max and
+    // sum per head (mx, sum: [n][heads]) and ctx accumulated in xn_[b] (no
+    // longer needed once q, k, v exist).
     for (int b = 0; b < n; ++b) {
-        const float* q = slot(b);
-        float* ctx = xn_[b];  // xn_ is no longer needed once q, k, v exist
-        const int n_pos = pos_ + b + 1;
-        std::memset(ctx, 0, d.q_dim * sizeof(float));
+        std::memset(xn_[b], 0, d.q_dim * sizeof(float));
         for (std::size_t hh = 0; hh < d.heads; ++hh) {
-            mx[hh] = -INFINITY;
-            sum[hh] = 0.0f;
+            mx[b * d.heads + hh] = -INFINITY;
+            sum[b * d.heads + hh] = 0.0f;
         }
-        for (int j0 = 0; j0 < n_pos; j0 += chunk) {
-            const int count = std::min(chunk, n_pos - j0);
-            if (!kv_load(ai, j0, count, io_)) return false;
-            for (int jj = 0; jj < count; ++jj) {
-                const std::byte* row = io_ + static_cast<std::size_t>(jj) * rb;
-                for (std::size_t g = 0; g < d.kv_heads; ++g) {
-                    const float* kr = slice(row, false, g, k_row);
-                    const float* vr = slice(row, true, g, v_row);
+    }
+    const int n_pos_all = pos_ + n;
+    for (int j0 = 0; j0 < n_pos_all; j0 += chunk) {
+        const int count = std::min(chunk, n_pos_all - j0);
+        if (!kv_load(ai, j0, count, io_)) return false;
+        for (int jj = 0; jj < count; ++jj) {
+            const int j = j0 + jj;
+            const std::byte* row = io_ + static_cast<std::size_t>(jj) * rb;
+            for (std::size_t g = 0; g < d.kv_heads; ++g) {
+                const float* kr = slice(row, false, g, k_row);
+                const float* vr = slice(row, true, g, v_row);
+                for (int b = 0; b < n; ++b) {
+                    if (j > pos_ + b) continue;  // causal
+                    const float* q = slot(b);
+                    float* ctx = xn_[b];
+                    float* mxb = mx + b * d.heads;
+                    float* sumb = sum + b * d.heads;
                     for (std::size_t hh = g * group; hh < (g + 1) * group; ++hh) {
                         const float s = m::dot({q + hh * d.head_dim, d.head_dim}, {kr, d.head_dim}) * scale;
                         float* ch = ctx + hh * d.head_dim;
-                        if (s > mx[hh]) {
-                            const float c = std::exp(mx[hh] - s);  // 0 on the first position
-                            sum[hh] *= c;
+                        if (s > mxb[hh]) {
+                            const float c = std::exp(mxb[hh] - s);  // 0 on the first position
+                            sumb[hh] *= c;
                             for (std::size_t i = 0; i < d.head_dim; ++i) ch[i] *= c;
-                            mx[hh] = s;
+                            mxb[hh] = s;
                         }
-                        const float pw = std::exp(s - mx[hh]);
-                        sum[hh] += pw;
+                        const float pw = std::exp(s - mxb[hh]);
+                        sumb[hh] += pw;
                         for (std::size_t i = 0; i < d.head_dim; ++i) ch[i] += pw * vr[i];
                     }
                 }
             }
         }
+    }
+    for (int b = 0; b < n; ++b) {
         for (std::size_t hh = 0; hh < d.heads; ++hh) {
-            const float inv = 1.0f / sum[hh];
-            for (std::size_t i = 0; i < d.head_dim; ++i) ctx[hh * d.head_dim + i] *= inv;
+            const float inv = 1.0f / sum[b * d.heads + hh];
+            for (std::size_t i = 0; i < d.head_dim; ++i) xn_[b][hh * d.head_dim + i] *= inv;
         }
     }
     return matvec(acts(tmp_), d.dim, L.o, h_.dtype(layer, kO), d.q_dim, acts(xn_), n);

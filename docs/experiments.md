@@ -51,4 +51,9 @@ kept or not. Starting point and context: [performance.md](performance.md).
 | 18 | Min-heap top-k instead of a sorted array (k = 1024) | Top-k 0.89 → 0.11 s per B1 run; B1 36.37 → **35.64 s**; B2 **7.77 s/token**, 130.3 s total | yes |
 | 19 | Bigger prompt batch: per-token allocations for x/xn/tmp, scratch slot 12 → 10 KB (conv X → tmp, attention ctx → xn), FATFS buffers 4 KB → 512 B per open file (`CONFIG_WL_SECTOR_SIZE=512`; wear levelling unused) | Batch 7 now fits (38 KB still free). B2 prompt (20 tokens, 3 passes instead of 4) 44.8 → **34.5 s**, B2 total 130.3 → **120.3 s**. B1 unchanged (6 tokens fit either way) | yes |
 | 20 | Drafts for the first answer tokens in the spare room of the last prompt batch (`speculative_prefill`, `verify(…, first_pred)` so prompt positions skip the LM head) | No draft accepted on B1 or B2; costs B1 +0.5 s, B2 +0.3 s. Helps only when the prompt ends mid-phrase | knob, off |
+| 21 | Cross-stream prefetch (next matrix's first block loads during the current one's last block) | B1 35.78 → **35.25 s**, B2 120.3 → **118.5 s** | yes |
+| 22 | Read blocks 40 / 48 KB again (more RAM since #19) | Per token 7.70 → 7.64 / 7.59 s, but the prompt batch falls back to 6 (fragmentation): B2 total 128.0 / 126.9 s vs 118.5 | no |
+| 23 | LM head re-score candidates 1024 → 768 (512 checked too) | Host agreement: 768 99.5% (same as 1024), 512 98.6%. Device with 768: B1 35.25 → **34.80 s**, B2 118.5 → **117.2 s** | yes (768) |
+| 24 | Adaptive draft length (longer drafts for prompt-lookup hits) | Simulation: kl=2..6 / kn=2 all 10.46–10.49 s/token; lookup hits are rare on these prompts | no |
+| 25 | KV cache: layer-major file layout (pre-sized at open) + each K/V chunk loaded once for all batch tokens | Was one SD read per (token, layer, position): ~540 small reads per pass at 30 positions, growing with context. B1 34.80 → **34.68 s**, B2 117.2 → **115.5 s** | yes |
 

@@ -480,3 +480,37 @@ TEST(EngineQ8, PrefillContextFull) {
     const std::vector<int32_t> prompt = {1, 1098, 5706, 803, 4481};
     EXPECT_EQ(eng.prefill(prompt, true), lfm::Engine::kContextFull);
 }
+
+// ---------------------------------------------------------------- read alignment
+
+// Records where streamed (start_read) reads begin.
+class RecordingSource final : public lfm::Source {
+public:
+    explicit RecordingSource(const char* path) : file_(path) {}
+    bool read_at(uint64_t offset, void* dst, std::size_t n) override { return file_.read_at(offset, dst, n); }
+    void start_read(uint64_t offset, void* dst, std::size_t n) override {
+        ++reads_;
+        if (offset % 512 != 0) ++misaligned_;
+        ok_ = file_.read_at(offset, dst, n);
+    }
+    bool wait() override { return ok_; }
+    int reads() const { return reads_; }
+    int misaligned() const { return misaligned_; }
+
+private:
+    lfm::FileSource file_;
+    bool ok_ = true;
+    int reads_ = 0, misaligned_ = 0;
+};
+
+// Every streamed weight read starts on an SD sector boundary, whatever the
+// row size (Q8 dim rows 1088 B, w2 rows 2720 B, Q4 head rows 576 B).
+TEST(EngineQ8, StreamedReadsAreSectorAligned) {
+    MODEL_REQUIRED(kQ8HeadPath);
+    RecordingSource src(kQ8HeadPath.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_ctx = 16}), lfm::Status::Ok);
+    EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
+    EXPECT_GT(src.reads(), 1000);
+    EXPECT_EQ(src.misaligned(), 0);
+}

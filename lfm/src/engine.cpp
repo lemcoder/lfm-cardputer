@@ -125,7 +125,7 @@ std::size_t Engine::ram_bytes(const EngineConfig& cfg) const {
     const Dims d(h_);
     const std::size_t kv = cfg.kv_path != nullptr ? 0
         : static_cast<std::size_t>(n_attn_) * static_cast<std::size_t>(cfg.max_ctx) * 2 * d.kv_dim * (cfg.kv_bf16 ? 2 : 4);
-    return cfg.io_bytes * (cfg.double_buffer ? 2 : 1) + d.floats(cfg.max_batch) * sizeof(float)
+    return cfg.io_bytes * (cfg.double_buffer ? 2 : 1) + row_bytes(Dtype::BF16, d.ff) + d.floats(cfg.max_batch) * sizeof(float)
            + static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float) + kv;
 }
 
@@ -182,8 +182,9 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     xn_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
     tmp_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
     norm_w_ = static_cast<float*>(alloc((d.dim + d.shared()) * sizeof(float)));
+    carry_ = static_cast<std::byte*>(alloc(row_bytes(Dtype::BF16, d.ff)));  // widest row we stream
     if (io_ == nullptr || io2_ == nullptr || arena_ == nullptr || x_ == nullptr || xn_ == nullptr ||
-        tmp_ == nullptr || norm_w_ == nullptr) {
+        tmp_ == nullptr || norm_w_ == nullptr || carry_ == nullptr) {
         return Status::OutOfMemory;
     }
     shared_ = norm_w_ + d.dim;
@@ -224,29 +225,53 @@ bool Engine::read_f32(uint64_t offset, std::span<float> out) {
     return src_->read_at(offset, out.data(), out.size_bytes());
 }
 
+// Reads fixed io_bytes blocks (tensors start 4 KB-aligned in the file, so
+// every block starts on an SD sector), regardless of where rows end: a read
+// that starts mid-sector costs the card an extra command. A row split across
+// two blocks is stitched together in carry_. With two buffers, the next
+// block loads while fn() runs on this one.
 template <typename Fn>
 bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&& fn) {
-    const std::size_t per_chunk = cfg_.io_bytes / rb;
+    const std::size_t total = rows * rb;
+    const std::size_t block = cfg_.io_bytes;
     std::byte* buf[2] = {io_, io2_};
+    const bool two = io2_ != io_;
     int cur = 0;
-    std::size_t n = std::min(per_chunk, rows);
-    src_->start_read(offset, buf[cur], n * rb);
-    for (std::size_t r0 = 0; r0 < rows;) {
+    std::size_t row = 0, carry_len = 0;
+
+    std::size_t len = std::min(block, total);
+    src_->start_read(offset, buf[cur], len);
+    for (std::size_t done = 0; done < total;) {
         if (!src_->wait()) return false;
-        const std::size_t next = r0 + n;
-        const std::size_t next_n = std::min(per_chunk, rows - std::min(rows, next));
-        // Without a second buffer the next read must wait until we're done.
-        const bool overlap = io2_ != io_ && next_n > 0;
-        if (overlap) src_->start_read(offset + next * rb, buf[cur ^ 1], next_n * rb);
-        for (std::size_t i = 0; i < n; ++i) fn(r0 + i, buf[cur] + i * rb);
-        if (!overlap && next_n > 0) {
-            src_->start_read(offset + next * rb, buf[cur], next_n * rb);
-        } else {
+        const std::size_t next = done + len;
+        const std::size_t next_len = std::min(block, total - next);
+        if (two && next_len > 0) src_->start_read(offset + next, buf[cur ^ 1], next_len);
+
+        const std::byte* p = buf[cur];
+        std::size_t avail = len;
+        if (carry_len > 0) {  // finish the row that started in the previous block
+            const std::size_t need = rb - carry_len;
+            std::memcpy(carry_ + carry_len, p, need);
+            fn(row++, carry_);
+            p += need;
+            avail -= need;
+            carry_len = 0;
+        }
+        for (; avail >= rb; p += rb, avail -= rb) fn(row++, p);
+        if (avail > 0) {  // start of a row that continues in the next block
+            std::memcpy(carry_, p, avail);
+            carry_len = avail;
+        }
+
+        if (!two && next_len > 0) {
+            src_->start_read(offset + next, buf[cur], next_len);
+        } else if (two) {
             cur ^= 1;
         }
-        r0 = next;
-        n = next_n;
+        done = next;
+        len = next_len;
     }
+    assert(row == rows && carry_len == 0);
     return true;
 }
 

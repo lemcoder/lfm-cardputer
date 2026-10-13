@@ -36,7 +36,7 @@ const char* to_string(Status s);
 struct EngineConfig {
     int max_ctx = 128;              // KV cache capacity in tokens
     bool kv_bf16 = false;           // store K/V as bf16: half the size, ~3 digits of precision
-    std::size_t io_bytes = 32768;   // weight / KV streaming buffer
+    std::size_t io_bytes = 32768;   // weight / KV streaming buffer; keep a multiple of 512 (SD sector)
     // Two weight buffers: compute on one while the Source fills the other
     // (only helps with a Source whose start_read() is really asynchronous).
     bool double_buffer = true;
@@ -149,6 +149,7 @@ private:
     float* norm_w_ = nullptr;    // norm weights [dim]
     float* arena_ = nullptr;     // per-token op scratch [max_batch][slot_floats_]
     float* shared_ = nullptr;    // per-op scratch shared by the batch
+    std::byte* carry_ = nullptr; // one weight row split across two read blocks
     std::size_t slot_floats_ = 0;
     float* conv_state_ = nullptr;      // [n_conv][conv_l-1][dim], oldest first
     // KV cache, either in RAM: per attention layer [max_ctx] rows,

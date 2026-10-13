@@ -138,7 +138,7 @@ std::size_t Engine::ram_bytes(const EngineConfig& cfg) const {
     const std::size_t xq = cfg.int8_activations
         ? static_cast<std::size_t>(cfg.max_batch) * std::max({d.dim, d.ff, d.q_dim}) * (1 + sizeof(float) / 32.0)
         : 0;
-    return cfg.io_bytes * (cfg.double_buffer ? 2 : 1) + row_bytes(Dtype::BF16, d.ff) + xq + d.floats(cfg.max_batch) * sizeof(float)
+    return (cfg.io_bytes + cfg.io_extra) * (cfg.double_buffer ? 2 : 1) + row_bytes(Dtype::BF16, d.ff) + xq + d.floats(cfg.max_batch) * sizeof(float)
            + (cfg.conv_state_path != nullptr ? 0 : static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float))
            + kv;
 }
@@ -193,8 +193,8 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     }
 
     // Biggest blocks first.
-    io_ = static_cast<std::byte*>(alloc(cfg.io_bytes));
-    io2_ = cfg.double_buffer ? static_cast<std::byte*>(alloc(cfg.io_bytes)) : io_;
+    io_ = static_cast<std::byte*>(alloc(cfg.io_bytes + cfg.io_extra));
+    io2_ = cfg.double_buffer ? static_cast<std::byte*>(alloc(cfg.io_bytes + cfg.io_extra)) : io_;
     const std::size_t B = static_cast<std::size_t>(cfg.max_batch);
     slot_floats_ = std::max(d.slot(), kTopKOffset + 2 * kMaxCandidates);  // LM head top-k lives here too
     for (std::size_t b = 0; b < B; ++b) {

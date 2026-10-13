@@ -503,7 +503,8 @@ static void handle_voltage_switch_stage3(int slot, sdmmc_command_t* cmd)
 
 /* ---------------------------------------------------------------- streamed reads (lfm-cardputer) */
 
-#define STREAM_DESC_CNT 24  // 3 x 32 KB in flight at most, in 4 KB descriptors
+#define STREAM_DESC_CNT 48  // 3 x 32 KB in flight at most, in 2 KB descriptors
+#define STREAM_DESC_LEN 2048  // small, so a reader can follow the data as it lands
 
 DRAM_DMA_ALIGNED_ATTR static sdmmc_desc_t s_stream_desc[STREAM_DESC_CNT];
 static struct {
@@ -514,6 +515,8 @@ static struct {
     int fill;         // next free descriptor
     void* buf[3];     // buffers in flight and their last descriptor
     int last[3];
+    int last_first;   // descriptors of the most recent feed
+    int last_count;
     esp_err_t err;
 } s_stream;
 
@@ -599,8 +602,8 @@ esp_err_t sdmmc_host_stream_feed(void* buf, size_t len)
             break;
         }
     }
-    const int need = (int)((len + SDMMC_DMA_MAX_BUF_LEN - 1) / SDMMC_DMA_MAX_BUF_LEN);
-    if (slot_i < 0 || need > STREAM_DESC_CNT / 3) {
+    const int need = (int)((len + STREAM_DESC_LEN - 1) / STREAM_DESC_LEN);
+    if (slot_i < 0 || need > STREAM_DESC_CNT / 2) {
         return ESP_ERR_NO_MEM;
     }
     uint8_t* p = (uint8_t*)buf;
@@ -611,7 +614,7 @@ esp_err_t sdmmc_host_stream_feed(void* buf, size_t len)
         if (d->owned_by_idmac) {
             return ESP_ERR_NO_MEM;  // ring full: the caller fed too far ahead
         }
-        const size_t n = left < SDMMC_DMA_MAX_BUF_LEN ? left : SDMMC_DMA_MAX_BUF_LEN;
+        const size_t n = left < STREAM_DESC_LEN ? left : STREAM_DESC_LEN;
         d->buffer1_ptr = p;
         d->buffer1_size = n;
         d->last_descriptor = (s_stream.fed + (len - left) + n == s_stream.total);
@@ -628,6 +631,8 @@ esp_err_t sdmmc_host_stream_feed(void* buf, size_t len)
         s_stream_desc[(s_stream.fill + k) % STREAM_DESC_CNT].owned_by_idmac = 1;
     }
     s_stream.buf[slot_i] = buf;
+    s_stream.last_first = s_stream.fill;
+    s_stream.last_count = need;
     s_stream.fill = idx;
     s_stream.fed += len;
     sdmmc_host_dma_resume();
@@ -690,4 +695,32 @@ esp_err_t sdmmc_host_stream_end(void)
     s_stream.active = false;
     xSemaphoreGive(s_request_mutex);
     return ESP_OK;
+}
+
+void sdmmc_host_stream_last_feed(int* first_desc, int* n_desc)
+{
+    *first_desc = s_stream.last_first;
+    *n_desc = s_stream.last_count;
+}
+
+size_t sdmmc_host_stream_landed(int first_desc, int n_desc)
+{
+    size_t bytes = 0;
+    for (int k = 0; k < n_desc; ++k) {
+        volatile sdmmc_desc_t* d = &s_stream_desc[(first_desc + k) % STREAM_DESC_CNT];
+        if (d->owned_by_idmac) {
+            break;
+        }
+        bytes += d->buffer1_size;
+    }
+    return bytes;
+}
+
+void sdmmc_host_stream_release(void* buf)
+{
+    for (int i = 0; i < 3; ++i) {
+        if (s_stream.buf[i] == buf) {
+            s_stream.buf[i] = NULL;
+        }
+    }
 }

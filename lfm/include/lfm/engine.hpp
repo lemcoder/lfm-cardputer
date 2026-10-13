@@ -37,6 +37,9 @@ struct EngineConfig {
     int max_ctx = 128;              // KV cache capacity in tokens
     bool kv_bf16 = false;           // store K/V as bf16: half the size, ~3 digits of precision
     std::size_t io_bytes = 32768;   // weight / KV streaming buffer; keep a multiple of 512 (SD sector)
+    // Bytes the Source may use past io_bytes in a buffer passed to
+    // start_read() (the device's decoder stages compressed data there).
+    std::size_t io_extra = 0;
     // Two weight buffers: compute on one while the Source fills the other
     // (only helps with a Source whose start_read() is really asynchronous).
     bool double_buffer = true;

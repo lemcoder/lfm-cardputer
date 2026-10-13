@@ -48,6 +48,8 @@
 #include "sd_speed.hpp"
 #include "kernel_test.hpp"
 #include "keyboard.hpp"
+
+void z_test(void (*print)(const char*));
 #include "usb_upload.hpp"
 
 namespace {
@@ -61,10 +63,12 @@ constexpr const char* kConvStatePath = "/sdcard/cstate.bin";
 constexpr const char* kRunConfigPath = "/sdcard/cfg.txt";
 constexpr const char* kPrefixPath = "/sdcard/prefix.bin";
 constexpr const char* kTokenizerPath = "/sdcard/tok.bin";  // tools/export_tokenizer.py
+constexpr const char* kLfzPath = "/sdcard/lfm.lfz";        // tools/zcodec.py pack (optional)
 constexpr int kMaxCtx = 1024;          // KV file grows 12 KB per token: 12 MB at most
 constexpr bool kSdSpeedTest = false;   // run the SD clock experiment instead of the model
 constexpr bool kKernelTest = false;    // check the SIMD kernels against the C reference instead
 constexpr bool kSdRawTest = false;     // measure raw SD reads vs FATFS after mounting, instead of the model
+constexpr bool kZTest = false;         // decode speed of the weight codec (ztest.cpp), instead of the model
 constexpr int32_t kDefaultPrompt[] = {1, 1098, 5706, 803, 4481, 856};  // "The capital of France is"
 constexpr int kMaxPrompt = 64;
 
@@ -224,6 +228,7 @@ struct RunConfig {
     int worker = 1;       // split the LM head scan with core 1
     int stream = 1;       // one SD command per matrix (AsyncFile::enable_streaming)
     int tree = 1;         // draft head proposes a tree (lfm::kTree3x1) instead of a chain
+    int compress = 0;     // read layer matrices from /lfm.lfz (experiment 41: costs batch 7, so off)
 };
 
 RunConfig read_run_config() {
@@ -251,6 +256,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "worker")) rc.worker = value;
         else if (!std::strcmp(key, "stream")) rc.stream = value;
         else if (!std::strcmp(key, "tree")) rc.tree = value;
+        else if (!std::strcmp(key, "compress")) rc.compress = value;
     }
     std::fclose(f);
     return rc;
@@ -651,6 +657,13 @@ extern "C" void app_main(void) {
     // fails; phase 2 is mid-window. 53.3 MHz (div 3) works at every phase.
     static SdCard card(SdCard::Config{.host_div = 2, .delay_phase = 2});
     if (!card.ok()) fatal("SD mount failed", esp_err_to_name(card.err()));
+    if (kZTest) {
+        set_phase("weight codec test");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        z_test([](const char* line) { lcd.println(line); });
+        set_phase("weight codec test done");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     if (kSdRawTest) {
         set_phase("SD driver test");
         vTaskDelay(pdMS_TO_TICKS(3000));  // time to attach a serial log
@@ -674,14 +687,18 @@ extern "C" void app_main(void) {
 
     const RunConfig rc = read_run_config();
     const bool streaming = rc.stream && src.enable_streaming(card.card(), "0:/lfm.lfm");
-    ESP_LOGI(TAG, "weight reads: %s", streaming ? "streamed (one SD command per matrix)" : "one SD command per block");
+    src.set_io_bytes(static_cast<std::size_t>(rc.io_kb) * 1024);
+    const bool compressed = streaming && rc.compress && src.enable_compression(kLfzPath, "0:/lfm.lfz");
+    ESP_LOGI(TAG, "weight reads: %s%s", streaming ? "streamed (one SD command per matrix)" : "one SD command per block",
+             compressed ? ", layer matrices compressed (/lfm.lfz)" : "");
     ESP_LOGI(TAG, "run config: spec %d max_draft %d max_batch %d io_kb %d gen %d ignore_eos %d progress %d runs %d",
              rc.spec, rc.max_draft, rc.max_batch, rc.io_kb, rc.gen, rc.ignore_eos, rc.progress, rc.runs);
 
     // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
     const std::size_t kReserve = static_cast<std::size_t>(rc.reserve_kb) * 1024;
     lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true,
-                          .io_bytes = static_cast<std::size_t>(rc.io_kb) * 1024, .kv_path = kKvPath,
+                          .io_bytes = static_cast<std::size_t>(rc.io_kb) * 1024,
+                          .io_extra = compressed ? AsyncFile::kIoExtra : 0, .kv_path = kKvPath,
                           .int8_activations = true, .speculative = rc.spec != 0, .conv_history_path = kConvHistPath,
                           .conv_state_path = kConvStatePath, .prefix_path = kPrefixPath};
     static lfm::Engine* eng = nullptr;

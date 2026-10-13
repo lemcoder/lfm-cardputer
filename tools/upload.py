@@ -23,7 +23,7 @@ from pathlib import Path
 import serial
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_FILES = [(ROOT / "out/lfm-q8-head-q4.lfm", "lfm.lfm"), (ROOT / "out/prompt.txt", "prompt.txt")]
+DEFAULT_FILES = [(ROOT / "out/lfm-q4.lfm", "lfm.lfm"), (ROOT / "out/prompt.txt", "prompt.txt")]
 CHUNK = 64 * 1024
 
 

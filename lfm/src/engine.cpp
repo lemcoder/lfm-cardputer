@@ -125,7 +125,10 @@ std::size_t Engine::ram_bytes(const EngineConfig& cfg) const {
     const Dims d(h_);
     const std::size_t kv = cfg.kv_path != nullptr ? 0
         : static_cast<std::size_t>(n_attn_) * static_cast<std::size_t>(cfg.max_ctx) * 2 * d.kv_dim * (cfg.kv_bf16 ? 2 : 4);
-    return cfg.io_bytes * (cfg.double_buffer ? 2 : 1) + row_bytes(Dtype::BF16, d.ff) + d.floats(cfg.max_batch) * sizeof(float)
+    const std::size_t xq = cfg.int8_activations
+        ? static_cast<std::size_t>(cfg.max_batch) * std::max({d.dim, d.ff, d.q_dim}) * (1 + sizeof(float) / 32.0)
+        : 0;
+    return cfg.io_bytes * (cfg.double_buffer ? 2 : 1) + row_bytes(Dtype::BF16, d.ff) + xq + d.floats(cfg.max_batch) * sizeof(float)
            + static_cast<std::size_t>(n_conv_) * (d.conv_l - 1) * d.dim * sizeof(float) + kv;
 }
 
@@ -183,6 +186,12 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
     tmp_ = static_cast<float*>(alloc(B * d.dim * sizeof(float)));
     norm_w_ = static_cast<float*>(alloc((d.dim + d.shared()) * sizeof(float)));
     carry_ = static_cast<std::byte*>(alloc(row_bytes(Dtype::BF16, d.ff)));  // widest row we stream
+    if (cfg.int8_activations) {
+        xq_cols_ = std::max({d.dim, d.ff, d.q_dim});
+        xq_ = static_cast<int8_t*>(alloc(B * xq_cols_));
+        xs_ = static_cast<float*>(alloc(B * (xq_cols_ / 32) * sizeof(float)));
+        if (xq_ == nullptr || xs_ == nullptr) return Status::OutOfMemory;
+    }
     if (io_ == nullptr || io2_ == nullptr || arena_ == nullptr || x_ == nullptr || xn_ == nullptr ||
         tmp_ == nullptr || norm_w_ == nullptr || carry_ == nullptr) {
         return Status::OutOfMemory;
@@ -279,6 +288,20 @@ bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&&
 // the matrix per batch.
 bool Engine::matvec(float* out, std::size_t out_stride, std::size_t rows, uint64_t offset, Dtype dt,
                      std::size_t cols, const float* x, std::size_t x_stride, int n) {
+    if (xq_ != nullptr && (dt == Dtype::Q8_0 || dt == Dtype::Q4_0)) {
+        // Integer path: quantize each token's input once, then int8 x int8 dots.
+        for (int b = 0; b < n; ++b) {
+            m::quantize_q8({x + static_cast<std::size_t>(b) * x_stride, cols}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
+        }
+        return stream_rows(offset, rows, row_bytes(dt, cols), [&](std::size_t r, const std::byte* row) {
+            for (int b = 0; b < n; ++b) {
+                const int8_t* q = xq_ + b * xq_cols_;
+                const float* sc = xs_ + b * (xq_cols_ / 32);
+                out[static_cast<std::size_t>(b) * out_stride + r] =
+                    dt == Dtype::Q8_0 ? m::dot_q8_0_q8(row, q, sc, cols) : m::dot_q4_0_q8(row, q, sc, cols);
+            }
+        });
+    }
     return stream_rows(offset, rows, row_bytes(dt, cols), [&](std::size_t r, const std::byte* row) {
         for (int b = 0; b < n; ++b) {
             out[static_cast<std::size_t>(b) * out_stride + r] = dot_row(dt, row, {x + static_cast<std::size_t>(b) * x_stride, cols});
@@ -299,6 +322,15 @@ int32_t Engine::lm_head(std::span<const float> x, float* logits) {
     const uint64_t scan_off = shortlist ? h_.lm_head : h_.embed;
     const std::size_t rb = row_bytes(scan_dt, h_.dim);
 
+    // Integer path (see matvec): quantize x once for the scan and the re-score.
+    const bool int8 = xq_ != nullptr && logits == nullptr;
+    if (int8) m::quantize_q8(x, xq_, xs_);
+    auto score = [&](Dtype dt, const std::byte* row) {
+        if (int8 && dt == Dtype::Q8_0) return m::dot_q8_0_q8(row, xq_, xs_, h_.dim);
+        if (int8 && dt == Dtype::Q4_0) return m::dot_q4_0_q8(row, xq_, xs_, h_.dim);
+        return dot_row(dt, row, x);
+    };
+
     // Top-k by approximate score, kept sorted descending (k is small).
     const int k = shortlist ? static_cast<int>(h_.lm_head_candidates) : 1;
     float top_score[kMaxCandidates];
@@ -306,7 +338,7 @@ int32_t Engine::lm_head(std::span<const float> x, float* logits) {
     int n_top = 0;
 
     const bool ok = stream_rows(scan_off, h_.vocab, rb, [&](std::size_t r, const std::byte* row) {
-        const float v = dot_row(scan_dt, row, x);
+        const float v = score(scan_dt, row);
         if (logits != nullptr) logits[r] = v;
         if (n_top == k && v <= top_score[k - 1]) return;
         int pos = n_top < k ? n_top++ : k - 1;
@@ -327,7 +359,7 @@ int32_t Engine::lm_head(std::span<const float> x, float* logits) {
     int32_t best_id = top_id[0];
     for (int i = 0; i < n_top; ++i) {
         if (!src_->read_at(h_.embed + static_cast<uint64_t>(top_id[i]) * erb, io_, erb)) return kIoError;
-        const float v = dot_row(h_.embed_dtype, io_, x);
+        const float v = score(h_.embed_dtype, io_);
         if (v > best || (v == best && top_id[i] < best_id)) {
             best = v;
             best_id = top_id[i];

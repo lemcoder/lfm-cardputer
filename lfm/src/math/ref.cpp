@@ -225,4 +225,50 @@ float dot_q4_0(const std::byte* row, std::span<const float> x) {
     return sum;
 }
 
+void quantize_q8(std::span<const float> x, int8_t* q, float* scale) {
+    assert(x.size() % 32 == 0);
+    for (std::size_t b = 0; b < x.size() / 32; ++b) {
+        const float* xb = x.data() + b * 32;
+        float amax = 0.0f;
+        for (std::size_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xb[i]));
+        const float d = amax / 127.0f;
+        const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+        scale[b] = d;
+        for (std::size_t i = 0; i < 32; ++i) q[b * 32 + i] = static_cast<int8_t>(std::lrintf(xb[i] * inv));
+    }
+}
+
+float dot_q8_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < n / 32; ++b) {
+        const std::byte* block = row + b * 34;
+        uint16_t scale_bits;
+        std::memcpy(&scale_bits, block, 2);
+        const auto* w = reinterpret_cast<const int8_t*>(block + 2);
+        const int8_t* x = xq + b * 32;
+        int32_t acc = 0;
+        for (std::size_t i = 0; i < 32; ++i) acc += static_cast<int32_t>(w[i]) * x[i];
+        sum += f16_to_f32(scale_bits) * xscale[b] * static_cast<float>(acc);
+    }
+    return sum;
+}
+
+float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n) {
+    float sum = 0.0f;
+    for (std::size_t b = 0; b < n / 32; ++b) {
+        const std::byte* block = row + b * 18;
+        uint16_t scale_bits;
+        std::memcpy(&scale_bits, block, 2);
+        const auto* w = reinterpret_cast<const uint8_t*>(block + 2);
+        const int8_t* x = xq + b * 32;
+        int32_t acc = 0;
+        for (std::size_t j = 0; j < 16; ++j) {
+            acc += (static_cast<int32_t>(w[j] & 0x0F) - 8) * x[j];
+            acc += (static_cast<int32_t>(w[j] >> 4) - 8) * x[j + 16];
+        }
+        sum += f16_to_f32(scale_bits) * xscale[b] * static_cast<float>(acc);
+    }
+    return sum;
+}
+
 } // namespace lfm::math::ref

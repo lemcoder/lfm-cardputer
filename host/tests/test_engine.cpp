@@ -514,3 +514,40 @@ TEST(EngineQ8, StreamedReadsAreSectorAligned) {
     EXPECT_GT(src.reads(), 1000);
     EXPECT_EQ(src.misaligned(), 0);
 }
+
+// ---------------------------------------------------------------- int8 activations + Q4 (device)
+
+const std::string kQ4Path = std::string(LFM_REPO_ROOT) + "/out/lfm-q4.lfm";
+
+// Integer path on the near-lossless Q8 file still produces the golden answer.
+TEST(EngineQ8, Int8ActivationsGenerateGolden) {
+    MODEL_REQUIRED(kQ8HeadPath);
+    lfm::FileSource src(kQ8HeadPath.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_ctx = 64, .int8_activations = true}), lfm::Status::Ok);
+    EXPECT_EQ(Generate(eng, golden::Tokens(), 8), GoldenGenerated());
+}
+
+// The device file and config: Q4 everywhere, int8 activations, async reads,
+// KV file, batched prompt. Same tokens with and without batching/async.
+TEST(EngineQ4, DeviceConfigConsistent) {
+    MODEL_REQUIRED(kQ4Path);
+    lfm::FileSource sync_src(kQ4Path.c_str());
+    ThreadedSource async_src(kQ4Path.c_str());
+    lfm::Engine one, dev;
+    ASSERT_EQ(one.open(sync_src, {.max_ctx = 64, .kv_bf16 = true, .int8_activations = true}), lfm::Status::Ok);
+    ASSERT_EQ(dev.open(async_src, {.max_ctx = 64, .kv_bf16 = true, .kv_path = kKvPath.c_str(), .max_batch = 3,
+                                   .int8_activations = true}),
+              lfm::Status::Ok);
+    const auto want = GenerateN(one, golden::Tokens(), 16);
+    const std::vector<int> tokens = golden::Tokens();  // one vector: begin/end must match
+    std::vector<int32_t> prompt(tokens.begin(), tokens.end());
+    std::vector<int32_t> got;
+    int32_t next = dev.prefill(prompt, true);
+    while (next >= 0 && got.size() < 16) {
+        got.push_back(next);
+        next = dev.forward(next, true);
+    }
+    EXPECT_EQ(got, want);
+    EXPECT_EQ(want.front(), 5242) << "first token should still be ' Paris'";
+}

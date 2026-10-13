@@ -201,7 +201,8 @@ extern "C" void app_main(void) {
 
     // Biggest prompt batch that fits, keeping kReserve bytes for everything else.
     constexpr std::size_t kReserve = 24 * 1024;
-    lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath};
+    lfm::EngineConfig cfg{.max_ctx = kMaxCtx, .kv_bf16 = true, .io_bytes = 32 * 1024, .kv_path = kKvPath,
+                          .int8_activations = true};
     static lfm::Engine* eng = nullptr;
     lfm::Status status = lfm::Status::OutOfMemory;
     for (int batch = 6; batch >= 1 && status == lfm::Status::OutOfMemory; --batch) {

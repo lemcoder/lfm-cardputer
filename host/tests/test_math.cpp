@@ -222,3 +222,38 @@ TEST(MathRef, DotQ8_0) {
     // 0.5 * (0 + 1 + ... + 31) + 2 * (-32) = 248 - 64
     EXPECT_FLOAT_EQ(m::ref::dot_q8_0(row.data(), x), 184.0f);
 }
+
+// ------------------------------------------------- integer (Q8 activation) path
+
+TEST(MathRef, QuantizeQ8RoundTrip) {
+    const Vec x = RandomVec(64, 7);
+    std::vector<int8_t> q(64);
+    float sc[2];
+    m::ref::quantize_q8(x, q.data(), sc);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        EXPECT_NEAR(sc[i / 32] * q[i], x[i], sc[i / 32] * 0.5f + 1e-7f) << i;  // within half a step
+    }
+}
+
+// Integer dots agree with the float dots up to the activation rounding.
+TEST(MathRef, IntegerDotsMatchFloat) {
+    const std::size_t n = 1024;
+    const Vec x = RandomVec(n, 8);
+    std::vector<int8_t> xq(n);
+    std::vector<float> xs(n / 32);
+    m::ref::quantize_q8(x, xq.data(), xs.data());
+
+    std::vector<std::byte> q8(n / 32 * 34), q4(n / 32 * 18);
+    std::mt19937 rng(9);
+    for (std::size_t b = 0; b < n / 32; ++b) {
+        const uint16_t scale = 0x2C00;  // 0.0625
+        std::memcpy(q8.data() + b * 34, &scale, 2);
+        std::memcpy(q4.data() + b * 18, &scale, 2);
+        for (int i = 0; i < 32; ++i) q8[b * 34 + 2 + i] = static_cast<std::byte>(static_cast<int8_t>(rng() % 255 - 127));
+        for (int i = 0; i < 16; ++i) q4[b * 18 + 2 + i] = static_cast<std::byte>(rng() & 0xFF);
+    }
+    const float f8 = m::ref::dot_q8_0(q8.data(), x), i8 = m::ref::dot_q8_0_q8(q8.data(), xq.data(), xs.data(), n);
+    const float f4 = m::ref::dot_q4_0(q4.data(), x), i4 = m::ref::dot_q4_0_q8(q4.data(), xq.data(), xs.data(), n);
+    EXPECT_NEAR(i8, f8, 0.01f * (1 + std::fabs(f8)) + 0.5f);
+    EXPECT_NEAR(i4, f4, 0.01f * (1 + std::fabs(f4)) + 0.1f);
+}

@@ -48,6 +48,10 @@ struct EngineConfig {
     // each weight chunk is read once per batch instead of once per token.
     // Costs ~(3*dim + max(3*dim, ff, 3*dim)) floats of RAM per extra token.
     int max_batch = 1;
+    // Quantize each matvec input to int8 (blocks of 32 + scale) so Q8/Q4
+    // weight rows are dotted with integer math (llama.cpp's Q8 x Q8). Much
+    // faster on the ESP32-S3; slightly less exact than float activations.
+    bool int8_activations = false;
 };
 
 class Engine {
@@ -136,7 +140,7 @@ private:
     int layer_slot_[kMaxLayers] = {};  // index among conv or attention layers
 
     // Separate allocations (a fragmented heap has no single big block).
-    static constexpr int kMaxBlocks = 8;
+    static constexpr int kMaxBlocks = 12;
     void* blocks_[kMaxBlocks] = {};
     int n_blocks_ = 0;
     void* alloc(std::size_t bytes);
@@ -150,6 +154,9 @@ private:
     float* arena_ = nullptr;     // per-token op scratch [max_batch][slot_floats_]
     float* shared_ = nullptr;    // per-op scratch shared by the batch
     std::byte* carry_ = nullptr; // one weight row split across two read blocks
+    int8_t* xq_ = nullptr;       // int8_activations: [max_batch][max cols] quantized inputs
+    float* xs_ = nullptr;        // ... and their per-32 scales [max_batch][max cols / 32]
+    std::size_t xq_cols_ = 0;    // max cols
     std::size_t slot_floats_ = 0;
     float* conv_state_ = nullptr;      // [n_conv][conv_l-1][dim], oldest first
     // KV cache, either in RAM: per attention layer [max_ctx] rows,

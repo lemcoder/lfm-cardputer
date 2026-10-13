@@ -3,7 +3,8 @@
 //   ./host/build/lfm_host out/lfm-q8.lfm                  # prompt from out/prompt.txt
 //   ./host/build/lfm_host out/lfm-q8.lfm 1 1098 5706 ...  # explicit token ids
 //   options: --max-new N (default 32), --ctx N (default 128), --kv-bf16,
-//            --kv-file PATH (KV cache in a file, as on the device), --batch N (prompt batch)
+//            --kv-file PATH (KV cache in a file, as on the device), --batch N (prompt batch),
+//            --int8 (int8 activations)
 
 #include <chrono>
 #include <cstdio>
@@ -51,6 +52,8 @@ int main(int argc, char** argv) {
             cfg.kv_path = argv[++i];
         } else if (std::strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
             cfg.max_batch = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--int8") == 0) {
+            cfg.int8_activations = true;
         } else if (std::strcmp(argv[i], "--kv-bf16") == 0) {
             cfg.kv_bf16 = true;
         } else {

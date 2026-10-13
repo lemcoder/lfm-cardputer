@@ -67,4 +67,19 @@ float dot_q8_0(const std::byte* row, std::span<const float> x);
 // Row of Q4_0 blocks: x.size() / 32 blocks of {f16 scale, uint8[16]}.
 float dot_q4_0(const std::byte* row, std::span<const float> x);
 
+// ---- integer path: activations quantized to int8 too (Q8 x Q8)
+// A vector of n floats becomes n / 32 blocks: int8 q[n] and a float scale
+// per block, x ~= scale[b] * q[b*32 + i]. Then a weight row dot product is
+// sum over blocks of (w_scale * x_scale * integer dot of 32 int8 pairs):
+// the inner loop is pure integer math, which SIMD units do 16 at a time.
+
+// q[i] = round(x[i] / scale[b]), scale[b] = max|x in block b| / 127.
+void quantize_q8(std::span<const float> x, int8_t* q, float* scale);
+
+// Q8_0 weight row (34-byte blocks) . quantized activation.
+float dot_q8_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n);
+
+// Q4_0 weight row (18-byte blocks) . quantized activation.
+float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, std::size_t n);
+
 }  // namespace lfm::math::ref

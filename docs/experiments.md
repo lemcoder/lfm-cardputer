@@ -25,6 +25,24 @@ kept or not. Starting point and context: [performance.md](performance.md).
 |---|---|---|---|---|
 | speculative, up to 5 drafts per pass | 41.27 s | 13.20 s | 14.06 s | 46.46 s |
 
+## Where it ended
+
+All lossless relative to the Q4 model except where noted (low-rank / flash LM
+head: 99.5% next-token agreement with the full head on the host).
+
+| | start of the run | end of the run | |
+|---|---|---|---|
+| B1 total ("The capital of France is" → " Paris.") | 41.27 s | **34.68 s** | −16% |
+| B1 run again (prompt cache) | 41.27 s | **23.39 s** | −43% |
+| B2 per generated token | 14.06 s | **7.48 s** | −47% |
+| B2 prompt (20 tokens) | 46.46 s | **33.27 s** | −28% |
+| B2 total (20 + 12 tokens) | ~215 s (14.06 s × 12 + 46.5) | **115.5 s** | −46% |
+
+Biggest wins: self-generated n-gram drafts (#5), LM head table in flash
+(#11–18, #23), prompt batch 7 (#19), prompt cache (#27). Rejected: layer
+dropping (#7) and MLP sparsity (#8) wreck the model; confidence-gated or
+adaptive drafts (#6, #24) don't beat plain k=2.
+
 ## Results
 
 | # | Idea | Result | Kept |
@@ -58,4 +76,13 @@ kept or not. Starting point and context: [performance.md](performance.md).
 | 25 | KV cache: layer-major file layout (pre-sized at open) + each K/V chunk loaded once for all batch tokens | Was one SD read per (token, layer, position): ~540 small reads per pass at 30 positions, growing with context. B1 34.80 → **34.68 s**, B2 117.2 → **115.5 s** | yes |
 | 26 | Flash at 120 MHz (LM head table scan reads 4.7 MB per call at 26 MB/s) | Needs the flash chip's high-performance mode, unverified for this board; ≤ 0.06 s per pass (0.5%) at stake, and a failed boot needs manual download mode | skipped |
 | 27 | **Prompt cache**: after the prompt, snapshot the conv state + position (K/V rows stay valid in kv.bin); a run with the same prompt restores instead of recomputing | B1 run again (G0 / `runs=2`): **34.70 → 23.39 s**, prompt 11.32 → 0.02 s, same tokens | yes |
+| 28 | Re-tune drafts per pass after #11–25 made extra positions cheaper | B2: k=1 8.31, **k=2 7.48**, k=3 7.67, k=4 7.88 s/token | k=2 stays |
+
+## Not tried (and why)
+
+- **Below Q4 / pruning weights:** out of scope (the brief keeps Q4 as the floor).
+- **Faster flash (120 MHz):** see 26.
+- **A staging buffer so conv state / KV use doesn't cancel the prefetch:** ~14 stream starts per pass × 3.6 ms ≈ 0.05 s (0.4%).
+- **Both cores computing:** SD is busy 92–93% of the time; compute already hides behind it.
+- **Tree / multi-candidate speculative drafts:** needs tree attention; current single-chain acceptance (~1.3 tokens per pass) suggests little headroom with these drafters.
 

@@ -33,6 +33,7 @@ Most of the work was making both terms small and keeping them overlapped.
 | 8 | **Q4 weights everywhere** + int8 activations (C) | 48.2 s | 15.0 s | 78.2 s | 8.89 | now compute-bound: SD busy 62% |
 | 9 | ESP32-S3 PIE SIMD dot kernels | 36.1 s | 14.8 s | 65.7 s | 8.89 | prompt batch had dropped to 2 |
 | 10 | Smaller allocations → prompt batch 4 fits | **25.7 s** | **14.8 s** | **55.3 s** | 8.89 | SD-bound again (98%) |
+| 11 | Autonomous run ([experiments.md](experiments.md)): low-rank / flash LM head, self-generated n-gram drafts (k=2), batch 7, cross-stream prefetch, KV layout, … | **11.3 s** | **~11.7 s** (B1), **7.48 s** (B2, drafts hit) | **34.7 s** | 8.9 | prompt cache: 23.4 s on a repeat |
 
 Rows 1–7 are lossless (same tokens as the PyTorch reference). Row 8 changes
 the weights to 4 bits (see *Quality*); the golden prompt still gives " Paris.".

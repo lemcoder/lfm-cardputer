@@ -248,11 +248,36 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
         }
     }
 
+    // Matrix streams of one pass, in order, for the cross-stream prefetch.
+    n_sched_ = 0;
+    auto add = [&](uint64_t off, std::size_t rows, Dtype dt, std::size_t cols) {
+        if (off != 0 && n_sched_ < kMaxStreams) sched_[n_sched_++] = {off, rows * row_bytes(dt, cols)};
+    };
+    for (uint32_t i = 0; i < h_.n_layers; ++i) {
+        if (cfg.skip_layers & (1u << i)) continue;
+        const LayerOffsets& L = h_.layers[i];
+        if (h_.layer_kind[i] == LayerKind::Conv) {
+            const Dtype dt = h_.dtype(i, kConvIn);
+            add(L.conv_in, 2 * d.dim, dt, d.dim);
+            add(L.conv_in + 2 * d.dim * row_bytes(dt, d.dim), d.dim, dt, d.dim);
+            add(L.conv_out, d.dim, h_.dtype(i, kConvOut), d.dim);
+        } else {
+            add(L.q, d.q_dim, h_.dtype(i, kQ), d.dim);
+            add(L.k, d.kv_dim, h_.dtype(i, kK), d.dim);
+            add(L.v, d.kv_dim, h_.dtype(i, kV), d.dim);
+            add(L.o, d.dim, h_.dtype(i, kO), d.q_dim);
+        }
+        add(L.w1, d.ff, h_.dtype(i, kW1), d.dim);
+        add(L.w3, d.ff, h_.dtype(i, kW3), d.dim);
+        add(L.w2, d.dim, h_.dtype(i, kW2), d.ff);
+    }
+
     reset();
     return Status::Ok;
 }
 
 void Engine::reset() {
+    cancel_prefetch();
     pos_ = 0;
     pending_n_ = 0;
     const std::size_t state_floats = (h_.conv_l - 1) * h_.dim;
@@ -272,6 +297,7 @@ void Engine::progress(int done) {
 // ---------------------------------------------------------------- weight I/O
 
 bool Engine::read_f32(uint64_t offset, std::span<float> out) {
+    drain();  // the Source allows no sync read while an async one is in flight
     return src_->read_at(offset, out.data(), out.size_bytes());
 }
 
@@ -280,6 +306,29 @@ bool Engine::read_f32(uint64_t offset, std::span<float> out) {
 // that starts mid-sector costs the card an extra command. A row split across
 // two blocks is stitched together in carry_. With two buffers, the next
 // block loads while fn() runs on this one.
+// Cross-stream prefetch: while a stream's last block is being processed,
+// the first block of the matrix that comes next in the pass (schedule built
+// in open()) is already loading into the free buffer. Anything that touches
+// the Source or io_/io2_ outside stream_rows calls drain() / cancel_prefetch().
+void Engine::drain() {
+    if (pf_pending_) {
+        pf_ok_ = src_->wait();
+        pf_pending_ = false;
+    }
+}
+
+void Engine::cancel_prefetch() {
+    drain();
+    pf_valid_ = false;
+}
+
+const Engine::Stream* Engine::next_stream(uint64_t offset) const {
+    for (int i = 0; i + 1 < n_sched_; ++i) {
+        if (sched_[i].offset == offset) return &sched_[i + 1];
+    }
+    return nullptr;
+}
+
 template <typename Fn>
 bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&& fn) {
     const std::size_t total = rows * rb;
@@ -290,12 +339,33 @@ bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&&
     std::size_t row = 0, carry_len = 0;
 
     std::size_t len = std::min(block, total);
-    src_->start_read(offset, buf[cur], len);
+    if (pf_valid_ && pf_offset_ == offset && pf_len_ == len) {
+        cur = pf_buf_;  // the first block is (being) prefetched: picked up below
+    } else {
+        cancel_prefetch();
+        src_->start_read(offset, buf[cur], len);
+        pf_pending_ = true;
+    }
+    pf_valid_ = false;
     for (std::size_t done = 0; done < total;) {
-        if (!src_->wait()) return false;
+        drain();
+        if (!pf_ok_) return false;
         const std::size_t next = done + len;
         const std::size_t next_len = std::min(block, total - next);
-        if (two && next_len > 0) src_->start_read(offset + next, buf[cur ^ 1], next_len);
+        if (two && next_len > 0) {
+            src_->start_read(offset + next, buf[cur ^ 1], next_len);
+            pf_pending_ = true;
+        } else if (two && next_len == 0) {
+            // Last block: start the next stream's first block meanwhile.
+            if (const Stream* nx = next_stream(offset)) {
+                pf_offset_ = nx->offset;
+                pf_len_ = std::min(block, nx->bytes);
+                pf_buf_ = cur ^ 1;
+                src_->start_read(pf_offset_, buf[pf_buf_], pf_len_);
+                pf_pending_ = true;
+                pf_valid_ = true;
+            }
+        }
 
         const std::byte* p = buf[cur];
         std::size_t avail = len;
@@ -315,6 +385,7 @@ bool Engine::stream_rows(uint64_t offset, std::size_t rows, std::size_t rb, Fn&&
 
         if (!two && next_len > 0) {
             src_->start_read(offset + next, buf[cur], next_len);
+            pf_pending_ = true;
         } else if (two) {
             cur ^= 1;
         }
@@ -404,6 +475,7 @@ float Engine::score_row(int b, Dtype dt, const std::byte* row, const float* in, 
 // one sector-aligned read: a separate small read costs ~0.5 ms (rows straddle
 // 512-byte sectors), about the same as reading 4 KB more. xs must be quantized.
 bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out) {
+    cancel_prefetch();  // uses io_ and io2_
     const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
     constexpr uint64_t kSector = 512;
     constexpr uint64_t kMaxGap = 4096;  // bytes worth reading through instead of a new command (16 KB measured worse)
@@ -654,6 +726,7 @@ bool Engine::lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits) {
         float best = -INFINITY;
         int32_t best_id = ids[0];
         for (int i = 0; i < n_top[b]; ++i) {
+            cancel_prefetch();
             if (!src_->read_at(h_.embed + static_cast<uint64_t>(ids[i]) * erb, io_, erb)) return false;
             const float v = score(b, h_.embed_dtype, io_, xs, h_.dim);
             if (v > best) {  // ascending ids: strict > keeps the lowest id on ties
@@ -727,6 +800,7 @@ std::size_t Engine::kv_row_bytes() const {
 
 // Store position `pos`'s K and V for one attention layer. Staged in io_.
 bool Engine::kv_put(int attn_idx, int pos, std::span<const float> k, std::span<const float> v) {
+    cancel_prefetch();  // stages in io_
     const std::size_t rb = kv_row_bytes();
     if (cfg_.kv_bf16) {
         auto* dst = reinterpret_cast<uint16_t*>(io_);
@@ -746,6 +820,7 @@ bool Engine::kv_put(int attn_idx, int pos, std::span<const float> k, std::span<c
 
 // Rows j0 .. j0+count-1 of one attention layer into dst.
 bool Engine::kv_load(int attn_idx, int j0, int count, std::byte* dst) {
+    cancel_prefetch();  // dst is io_
     const std::size_t rb = kv_row_bytes();
     if (kv_file_ == nullptr) {
         std::memcpy(dst, kv_ram_[attn_idx] + static_cast<std::size_t>(j0) * rb, static_cast<std::size_t>(count) * rb);
@@ -902,6 +977,7 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
     for (int b = 0; b < n; ++b) {
         int32_t token = tokens[b];
         if (token < 0 || static_cast<std::size_t>(token) >= d.vocab) token = 0;
+        cancel_prefetch();
         if (!src_->read_at(h_.embed + static_cast<uint64_t>(token) * rb, io_, rb)) return kIoError;
         dequant_row(h_.embed_dtype, io_, {act(x_, b), d.dim});
     }
@@ -988,6 +1064,7 @@ int32_t Engine::verify(std::span<const int32_t> tokens, int32_t* preds, int firs
 
 bool Engine::accept(int keep) {
     if (pending_n_ == 0 || keep < 1 || keep > pending_n_) return false;
+    cancel_prefetch();  // the rollback stages state in io_
     if (keep < pending_n_) {
         // Conv state after `keep` tokens = history rows keep .. keep+hist-1
         // (history = the state before verify(), then each token's bx).
@@ -1010,6 +1087,7 @@ bool Engine::accept(int keep) {
 // a conv layer runs (io_ is free between that layer's two matvecs).
 float* Engine::state_load(int slot) {
     if (state_file_ == nullptr) return conv_state_[slot];
+    cancel_prefetch();  // staged in io_
     const std::size_t bytes = (h_.conv_l - 1) * h_.dim * sizeof(float);
     auto* buf = reinterpret_cast<float*>(io_);
     return state_file_->read_at(static_cast<uint64_t>(slot) * bytes, buf, bytes) ? buf : nullptr;
@@ -1056,6 +1134,7 @@ int32_t Engine::prefill(std::span<const int32_t> tokens, bool want_next, float* 
 
 std::size_t Engine::token_text(int32_t id, char* buf, std::size_t cap) {
     if (id < 0 || static_cast<uint32_t>(id) >= h_.vocab) return 0;
+    drain();
     uint32_t range[2];
     if (!src_->read_at(h_.vocab_index + static_cast<uint64_t>(id) * 4, range, sizeof(range))) return 0;
     const std::size_t len = std::min<std::size_t>(range[1] - range[0], cap);

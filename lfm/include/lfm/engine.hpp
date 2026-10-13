@@ -233,6 +233,25 @@ private:
     float* hist_ram_ = nullptr;
     FileSource* hist_file_ = nullptr;
     FileSource* state_file_ = nullptr;
+    // Cross-stream prefetch (stream_rows): the pass's matrix order, and the
+    // state of an async read that may be in flight.
+    struct Stream {
+        uint64_t offset;
+        std::size_t bytes;
+    };
+    static constexpr int kMaxStreams = 8 * kMaxLayers;
+    Stream sched_[kMaxStreams] = {};
+    int n_sched_ = 0;
+    bool pf_pending_ = false;  // an async read is in flight (wait() not yet called)
+    bool pf_ok_ = true;        // result of the last wait()
+    bool pf_valid_ = false;    // the next stream's first block is in io_[pf_buf_]
+    uint64_t pf_offset_ = 0;
+    std::size_t pf_len_ = 0;
+    int pf_buf_ = 0;
+    void drain();
+    void cancel_prefetch();
+    const Stream* next_stream(uint64_t offset) const;
+
     // Memory-mapped LM head shortlist table (set_flash_head).
     FlashHeadHeader fh_{};
     const std::byte* fh_proj_ = nullptr;

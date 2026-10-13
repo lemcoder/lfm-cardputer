@@ -183,6 +183,7 @@ struct RunConfig {
     int prompt_cache = 1; // reuse the prompt's state when a run repeats the previous prompt
     int chat = 1;         // keyboard chat (needs /tok.bin); 0 = run /prompt.txt (benchmarks)
     int max_reply = 256;  // chat: longest answer, tokens
+    int draft_head = 1;   // use a draft head flashed in the "ngram" partition
 };
 
 RunConfig read_run_config() {
@@ -206,6 +207,7 @@ RunConfig read_run_config() {
         else if (!std::strcmp(key, "prompt_cache")) rc.prompt_cache = value;
         else if (!std::strcmp(key, "chat")) rc.chat = value;
         else if (!std::strcmp(key, "max_reply")) rc.max_reply = value;
+        else if (!std::strcmp(key, "draft_head")) rc.draft_head = value;
     }
     std::fclose(f);
     return rc;
@@ -509,12 +511,20 @@ extern "C" void app_main(void) {
         return ptr;
     };
     std::size_t ngram_size = 0, head_size = 0;
-    const void* ngram = map_partition("ngram", &ngram_size);
-    const bool ngram_ok = drafter.set_ngram(ngram, ngram_size);
-    ESP_LOGI(TAG, "n-gram draft table: %s", ngram_ok ? "loaded from flash" : "not flashed (lookup only)");
     const void* head = map_partition("lmhead", &head_size);
     const bool head_ok = rc.flash_head && eng->set_flash_head(head, head_size);
     ESP_LOGI(TAG, "LM head table: %s", head_ok ? "from flash" : "from the SD card");
+    // The "ngram" partition holds a draft head (tools/draft_heads.py export)
+    // or an n-gram table (tools/spec_eval.py --export).
+    const void* ngram = map_partition("ngram", &ngram_size);
+    static lfm::DraftHead draft_head;
+    if (rc.draft_head && draft_head.set(ngram, ngram_size, *eng)) {
+        drafter.set_head(&draft_head);
+        ESP_LOGI(TAG, "drafts: prompt lookup, then the draft head in flash");
+    } else {
+        const bool ngram_ok = drafter.set_ngram(ngram, ngram_size);
+        ESP_LOGI(TAG, "drafts: prompt lookup, then %s", ngram_ok ? "the n-gram table in flash" : "nothing (not flashed)");
+    }
     const int max_draft = rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
 
     if (rc.chat) {
@@ -549,6 +559,7 @@ extern "C" void app_main(void) {
         const long rescore0 = eng->stats().rescore_reads;
         const double scan0 = eng->stats().flash_scan_s;
         const double proj0 = eng->stats().flash_proj_s, topk0 = eng->stats().topk_s;
+        const double dh0 = eng->stats().draft_head_s;
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
         drafter.reset();
@@ -642,14 +653,14 @@ extern "C" void app_main(void) {
         // One machine-readable line per run (tools/bench.py).
         ESP_LOGI(TAG, "RESULT run=%d prompt_tokens=%d prefill_s=%.2f gen_tokens=%d gen_s=%.2f s_per_tok=%.3f "
                  "total_s=%.2f passes=%d drafted=%d accepted=%d batch=%d read_mb=%.1f sd_busy=%.3f stall=%.3f heap_free=%u "
-                 "lm_head_s=%.2f rescore_reads=%ld flash_scan_s=%.2f proj_s=%.2f topk_s=%.2f",
+                 "lm_head_s=%.2f rescore_reads=%ld flash_scan_s=%.2f proj_s=%.2f topk_s=%.2f draft_head_s=%.2f",
                  run, n_prompt, prefill_s, g_status.tokens, gen_s,
                  g_status.tokens > 1 ? gen_s / (g_status.tokens - 1) : 0.0, total_s, spec.passes, spec.drafted,
                  spec.accepted, cfg.max_batch, (src.bytes_read() - read0) / 1e6, (src.sd_busy_seconds() - sd0) / total_s,
                  (src.stall_seconds() - stall0) / total_s,
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT), eng->stats().lm_head_s - head0,
                  eng->stats().rescore_reads - rescore0, eng->stats().flash_scan_s - scan0,
-                 eng->stats().flash_proj_s - proj0, eng->stats().topk_s - topk0);
+                 eng->stats().flash_proj_s - proj0, eng->stats().topk_s - topk0, eng->stats().draft_head_s - dh0);
 
         if (run + 1 < rc.runs) continue;
         do {

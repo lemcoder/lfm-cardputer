@@ -37,6 +37,8 @@ head: 99.5% next-token agreement with the full head on the host).
 | B2 per generated token | 14.06 s | **7.48 s** | −47% |
 | B2 prompt (20 tokens) | 46.46 s | **33.27 s** | −28% |
 | B2 total (20 + 12 tokens) | ~215 s (14.06 s × 12 + 46.5) | **115.5 s** | −46% |
+| *after #30 (draft head)*: B1 total | | **23.6 s** | −43% |
+| *after #30*: B2 per token / total | | **5.61 s / 95.0 s** | −60% / −56% |
 
 Biggest wins: self-generated n-gram drafts (#5), LM head table in flash
 (#11–18, #23), prompt batch 7 (#19), prompt cache (#27). Rejected: layer
@@ -78,6 +80,7 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 27 | **Prompt cache**: after the prompt, snapshot the conv state + position (K/V rows stay valid in kv.bin); a run with the same prompt restores instead of recomputing | B1 run again (G0 / `runs=2`): **34.70 → 23.39 s**, prompt 11.32 → 0.02 s, same tokens | yes |
 | 28 | Re-tune drafts per pass after #11–25 made extra positions cheaper | B2: k=1 8.31, **k=2 7.48**, k=3 7.67, k=4 7.88 s/token | k=2 stays |
 | 29 | **Wi-Fi + SD in parallel**: part of each weight block from the Mac over Wi-Fi while the card reads the rest (details below) | Combined 10.3–10.8 MB/s vs 9.3 from the card alone, but Wi-Fi needs 73–121 KB of RAM: prompt batch 7 → 3–4, B2 total ~115 → ~145 s (est.) | no, code removed |
+| 30 | **Draft head** (Medusa / Hydra style) instead of the n-gram table: a small network guesses the next tokens from the model's own final hidden state (details below) | B1 34.7 → **23.6 s**; B2 7.48 → **5.61 s/token** (total 115.5 → 95.0 s); chat, 48-token reply: **7.4 s/token** (1.71 tokens/pass) vs 11.1 with lookup only | **yes** |
 
 
 ## 29 in detail: Wi-Fi + SD in parallel
@@ -127,6 +130,56 @@ small Wi-Fi config (~73 KB at peak) forces the prompt batch from 7 down to
 ~115 → ~145 s. It only pays off past ~45 generated tokens per prompt, and it
 makes the device depend on a Mac running a server. The bigger buffers that
 gave +16% need RAM the device doesn't have.
+
+
+## 30 in detail: draft head
+
+**Why.** The n-gram table drafts from the last two tokens only. On ordinary
+text and chat replies it is rarely right (B1: 0 of 4 drafts; a chat "Hello":
+0 of 18), so most passes give one token.
+
+**What.** After each pass the engine has h, the final (normed) hidden state
+of the position that produced the newest token `fed`. One shared step,
+applied once per draft:
+
+    h' = h + up(silu(down([h, rmsnorm(embedding(fed))])))      down: 2048 -> 512, up: 512 -> 1024
+    draft = argmax(LM head(final_norm(h')))                    then feed h' and the draft to the next step
+
+Trained (`tools/draft_heads.py`) on the hidden states of the Q4 model over
+3.2M positions of its own greedy text: WikiText openings, Alpaca prompts in
+three shapes and 6000 ChatML chat turns (`tools/selfgen_corpus.py`). Only
+positions where the text continues the way the Q4 model would are used.
+
+**Simulated first** (20 chat prompts, 20 clean prompts, k = 2, tokens per pass):
+
+| drafter | chat | clean |
+|---|---|---|
+| n-gram table (what was on the device) | 1.21 | 1.31 |
+| Medusa heads (one per depth, no token input), WikiText-only training | 1.18 | 1.28 |
+| recurrent head, WikiText-only training | — | 1.42 |
+| recurrent head rank 256, mixed corpus | 1.56 | 1.62 |
+| recurrent head rank 512, mixed corpus | 1.63 | 1.64 |
+| prompt lookup, then recurrent rank 512 | **1.67** | **1.66** |
+| same, head weights in Q4 (what ships) | 1.65 | 1.66 |
+
+Training data mattered most: trained on WikiText only, the head was right
+51% of the time on held-out WikiText but ~31% on the clean prompts. Feeding
+the drafted token back in (recurrent) beats separate per-depth heads.
+
+**On the device.** Rank 512, Q4: 0.86 MB in the flash partition that held
+the n-gram table (`tools/draft_heads.py export`, `tools/flash_part.sh ngram
+out/dhead.bin`). Per draft: embedding row (flash cache or SD), two matvecs
+from flash, then the flash LM-head table scan with only the top 16 candidates
+re-scored. Engine scratch slots hold the temporaries, so no extra RAM.
+Measured: 1.71 tokens/pass on a 48-token chat reply (host prediction 1.70),
+drafting ~0.22 s per draft, i.e. a pass costs ~12.4 s instead of ~11.7 s.
+Output stays identical to greedy (host test
+`Speculative.DraftHeadSameTokensAsGreedy`).
+
+Not done yet: k = 3 on the device (simulation: 1.75 vs 1.67 tokens/pass, but
+each draft costs ~0.22 s); a cheaper draft LM head (the full-vocab table scan
+is most of the 0.22 s; restricting to the 16K most frequent ids would miss 14%
+of tokens).
 
 ## Not tried (and why)
 

@@ -135,6 +135,26 @@ public:
     // greedy tokens. False (and not used) if it doesn't match the model.
     bool set_flash_head(const void* data, std::size_t size);
 
+    // Draft heads (lfm/draft.hpp) run between passes and borrow the engine's
+    // buffers; everything here is valid until the next forward / prefill / verify.
+    //
+    // Final hidden state (after the final norm) of the newest token whose
+    // prediction is known: prefill's last token, or verify's last accepted one.
+    const float* last_hidden() const { return hidden_slot_ >= 0 ? xn_[hidden_slot_] : nullptr; }
+    // Free per-token scratch: i in [0, max_batch - 1), scratch_floats() each.
+    float* scratch(int i) const { return i >= 0 && i + 1 < cfg_.max_batch ? slots_[i + 1] : nullptr; }
+    std::size_t scratch_floats() const { return slot_floats_; }
+    // out[r] = row r . x, for a matrix already in memory (memory-mapped flash).
+    void matvec_mem(const std::byte* rows, Dtype dt, std::size_t n_rows, std::size_t cols, const float* x, float* out);
+    // Embedding row of `token`, dequantized (from the flash head's cache if
+    // there, else from the Source).
+    bool embedding(int32_t token, float* out);
+    // Greedy token for a raw (not yet final-normed) hidden state h, for drafts.
+    // With the flash head: its low-rank scan, top kDraftCandidates re-scored
+    // exactly (close to, not always, the exact argmax). work: dim floats.
+    int32_t draft_token(const float* h, float* work);
+    static constexpr int kDraftCandidates = 16;
+
     // Counters for experiments (since open()).
     struct Stats {
         double lm_head_s = 0;   // wall time in the LM head (scan + re-score)
@@ -142,6 +162,7 @@ public:
         double flash_scan_s = 0; // part of lm_head_s: projection + flash table scan
         double flash_proj_s = 0; // part of flash_scan_s: the projection
         double topk_s = 0;       // part of flash_scan_s: top-k inserts
+        double draft_head_s = 0; // draft heads' LM head (draft_token), not in lm_head_s
     };
     const Stats& stats() const { return stats_; }
 
@@ -175,7 +196,7 @@ private:
     // logits (n == 1 only) gets every vocab score.
     bool lm_head(const Ptrs& xs, int n, int32_t* out, float* logits);
     bool lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits);
-    bool lm_head_flash(const Ptrs& xs, int n, int32_t* out);
+    bool lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates);
     void quantize_inputs(const Ptrs& in, int n, std::size_t cols);
     float score_row(int b, Dtype dt, const std::byte* row, const float* in, std::size_t cols) const;
     bool rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out);
@@ -272,6 +293,7 @@ private:
     const std::byte* fh_proj_ = nullptr;
     const std::byte* fh_table_ = nullptr;
     const std::byte* fh_cache_ = nullptr;
+    int hidden_slot_ = -1;  // last_hidden(): xn_ slot, -1 = none
     bool recording_ = false;
     int pending_start_ = 0;
     int pending_n_ = 0;

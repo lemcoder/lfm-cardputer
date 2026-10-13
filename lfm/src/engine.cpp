@@ -288,6 +288,7 @@ void Engine::reset() {
     cancel_prefetch();
     pos_ = 0;
     pending_n_ = 0;
+    hidden_slot_ = -1;
     const std::size_t state_floats = (h_.conv_l - 1) * h_.dim;
     for (int i = 0; i < n_conv_; ++i) {
         if (conv_state_[i] != nullptr) std::memset(conv_state_[i], 0, state_floats * sizeof(float));
@@ -589,11 +590,11 @@ static inline void topk_insert(float* hs, int32_t* hi, int& size, int k, float v
 
 // LM head from the memory-mapped flash table: no SD reads except the
 // exact re-score of the shortlist.
-bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out) {
+bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates) {
     const std::size_t rank = fh_.rank;
     const std::size_t prb = row_bytes(fh_.proj_dtype, h_.dim);
     const std::size_t trb = row_bytes(fh_.table_dtype, rank);
-    const int k = static_cast<int>(fh_.candidates);
+    const int k = candidates;
 
     const auto t_scan = std::chrono::steady_clock::now();
     Ptrs z = slots(0);  // z at the start of each token's slot, top-k after kTopKOffset
@@ -654,7 +655,7 @@ bool Engine::lm_head(const Ptrs& xs, int n, int32_t* out, float* logits) {
 
 bool Engine::lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits) {
     assert(n >= 1 && n <= cfg_.max_batch && (logits == nullptr || n == 1));
-    if (fh_table_ != nullptr && logits == nullptr) return lm_head_flash(xs, n, out);
+    if (fh_table_ != nullptr && logits == nullptr) return lm_head_flash(xs, n, out, static_cast<int>(fh_.candidates));
     const bool shortlist = h_.lm_head != 0 && logits == nullptr;
     const bool lowrank = shortlist && h_.lm_rank > 0;
     const Dtype scan_dt = shortlist ? h_.lm_head_dtype : h_.embed_dtype;
@@ -1034,6 +1035,7 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
     }
     pos_ += n;
 
+    hidden_slot_ = -1;
     if (!want_next && preds == nullptr) {
         progress(static_cast<int>(h_.n_layers) + 1);
         return kNoToken;
@@ -1050,15 +1052,54 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
         }
         if (!lm_head(heads, n - first_pred, preds + first_pred, nullptr)) return kIoError;
         next = preds[n - 1];
+        hidden_slot_ = n - 1;  // accept() moves it to the last kept position
     } else {
         // Only the last token's prediction is needed.
         m::rmsnorm({act(xn_, n - 1), d.dim}, {act(x_, n - 1), d.dim}, norm_w, h_.norm_eps);
         Ptrs last{};
         last.p[0] = act(xn_, n - 1);
         if (!lm_head(last, 1, &next, logits)) return kIoError;
+        hidden_slot_ = n - 1;
     }
     progress(static_cast<int>(h_.n_layers) + 1);
     return next;
+}
+
+// ---------------------------------------------------------------- draft heads
+
+void Engine::matvec_mem(const std::byte* rows, Dtype dt, std::size_t n_rows, std::size_t cols, const float* x,
+                        float* out) {
+    Ptrs in{};
+    in.p[0] = const_cast<float*>(x);
+    if (xq_ != nullptr) quantize_inputs(in, 1, cols);
+    const std::size_t rb = row_bytes(dt, cols);
+    for (std::size_t r = 0; r < n_rows; ++r) out[r] = score_row(0, dt, rows + r * rb, x, cols);
+}
+
+bool Engine::embedding(int32_t token, float* out) {
+    if (token < 0 || static_cast<uint32_t>(token) >= h_.vocab) return false;
+    const std::size_t rb = row_bytes(h_.embed_dtype, h_.dim);
+    if (fh_cache_ != nullptr && static_cast<uint32_t>(token) < fh_.cache_rows) {
+        dequant_row(h_.embed_dtype, fh_cache_ + static_cast<std::size_t>(token) * rb, {out, h_.dim});
+        return true;
+    }
+    cancel_prefetch();  // uses io_
+    if (!src_->read_at(h_.embed + static_cast<uint64_t>(token) * rb, io_, rb)) return false;
+    dequant_row(h_.embed_dtype, io_, {out, h_.dim});
+    return true;
+}
+
+int32_t Engine::draft_token(const float* h, float* work) {
+    std::span<float> norm_w{norm_w_, h_.dim};
+    if (!read_f32(h_.final_norm, norm_w)) return kIoError;
+    m::rmsnorm({work, h_.dim}, {h, h_.dim}, norm_w, h_.norm_eps);
+    Ptrs xs{};
+    xs.p[0] = work;
+    int32_t tok = kNoToken;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = fh_table_ != nullptr ? lm_head_flash(xs, 1, &tok, kDraftCandidates) : lm_head_impl(xs, 1, &tok, nullptr);
+    stats_.draft_head_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return ok ? tok : kIoError;
 }
 
 int32_t Engine::forward(int32_t token, bool want_next, float* logits) {
@@ -1098,6 +1139,7 @@ bool Engine::accept(int keep) {
     }
     pos_ = pending_start_ + keep;
     pending_n_ = 0;
+    hidden_slot_ = keep - 1;
     return true;
 }
 
@@ -1153,6 +1195,7 @@ bool Engine::restore_prefix() {
         }
     }
     pos_ = prefix_pos_;
+    hidden_slot_ = -1;  // the hidden state after the prefix isn't kept
     return true;
 }
 

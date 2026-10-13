@@ -4,9 +4,15 @@
 // Draft sources, tried in order:
 //   1. prompt lookup: find the last 2 tokens earlier in the history and
 //      propose what followed them there (repeats, lists, code);
-//   2. n-gram table: trigram (a, b) -> most frequent next token, bigram
-//      fallback, built from a corpus by tools/spec_eval.py --export. On the
-//      device it lives in the flash "weights" partition, read through mmap.
+//   2. a draft head (if set): a small network trained on the model's own
+//      text (tools/draft_heads.py) that guesses the next tokens from the
+//      model's final hidden state, one shared step per draft:
+//        h' = h + up(silu(down([h, rmsnorm(embedding(token))])))
+//        draft = argmax(LM head(final_norm(h')))
+//   3. otherwise the n-gram table: trigram (a, b) -> most frequent next
+//      token, bigram fallback (tools/spec_eval.py --export).
+// On the device the head or the n-gram table lives in the flash "ngram"
+// partition, read through mmap.
 //
 // Greedy verification makes the result identical to plain greedy decoding;
 // drafts only change how many tokens one pass over the weights produces.
@@ -14,6 +20,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+
+#include "lfm/format.hpp"
 
 namespace lfm {
 
@@ -47,6 +55,38 @@ inline uint32_t ngram_slot(uint32_t key, uint32_t slots) {
     return bits == 0 ? 0 : (key * 0x9E3779B1u) >> (32 - bits);
 }
 
+// Draft head file layout (little-endian), written by tools/draft_heads.py export:
+//   DraftHeadHeader, then the two matrices at their offsets (from the header start).
+struct DraftHeadHeader {
+    char magic[8];         // "LFMDHED\0"
+    uint32_t version;      // 1
+    uint32_t dim;
+    uint32_t rank;
+    Dtype dtype;           // of both matrices
+    uint64_t down_offset;  // [rank][2 * dim], input [h, rmsnorm(embedding(token))]
+    uint64_t up_offset;    // [dim][rank]
+};
+static_assert(sizeof(DraftHeadHeader) == 40);
+inline constexpr char kDraftHeadMagic[8] = {'L', 'F', 'M', 'D', 'H', 'E', 'D', '\0'};
+
+class DraftHead {
+public:
+    // The whole file contents, kept by the caller (memory-mapped flash).
+    // False if it isn't a head for this model.
+    bool set(const void* data, std::size_t size, const Engine& eng);
+    bool ok() const { return down_ != nullptr; }
+
+    // Up to k drafts for the tokens after `fed`, from eng.last_hidden() (the
+    // state that produced fed). Uses the engine's scratch between passes.
+    // Returns how many (0 if there's no hidden state), or a negative Engine code.
+    int draft(Engine& eng, int32_t fed, int k, int32_t* out) const;
+
+private:
+    DraftHeadHeader h_{};
+    const std::byte* down_ = nullptr;
+    const std::byte* up_ = nullptr;
+};
+
 class Drafter {
 public:
     // history: caller-owned buffer for up to `cap` tokens (the context).
@@ -62,9 +102,15 @@ public:
 
     // Up to k draft tokens continuing the history. Returns how many.
     int draft(int32_t* out, int k) const;
+    // Prompt lookup only.
+    int lookup(int32_t* out, int k) const;
+
+    // Optional draft head, used when lookup finds nothing (instead of the
+    // n-gram table). Kept by the caller.
+    void set_head(const DraftHead* head) { head_ = head; }
+    const DraftHead* head() const { return head_; }
 
 private:
-    int lookup(int32_t* out, int k) const;
     int ngram(int32_t* out, int k) const;
     int32_t ngram_next(int32_t a, int32_t b) const;  // -1 if unknown
 
@@ -75,6 +121,7 @@ private:
     const NgramEntry* tri_ = nullptr;
     uint32_t vocab_ = 0;
     uint32_t tri_slots_ = 0;
+    const DraftHead* head_ = nullptr;
 };
 
 // Speculative decoding statistics.

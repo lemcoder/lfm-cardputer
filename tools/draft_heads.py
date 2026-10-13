@@ -18,7 +18,8 @@ Draft logits use the model's own (tied) LM head.
 
     uv run tools/draft_heads.py collect          # hidden states of out/spec/selfgen.npy, Q4 model
     uv run tools/draft_heads.py train --variant recurrent
-    uv run tools/draft_heads.py eval             # acceptance on clean prompts vs the n-gram drafter
+    uv run tools/draft_heads.py eval             # acceptance on chat / clean prompts vs the n-gram drafter
+    uv run tools/draft_heads.py export           # -> out/dhead.bin (rank 512, Q4: 0.9 MB, flash "ngram" partition)
 
 Hidden states come from the model with Q4_0-dequantized matrices (what the
 device runs), not the BF16 original.
@@ -255,11 +256,25 @@ def evaluate_rows(head, H, rows, E, norm_w, limit=20000):
     return [np.mean(np.all(hits[:, :k + 1], axis=1)) for k in range(tgt.shape[1])]
 
 
-def load_head(path: Path, dim: int):
+def roundtrip(w: torch.Tensor, quant: str) -> torch.Tensor:
+    """The weights as the device will see them: Q8_0 / Q4_0 round trip."""
+    a = w.detach().cpu().float().numpy()
+    if quant == "q4":
+        b = dequant_q4_0(export.quantize_q4_0(a), *a.shape)
+    else:
+        raw = np.frombuffer(export.quantize_q8_0(a), dtype=[("d", "<f2"), ("q", "i1", 32)]).reshape(a.shape[0], -1)
+        b = (raw["q"].astype(np.float32) * raw["d"].astype(np.float32)[..., None]).reshape(a.shape)
+    return torch.from_numpy(b)
+
+
+def load_head(path: Path, dim: int, quant: str = "f32"):
     ck = torch.load(path)
-    head = make_head(ck["variant"], dim, ck["rank"], ck["depth"]).to(DEVICE)
-    head.load_state_dict(ck["state"])
-    return head.eval()
+    head = make_head(ck["variant"], dim, ck["rank"], ck["depth"])
+    state = ck["state"]
+    if quant != "f32":
+        state = {k: roundtrip(v, quant) for k, v in state.items()}
+    head.load_state_dict(state)
+    return head.to(DEVICE).eval()
 
 
 CHAT_PROMPTS = [
@@ -295,7 +310,10 @@ def evaluate(args):
     }
     corpus = np.load(ROOT / "out" / "spec" / "selfgen.npy")
     bigram, trigram = spec_eval.build_ngram(corpus, 1.0)  # the table flashed on the device
-    heads = {p.stem: load_head(p, E.shape[1]) for p in sorted(OUT.glob("*_r*_d*.pt"))}
+    heads = {}
+    for p in sorted(OUT.glob("*_r*_d*.pt")):
+        for q in args.head_quant:
+            heads[f"{p.stem} {q}"] = load_head(p, E.shape[1], q)
 
     for set_name, prompts in sets.items():
         seqs, plens, hs = [], [], []
@@ -346,9 +364,34 @@ def evaluate(args):
                 print(f"{name:34s} k={k}: {tokens / passes:.2f} tokens/pass, est {s_tok:.2f} s/token", flush=True)
 
 
+def export_head(args):
+    """out/dhead.bin for the device (lfm/draft.hpp DraftHeadHeader)."""
+    import struct
+    ck = torch.load(args.head, map_location="cpu")
+    assert ck["variant"] == "recurrent", "the device runs the recurrent head"
+    down = ck["state"]["down.weight"].float().numpy()  # [rank, 2 * dim]
+    up = ck["state"]["up.weight"].float().numpy()      # [dim, rank]
+    quant = {"q4": (export.quantize_q4_0, 3), "q8": (export.quantize_q8_0, 2)}[args.quant]
+    down_b, up_b = quant[0](down), quant[0](up)
+    rank, dim = down.shape[0], up.shape[0]
+    header = 40
+    down_off = 64
+    up_off = (down_off + len(down_b) + 63) // 64 * 64
+    with open(args.out, "wb") as f:
+        f.write(b"LFMDHED\0" + struct.pack("<IIII", 1, dim, rank, quant[1]) + struct.pack("<QQ", down_off, up_off))
+        f.write(bytes(down_off - header))
+        f.write(down_b)
+        f.write(bytes(up_off - down_off - len(down_b)))
+        f.write(up_b)
+    print(f"wrote {args.out}: rank {rank}, {args.quant}, {Path(args.out).stat().st_size / 1024:.0f} KB")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["collect", "train", "eval"])
+    ap.add_argument("cmd", choices=["collect", "train", "eval", "export"])
+    ap.add_argument("--head", type=Path, default=OUT / "recurrent_r512_d3.pt", help="export: trained head")
+    ap.add_argument("--quant", choices=["q4", "q8"], default="q4", help="export: weight format")
+    ap.add_argument("--out", type=Path, default=ROOT / "out" / "dhead.bin", help="export: output file")
     ap.add_argument("--variant", choices=["medusa", "recurrent"], default="recurrent")
     ap.add_argument("--rank", type=int, default=512)
     ap.add_argument("--depth", type=int, default=3)
@@ -356,11 +399,13 @@ def main():
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--tokens", type=int, default=128, help="eval: greedy tokens per clean prompt")
+    ap.add_argument("--head-quant", nargs="+", default=["f32"], choices=["f32", "q8", "q4"],
+                    help="eval: head weights as stored on the device")
     ap.add_argument("--corpus", type=Path, nargs="+", default=[ROOT / "out" / "spec" / "selfgen.npy"],
                     help="collect: self-generated corpora (-1 separates sequences)")
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    {"collect": collect, "train": train, "eval": evaluate}[args.cmd](args)
+    {"collect": collect, "train": train, "eval": evaluate, "export": export_head}[args.cmd](args)
 
 
 if __name__ == "__main__":

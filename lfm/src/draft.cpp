@@ -1,8 +1,10 @@
 #include "lfm/draft.hpp"
 
+#include <cmath>
 #include <cstring>
 
 #include "lfm/engine.hpp"
+#include "lfm/math/ops.hpp"
 
 namespace lfm {
 
@@ -84,6 +86,54 @@ int Drafter::ngram(int32_t* out, int k) const {
     return m;
 }
 
+bool DraftHead::set(const void* data, std::size_t size, const Engine& eng) {
+    down_ = up_ = nullptr;
+    if (data == nullptr || size < sizeof(DraftHeadHeader)) return false;
+    std::memcpy(&h_, data, sizeof(h_));
+    const uint32_t dim = eng.header().dim;
+    const bool ok = std::memcmp(h_.magic, kDraftHeadMagic, sizeof(kDraftHeadMagic)) == 0 && h_.version == 1 &&
+                    h_.dim == dim && h_.rank % kQ8BlockSize == 0 && h_.rank > 0 &&
+                    (h_.dtype == Dtype::Q8_0 || h_.dtype == Dtype::Q4_0 || h_.dtype == Dtype::BF16) &&
+                    h_.down_offset + h_.rank * row_bytes(h_.dtype, 2 * dim) <= size &&
+                    h_.up_offset + dim * row_bytes(h_.dtype, h_.rank) <= size;
+    if (!ok) return false;
+    down_ = static_cast<const std::byte*>(data) + h_.down_offset;
+    up_ = static_cast<const std::byte*>(data) + h_.up_offset;
+    return true;
+}
+
+int DraftHead::draft(Engine& eng, int32_t fed, int k, int32_t* out) const {
+    const float* h0 = eng.last_hidden();
+    const std::size_t dim = h_.dim, rank = h_.rank;
+    // z = [h | embedding], w = [u (rank) | work (dim)], in two scratch slots.
+    float* z = eng.scratch(0);
+    float* w = eng.scratch(1);
+    if (!ok() || h0 == nullptr || z == nullptr || w == nullptr || eng.scratch_floats() < 2 * dim ||
+        eng.scratch_floats() < rank + dim) {
+        return 0;
+    }
+    float* u = w;
+    float* work = w + rank;
+    std::memcpy(z, h0, dim * sizeof(float));
+    int32_t tok = fed;
+    for (int i = 0; i < k; ++i) {
+        float* e = z + dim;
+        if (!eng.embedding(tok, e)) return Engine::kIoError;
+        float ss = 0;
+        for (std::size_t j = 0; j < dim; ++j) ss += e[j] * e[j];
+        const float inv = 1.0f / std::sqrt(ss / static_cast<float>(dim) + 1e-5f);
+        for (std::size_t j = 0; j < dim; ++j) e[j] *= inv;
+        eng.matvec_mem(down_, h_.dtype, rank, 2 * dim, z, u);
+        math::silu({u, rank});
+        eng.matvec_mem(up_, h_.dtype, dim, rank, u, work);
+        for (std::size_t j = 0; j < dim; ++j) z[j] += work[j];  // h' (the next step's h)
+        tok = eng.draft_token(z, work);
+        if (tok < 0) return tok;
+        out[i] = tok;
+    }
+    return k;
+}
+
 int speculative_step(Engine& eng, Drafter& drafter, int32_t fed, int max_draft, int32_t* out, SpecStats* stats) {
     int32_t tokens[Engine::kMaxBatch];
     int32_t preds[Engine::kMaxBatch];
@@ -92,7 +142,14 @@ int speculative_step(Engine& eng, Drafter& drafter, int32_t fed, int max_draft, 
     int k = max_draft;
     if (k > Engine::kMaxBatch - 1) k = Engine::kMaxBatch - 1;
     if (k > eng.max_ctx() - eng.pos() - 1) k = eng.max_ctx() - eng.pos() - 1;
-    const int n_draft = k > 0 ? drafter.draft(tokens + 1, k) : 0;
+    int n_draft = 0;
+    if (k > 0 && drafter.head() != nullptr) {
+        n_draft = drafter.lookup(tokens + 1, k);
+        if (n_draft == 0) n_draft = drafter.head()->draft(eng, fed, k, tokens + 1);
+        if (n_draft < 0) return n_draft;
+    } else if (k > 0) {
+        n_draft = drafter.draft(tokens + 1, k);
+    }
 
     const int32_t r = eng.verify({tokens, static_cast<std::size_t>(1 + n_draft)}, preds);
     if (r < 0) return r;

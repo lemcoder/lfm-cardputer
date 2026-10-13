@@ -20,6 +20,9 @@ const std::string kRoot = LFM_REPO_ROOT;
 const std::string kQ4 = kRoot + "/out/lfm-q4.lfm";
 const std::string kBf16 = kRoot + "/out/lfm-bf16.lfm";
 const std::string kNgram = kRoot + "/out/ngram.bin";
+const std::string kDevice = kRoot + "/out/lfm-q4-head-lr256.lfm";  // the device's model file
+const std::string kFlashHead = kRoot + "/out/lmhead.bin";          // tools/flash_head.py
+const std::string kDraftHead = kRoot + "/out/dhead.bin";           // tools/draft_heads.py export
 const std::string kHistPath = kRoot + "/out/test-conv-hist.bin";
 const std::string kKvPath2 = kRoot + "/out/test-kv2.bin";
 const std::string kStatePath = kRoot + "/out/test-conv-state.bin";
@@ -79,6 +82,57 @@ std::vector<int32_t> Speculative(const std::string& path, lfm::EngineConfig cfg,
     return out;
 }
 
+// The device setup: flash LM head, draft head after prompt lookup. Greedy
+// (with the same flash LM head) vs speculative, on a chat turn.
+struct HeadRun {
+    std::vector<int32_t> plain, spec;
+    lfm::SpecStats st;
+};
+HeadRun RunWithDraftHead(int n, int max_draft) {
+    const auto flash = ReadFile(kFlashHead);
+    const auto dhead = ReadFile(kDraftHead);
+    // "<|startoftext|><|im_start|>user\nTell me about the planets.<|im_end|>\n<|im_start|>assistant\n"
+    const std::vector<int32_t> prompt = {1, 6, 6423, 708, 52486, 1123, 1337, 779, 19603, 523, 7, 708, 6, 64015, 708};
+    lfm::EngineConfig cfg{.max_ctx = 256, .kv_bf16 = true, .kv_path = kKvPath2.c_str(), .max_batch = 4,
+                          .int8_activations = true, .speculative = true, .conv_history_path = kHistPath.c_str(),
+                          .conv_state_path = kStatePath.c_str()};
+    HeadRun r;
+    {
+        lfm::FileSource src(kDevice.c_str());
+        lfm::Engine eng;
+        EXPECT_EQ(eng.open(src, cfg), lfm::Status::Ok);
+        EXPECT_TRUE(eng.set_flash_head(flash.data(), flash.size()));
+        int32_t next = eng.prefill(prompt, true);
+        while (next >= 0 && static_cast<int>(r.plain.size()) < n) {
+            r.plain.push_back(next);
+            next = eng.forward(next, true);
+        }
+    }
+    lfm::FileSource src(kDevice.c_str());
+    lfm::Engine eng;
+    EXPECT_EQ(eng.open(src, cfg), lfm::Status::Ok);
+    EXPECT_TRUE(eng.set_flash_head(flash.data(), flash.size()));
+    lfm::DraftHead head;
+    EXPECT_TRUE(head.set(dhead.data(), dhead.size(), eng));
+    std::vector<int32_t> hist(1024);
+    lfm::Drafter drafter(hist.data(), static_cast<int>(hist.size()));
+    drafter.set_head(&head);
+    for (int32_t t : prompt) drafter.push(t);
+    int32_t fed = eng.prefill(prompt, true);
+    r.spec.push_back(fed);
+    drafter.push(fed);
+    int32_t buf[lfm::Engine::kMaxBatch];
+    while (static_cast<int>(r.spec.size()) < n) {
+        const int got = lfm::speculative_step(eng, drafter, fed, max_draft, buf, &r.st);
+        EXPECT_GT(got, 0);
+        if (got <= 0) break;
+        for (int i = 0; i < got; ++i) r.spec.push_back(buf[i]);
+        fed = buf[got - 1];
+    }
+    r.spec.resize(r.plain.size());
+    return r;
+}
+
 #define REQUIRE(path)                                                                   \
     do {                                                                                \
         GOLDEN_REQUIRED();                                                              \
@@ -134,6 +188,30 @@ TEST(Speculative, DeviceConfigSameTokensAsGreedy) {
     RecordProperty("tokens_per_pass", std::to_string(static_cast<double>(st.tokens) / st.passes));
     EXPECT_GT(st.accepted, 0) << "no draft was ever accepted";
     EXPECT_LT(st.accepted, st.drafted) << "test should also exercise rejections";
+}
+
+TEST(DraftHead, RejectsBadFile) {
+    if (!Exists(kDevice)) GTEST_SKIP() << kDevice << " missing";
+    lfm::FileSource src(kDevice.c_str());
+    lfm::Engine eng;
+    ASSERT_EQ(eng.open(src, {.max_batch = 3}), lfm::Status::Ok);
+    lfm::DraftHead head;
+    const char junk[64] = {};
+    EXPECT_FALSE(head.set(junk, sizeof(junk), eng));
+    EXPECT_FALSE(head.ok());
+}
+
+TEST(Speculative, DraftHeadSameTokensAsGreedy) {
+    for (const auto& p : {kDevice, kFlashHead, kDraftHead}) {
+        if (!Exists(p)) GTEST_SKIP() << p << " missing";
+    }
+    const HeadRun r = RunWithDraftHead(64, 2);
+    EXPECT_EQ(r.spec, r.plain);
+    const double tpp = static_cast<double>(r.st.tokens) / r.st.passes;
+    RecordProperty("tokens_per_pass", std::to_string(tpp));
+    std::printf("draft head: %d passes, %d tokens (%.2f per pass), drafts %d/%d accepted\n", r.st.passes,
+                r.st.tokens, tpp, r.st.accepted, r.st.drafted);
+    EXPECT_GT(r.st.accepted, 0);
 }
 
 // Exact float path, conv history in RAM.

@@ -65,6 +65,49 @@ def build_tree(head, h0, fed, E, norm_w, shape, vocab=None):
     return tok, children, steps, n
 
 
+@torch.no_grad()
+def dynamic_tree(head, h0, fed, E, norm_w, m=6, depth=4, k=2, c=3, conf="exact", topn=16):
+    """EAGLE-2: expand the k best nodes per layer (value = product of the
+    head's confidences along the path), then keep the m best of all nodes.
+    conf "exact": softmax over the vocab; "top16": over the top topn logits
+    only (what the device can compute). Returns (tokens, children, expansions
+    per layer, positions)."""
+    nodes = [{"tok": fed, "parent": -1, "v": 1.0, "d": 0, "h": h0}]
+    frontier, layer_sizes = [0], []
+    for _ in range(depth):
+        hs = torch.stack([nodes[i]["h"] for i in frontier])
+        toks = torch.tensor([nodes[i]["tok"] for i in frontier], device=dh.DEVICE)
+        h_new = head.step(hs, toks, E)
+        logits = dh.head_logits(h_new, E, norm_w)
+        if conf == "exact":
+            probs = torch.softmax(logits.float(), -1)
+            pv, pi = torch.topk(probs, c, -1)
+        else:
+            lv, li = torch.topk(logits.float(), topn, -1)
+            pr = torch.softmax(lv, -1)
+            pv, pi = pr[:, :c], li[:, :c]
+        layer_sizes.append(len(frontier))
+        new = []
+        for row, f in enumerate(frontier):
+            for j in range(c):
+                nodes.append({"tok": int(pi[row, j]), "parent": f, "v": nodes[f]["v"] * float(pv[row, j]),
+                              "d": nodes[f]["d"] + 1, "h": h_new[row]})
+                new.append(len(nodes) - 1)
+        frontier = sorted(new, key=lambda i: -nodes[i]["v"])[:k]
+    keep = sorted(range(1, len(nodes)), key=lambda i: (-nodes[i]["v"], nodes[i]["d"]))[:m]
+    keep = sorted(keep, key=lambda i: (nodes[i]["d"], -nodes[i]["v"]))  # parents before children
+    index = {0: 0}
+    for i in keep:
+        index[i] = len(index)
+    toks = [fed] + [nodes[i]["tok"] for i in keep]
+    children = {}
+    for i in keep:
+        p = nodes[i]["parent"]
+        if p in index:
+            children.setdefault(index[p], []).append(index[i])
+    return toks, children, layer_sizes, len(toks)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--head", type=Path, default=dh.OUT / "recurrent_r512_d3.pt")
@@ -117,6 +160,39 @@ def main():
                     cost += 9.6 + 0.2 * n_pos + 0.15 * steps
                     i += step
             print(f"{name:7s}: {tokens / passes:.2f} tokens/pass, est {cost / tokens:.2f} s/token")
+        # EAGLE-2 style dynamic trees (budget m drafts, depth, expand k per layer, c guesses per node).
+        for conf in ("exact", "top16"):
+            for depth, k, c in ((3, 2, 3), (4, 2, 3), (5, 2, 2), (4, 3, 3), (6, 1, 3), (5, 3, 2)):
+                passes = tokens = cost = 0.0
+                for s_, p, hs in seqs:
+                    i = p
+                    while i < len(s_):
+                        fed = s_[i - 1]
+                        drafts = dh.draft_lookup(s_[:i], 6)
+                        if drafts:
+                            acc = 0
+                            while acc < len(drafts) and i + acc < len(s_) and drafts[acc] == s_[i + acc]:
+                                acc += 1
+                            n_pos, step_cost = 1 + len(drafts), 0.0
+                        else:
+                            toks, children, layers, n_pos = dynamic_tree(head, hs[i - 2], fed, E, norm_w, 6, depth,
+                                                                         k, c, conf)
+                            node, acc = 0, 0
+                            while True:
+                                nxt = [ch for ch in children.get(node, []) if i + acc < len(s_) and toks[ch] == s_[i + acc]]
+                                if not nxt:
+                                    break
+                                node = nxt[0]
+                                acc += 1
+                            # one flash scan per layer, shared by its nodes
+                            step_cost = sum(0.15 + 0.03 * (n - 1) for n in layers)
+                        step = min(acc + 1, len(s_) - i)
+                        tokens += step
+                        passes += 1
+                        cost += 9.6 + 0.2 * n_pos + step_cost
+                        i += step
+                name = f"dyn {conf} d{depth} k{k} c{c}"
+                print(f"{name:22s}: {tokens / passes:.2f} tokens/pass, est {cost / tokens:.2f} s/token", flush=True)
 
 
 if __name__ == "__main__":

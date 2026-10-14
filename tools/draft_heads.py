@@ -198,7 +198,18 @@ def train(args):
             feed = torch.from_numpy(tr[1][sel]).long().to(DEVICE)
             tgt = torch.from_numpy(tr[2][sel]).long().to(DEVICE)
             outs = head(h, feed, E, norm_w)
-            loss = sum(F.cross_entropy(head_logits(o, E, norm_w), tgt[:, k]) for k, o in enumerate(outs))
+            loss = 0.0
+            for k, o in enumerate(outs):
+                student = head_logits(o, E, norm_w)
+                if args.loss != "hard":
+                    # Teacher: the model's own distribution at the target position
+                    # (its stored final hidden state times the tied LM head).
+                    with torch.no_grad():
+                        ht = torch.from_numpy(np.asarray(H[tr[0][sel] + k + 1], np.float32)).to(DEVICE)
+                        teacher = torch.softmax(ht @ E.T, -1)
+                    soft = -(teacher * torch.log_softmax(student, -1)).sum(-1).mean()
+                hard = F.cross_entropy(student, tgt[:, k])
+                loss = loss + (hard if args.loss == "hard" else soft if args.loss == "distill" else 0.5 * (hard + soft))
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -210,7 +221,7 @@ def train(args):
         acc = evaluate_rows(head, H, va, E, norm_w)
         print(f"epoch {epoch}: held-out top-1 per depth (drafting on its own guesses): "
               + ", ".join(f"{100 * a:.1f}%" for a in acc), flush=True)
-    path = OUT / f"recurrent_r{args.rank}_d{args.depth}.pt"
+    path = OUT / f"recurrent_r{args.rank}_d{args.depth}{'' if args.loss == 'hard' else '_' + args.loss}.pt"
     torch.save({"variant": "recurrent", "rank": args.rank, "depth": args.depth, "state": head.state_dict()}, path)
     print(f"wrote {path}")
 
@@ -426,6 +437,8 @@ def main():
     ap.add_argument("--quant", choices=["q4", "q8"], default="q4", help="export: weight format")
     ap.add_argument("--out", type=Path, default=ROOT / "out" / "dhead.bin", help="export: output file")
     ap.add_argument("--rank", type=int, default=512)
+    ap.add_argument("--loss", choices=["hard", "distill", "mix"], default="hard",
+                    help="train: hard = the model's top token; distill = its whole distribution (Hydra++); mix = both")
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--epochs", type=int, default=2)
     ap.add_argument("--batch", type=int, default=512)

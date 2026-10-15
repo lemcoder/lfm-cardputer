@@ -763,6 +763,8 @@ extern "C" void app_main(void) {
         const double proj0 = eng->stats().flash_proj_s, topk0 = eng->stats().topk_s;
         const double dh0 = eng->stats().draft_head_s;
         const lfm::Engine::FileIo io0 = eng->file_io();
+        eng->prof_flush();
+        const lfm::Engine::Stats prof0 = eng->stats();
         const long streams0 = src.streams();
         int32_t next = lfm::Engine::kNoToken;
         char phase[32];
@@ -848,11 +850,21 @@ extern "C" void app_main(void) {
         const double total_s = (esp_timer_get_time() - t0) / 1e6;
         const double gen_s = (esp_timer_get_time() - t_gen) / 1e6;
         ESP_LOGI(TAG, "done: %d tokens, %.1f s total, read %.0f MB", g_status.tokens, total_s, src.bytes_read() / 1e6);
+        // Where the time went (Engine::ProfCat), as " p_<name>=<s>" fields.
+        eng->prof_flush();
+        char prof_str[256];
+        {
+            int at = 0;
+            for (int c = 0; c < lfm::Engine::kNumProf && at < static_cast<int>(sizeof(prof_str)); ++c) {
+                at += std::snprintf(prof_str + at, sizeof(prof_str) - at, " p_%s=%.2f", lfm::Engine::prof_name(c),
+                                    eng->stats().prof[c] - prof0.prof[c]);
+            }
+        }
         // One machine-readable line per run (tools/bench.py).
         ESP_LOGI(TAG, "RESULT run=%d prompt_tokens=%d prefill_s=%.2f gen_tokens=%d gen_s=%.2f s_per_tok=%.3f "
                  "total_s=%.2f passes=%d drafted=%d accepted=%d batch=%d read_mb=%.1f sd_busy=%.3f stall=%.3f heap_free=%u "
                  "lm_head_s=%.2f rescore_reads=%ld flash_scan_s=%.2f proj_s=%.2f topk_s=%.2f draft_head_s=%.2f "
-                 "kv_s=%.2f kv_ops=%ld conv_s=%.2f conv_write_s=%.2f conv_reads=%ld conv_writes=%ld streams=%ld",
+                 "kv_s=%.2f kv_ops=%ld conv_s=%.2f conv_write_s=%.2f conv_reads=%ld conv_writes=%ld streams=%ld%s",
                  run, n_prompt, prefill_s, g_status.tokens, gen_s,
                  g_status.tokens > 1 ? gen_s / (g_status.tokens - 1) : 0.0, total_s, spec.passes, spec.drafted,
                  spec.accepted, cfg.max_batch, (src.bytes_read() - read0) / 1e6, (src.sd_busy_seconds() - sd0) / total_s,
@@ -862,7 +874,7 @@ extern "C" void app_main(void) {
                  eng->stats().flash_proj_s - proj0, eng->stats().topk_s - topk0, eng->stats().draft_head_s - dh0,
                  eng->file_io().kv_s - io0.kv_s, eng->file_io().kv_ops - io0.kv_ops, eng->file_io().conv_s - io0.conv_s,
                  eng->file_io().conv_write_s - io0.conv_write_s, eng->file_io().conv_reads - io0.conv_reads,
-                 eng->file_io().conv_writes - io0.conv_writes, src.streams() - streams0);
+                 eng->file_io().conv_writes - io0.conv_writes, src.streams() - streams0, prof_str);
 
         if (run + 1 < rc.runs) continue;
         do {

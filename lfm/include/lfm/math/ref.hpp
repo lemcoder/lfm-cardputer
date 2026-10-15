@@ -84,6 +84,10 @@ float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, s
 
 // rows Q4_0 rows of n columns, stored back to back, each dotted with the
 // same quantized activation: out[r]. (An LM head table scan.)
+// One Q4_0 row against n_tok token inputs: out[t] = dot_q4_0_q8(row, xq + t *
+// xq_stride, xscale + t * xs_stride, n). Same results, the weights unpacked once.
+void dot_q4_0_q8_multi(const std::byte* row, const int8_t* xq, std::size_t xq_stride, const float* xscale,
+                       std::size_t xs_stride, int n_tok, std::size_t n, float* out);
 void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq, const float* xscale,
                   float* out);
 

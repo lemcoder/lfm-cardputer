@@ -284,6 +284,7 @@ Status Engine::open(Source& src, const EngineConfig& cfg) {
 }
 
 void Engine::reset() {
+    Prof prof_scope(*this, kProfOther);
     cancel_prefetch();
     pos_ = 0;
     pending_n_ = 0;
@@ -305,6 +306,7 @@ void Engine::progress(int done) {
 // ---------------------------------------------------------------- weight I/O
 
 bool Engine::read_f32(uint64_t offset, std::span<float> out) {
+    Prof prof_scope(*this, kProfIo);
     drain();  // the Source allows no sync read while an async one is in flight
     return src_->read_at(offset, out.data(), out.size_bytes());
 }
@@ -319,6 +321,7 @@ bool Engine::read_f32(uint64_t offset, std::span<float> out) {
 // in open()) is already loading into the free buffer. Anything that touches
 // the Source or io_/io2_ outside stream_rows calls drain() / cancel_prefetch().
 void Engine::drain() {
+    Prof prof_scope(*this, kProfIo);
     if (pf_pending_) {
         pf_ok_ = src_->wait();
         pf_pending_ = false;
@@ -421,9 +424,18 @@ Engine::Ptrs Engine::acts(float* const* base) const {
 
 bool Engine::matvec(const Ptrs& out, std::size_t rows, uint64_t offset, Dtype dt, std::size_t cols, const Ptrs& x,
                     int n) {
+    Prof prof_scope(*this, kProfMatvec);
     if (xq_ != nullptr && (dt == Dtype::Q8_0 || dt == Dtype::Q4_0)) {
         // Integer path: quantize each token's input once, then int8 x int8 dots.
         for (int b = 0; b < n; ++b) m::quantize_q8({x.p[b], cols}, xq_ + b * xq_cols_, xs_ + b * (xq_cols_ / 32));
+        if (dt == Dtype::Q4_0 && n >= 2) {
+            // Several tokens: each weight block unpacked once for all of them.
+            return stream_rows(offset, rows, row_bytes(dt, cols), [&](std::size_t r, const std::byte* row) {
+                float res[kMaxBatch];
+                m::dot_q4_0_q8_multi(row, xq_, xq_cols_, xs_, xq_cols_ / 32, n, cols, res);
+                for (int b = 0; b < n; ++b) out.p[b][r] = res[b];
+            });
+        }
         return stream_rows(offset, rows, row_bytes(dt, cols), [&](std::size_t r, const std::byte* row) {
             for (int b = 0; b < n; ++b) {
                 const int8_t* q = xq_ + b * xq_cols_;
@@ -572,7 +584,12 @@ bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* coun
             if (e - start > cfg_.io_bytes || row_off(uni[j]) > end + kMaxGap) break;
             end = e;
         }
-        if (!src_->read_at(start, io_, static_cast<std::size_t>(end - start))) return false;
+        bool got;
+        {
+            Prof io(*this, kProfIo);
+            got = src_->read_at(start, io_, static_cast<std::size_t>(end - start));
+        }
+        if (!got) return false;
         ++stats_.rescore_reads;
         for (; i < j; ++i) score_all(io_ + (row_off(uni[i]) - start), uni[i]);
     }
@@ -840,6 +857,7 @@ bool Engine::lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits) {
 //   out = out_proj · (C * y)
 // The batch's tokens go through the conv state in order.
 bool Engine::conv_op(int layer, int n) {
+    Prof prof_scope(*this, kProfConv);
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
     float* kernel = shared_;  // [dim * conv_l]
@@ -917,6 +935,7 @@ std::size_t Engine::kv_row_bytes() const {
 
 // Store position `pos`'s K and V for one attention layer. Staged in io_.
 bool Engine::kv_put(int attn_idx, int pos, std::span<const float> k, std::span<const float> v) {
+    Prof prof_scope(*this, kProfIo);
     cancel_prefetch();  // stages in io_
     const std::size_t rb = kv_row_bytes();
     if (cfg_.kv_bf16) {
@@ -938,6 +957,7 @@ bool Engine::kv_put(int attn_idx, int pos, std::span<const float> k, std::span<c
 
 // Move one position's K/V row (accept_path: an accepted tree node to its depth).
 bool Engine::kv_copy(int attn_idx, int from, int to) {
+    Prof prof_scope(*this, kProfIo);
     const std::size_t rb = kv_row_bytes();
     if (kv_file_ == nullptr) {
         std::memcpy(kv_ram_[attn_idx] + static_cast<std::size_t>(to) * rb,
@@ -951,6 +971,7 @@ bool Engine::kv_copy(int attn_idx, int from, int to) {
 
 // Rows j0 .. j0+count-1 of one attention layer into dst.
 bool Engine::kv_load(int attn_idx, int j0, int count, std::byte* dst) {
+    Prof prof_scope(*this, kProfIo);
     cancel_prefetch();  // dst is io_
     const std::size_t rb = kv_row_bytes();
     if (kv_file_ == nullptr) {
@@ -974,6 +995,7 @@ bool Engine::kv_load(int attn_idx, int j0, int count, std::byte* dst) {
 // Batch: every token's K/V is stored first; token b then attends to
 // positions 0 .. pos_+b (causal).
 bool Engine::attn_op(int layer, int n) {
+    Prof prof_scope(*this, kProfAttn);
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
     const int ai = layer_slot_[layer];
@@ -1081,6 +1103,7 @@ bool Engine::attn_op(int layer, int n) {
 // w3's rows then turn it into the activation in place, so only ff floats per
 // token are needed.
 bool Engine::mlp(int layer, int n) {
+    Prof prof_scope(*this, kProfMlp);
     const Dims d(h_);
     const LayerOffsets& L = h_.layers[layer];
     if (!matvec(slots(0), d.ff, L.w1, h_.dtype(layer, kW1), d.dim, acts(xn_), n)) return false;
@@ -1088,7 +1111,17 @@ bool Engine::mlp(int layer, int n) {
     const Dtype dt3 = h_.dtype(layer, kW3);
     // Integer path: w1's matvec just quantized these same inputs into xq_.
     const bool int8 = xq_ != nullptr && h_.dtype(layer, kW1) == dt3 && (dt3 == Dtype::Q8_0 || dt3 == Dtype::Q4_0);
+    const bool multi = int8 && dt3 == Dtype::Q4_0 && n >= 2;
     const bool ok = stream_rows(L.w3, d.ff, row_bytes(dt3, d.dim), [&](std::size_t r, const std::byte* row) {
+        if (multi) {  // each weight block unpacked once for all tokens
+            float up[kMaxBatch];
+            m::dot_q4_0_q8_multi(row, xq_, xq_cols_, xs_, xq_cols_ / 32, n, d.dim, up);
+            for (int b = 0; b < n; ++b) {
+                float& g = slot(b)[r];
+                g = g * (1.0f / (1.0f + std::exp(-g))) * up[b];  // silu(gate) * up
+            }
+            return;
+        }
         for (int b = 0; b < n; ++b) {
             float up;
             if (int8) {
@@ -1131,6 +1164,7 @@ bool Engine::set_tree(const int8_t* parents, int n) {
 }
 
 int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* logits, int32_t* preds, int first_pred) {
+    Prof prof_scope(*this, kProfResidual);
     if (pos_ + n > cfg_.max_ctx) return kContextFull;
     if (!tree_) set_chain(n);
     tree_ = false;
@@ -1143,7 +1177,10 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
         int32_t token = tokens[b];
         if (token < 0 || static_cast<std::size_t>(token) >= d.vocab) token = 0;
         cancel_prefetch();
-        if (!src_->read_at(h_.embed + static_cast<uint64_t>(token) * rb, io_, rb)) return kIoError;
+        {
+            Prof io(*this, kProfIo);
+            if (!src_->read_at(h_.embed + static_cast<uint64_t>(token) * rb, io_, rb)) return kIoError;
+        }
         dequant_row(h_.embed_dtype, io_, {act(x_, b), d.dim});
     }
 
@@ -1181,6 +1218,7 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
         progress(static_cast<int>(h_.n_layers) + 1);
         return kNoToken;
     }
+    Prof lm_scope(*this, kProfLmHead);
     if (!read_f32(h_.final_norm, norm_w)) return kIoError;
     int32_t next = kNoToken;
     if (preds != nullptr) {
@@ -1232,10 +1270,33 @@ Engine::FileIo Engine::file_io() const {
     return r;
 }
 
+// ---------------------------------------------------------------- profiler
+
+namespace {
+int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+}  // namespace
+
+void Engine::prof_switch(ProfCat c) {
+    const int64_t t = now_us();
+    if (prof_t_us_ >= 0) stats_.prof[prof_cat_] += static_cast<double>(t - prof_t_us_) / 1e6;
+    prof_t_us_ = t;
+    prof_cat_ = c;
+}
+
+const char* Engine::prof_name(int cat) {
+    static const char* const kNames[kNumProf] = {"outside", "io",       "matvec", "attn",  "conv",
+                                                 "mlp",     "residual", "lmhead", "draft", "other"};
+    return cat >= 0 && cat < kNumProf ? kNames[cat] : "?";
+}
+
 // ---------------------------------------------------------------- draft heads
 
 void Engine::matvec_mem(const std::byte* rows, Dtype dt, std::size_t n_rows, std::size_t cols, const float* x,
                         float* out) {
+    Prof prof_scope(*this, kProfDraft);
     Ptrs in{};
     in.p[0] = const_cast<float*>(x);
     if (xq_ != nullptr) quantize_inputs(in, 1, cols);
@@ -1244,6 +1305,7 @@ void Engine::matvec_mem(const std::byte* rows, Dtype dt, std::size_t n_rows, std
 }
 
 bool Engine::embedding(int32_t token, float* out) {
+    Prof prof_scope(*this, kProfDraft);
     if (token < 0 || static_cast<uint32_t>(token) >= h_.vocab) return false;
     const std::size_t rb = row_bytes(h_.embed_dtype, h_.dim);
     if (fh_cache_ != nullptr && static_cast<uint32_t>(token) < fh_.cache_rows) {
@@ -1251,12 +1313,16 @@ bool Engine::embedding(int32_t token, float* out) {
         return true;
     }
     cancel_prefetch();  // uses io_
-    if (!src_->read_at(h_.embed + static_cast<uint64_t>(token) * rb, io_, rb)) return false;
+    {
+        Prof io(*this, kProfIo);
+        if (!src_->read_at(h_.embed + static_cast<uint64_t>(token) * rb, io_, rb)) return false;
+    }
     dequant_row(h_.embed_dtype, io_, {out, h_.dim});
     return true;
 }
 
 bool Engine::draft_tokens(const float* const* hs, int n, float* work, DraftTop* tops) {
+    Prof prof_scope(*this, kProfDraft);
     if (n < 1 || n > cfg_.max_batch) return false;
     std::span<float> norm_w{norm_w_, h_.dim};
     if (!read_f32(h_.final_norm, norm_w)) return false;
@@ -1333,6 +1399,7 @@ bool Engine::accept(int keep) {
 }
 
 bool Engine::accept_path(const int8_t* path, int len) {
+    Prof prof_scope(*this, kProfOther);
     if (pending_n_ == 0 || len < 1 || len > pending_n_ || path[0] != 0) return false;
     bool chain = true;
     for (int i = 1; i < len; ++i) {
@@ -1373,6 +1440,7 @@ bool Engine::accept_path(const int8_t* path, int len) {
 // Conv state: in RAM, or (conv_state_path) in a file, loaded into io_ while
 // a conv layer runs (io_ is free between that layer's two matvecs).
 float* Engine::state_load(int slot) {
+    Prof prof_scope(*this, kProfIo);
     if (state_file_ == nullptr) return conv_state_[slot];
     cancel_prefetch();  // staged in io_
     const std::size_t bytes = (h_.conv_l - 1) * h_.dim * sizeof(float);
@@ -1381,12 +1449,14 @@ float* Engine::state_load(int slot) {
 }
 
 bool Engine::state_store(int slot, const float* state) {
+    Prof prof_scope(*this, kProfIo);
     if (state_file_ == nullptr) return true;  // RAM state was updated in place
     const std::size_t bytes = (h_.conv_l - 1) * h_.dim * sizeof(float);
     return state_file_->write_at(static_cast<uint64_t>(slot) * bytes, state, bytes);
 }
 
 bool Engine::snapshot_prefix() {
+    Prof prof_scope(*this, kProfOther);
     if (pending_n_ != 0) return false;
     cancel_prefetch();
     const std::size_t floats = (h_.conv_l - 1) * h_.dim, bytes = floats * sizeof(float);
@@ -1410,6 +1480,7 @@ bool Engine::snapshot_prefix() {
 }
 
 bool Engine::restore_prefix() {
+    Prof prof_scope(*this, kProfOther);
     if (prefix_pos_ < 0 || pending_n_ != 0) return false;
     cancel_prefetch();
     const std::size_t floats = (h_.conv_l - 1) * h_.dim, bytes = floats * sizeof(float);
@@ -1431,6 +1502,7 @@ bool Engine::restore_prefix() {
 std::size_t Engine::hist_rows() const { return h_.conv_l - 1 + static_cast<std::size_t>(cfg_.max_batch); }
 
 bool Engine::hist_put(int slot, int row, const float* src) {
+    Prof prof_scope(*this, kProfIo);
     const std::size_t bytes = h_.dim * sizeof(float);
     const std::size_t idx = static_cast<std::size_t>(slot) * hist_rows() + static_cast<std::size_t>(row);
     if (hist_file_ != nullptr) return hist_file_->write_at(idx * bytes, src, bytes);
@@ -1439,6 +1511,7 @@ bool Engine::hist_put(int slot, int row, const float* src) {
 }
 
 bool Engine::hist_get(int slot, int row, float* dst) {
+    Prof prof_scope(*this, kProfIo);
     const std::size_t bytes = h_.dim * sizeof(float);
     const std::size_t idx = static_cast<std::size_t>(slot) * hist_rows() + static_cast<std::size_t>(row);
     if (hist_file_ != nullptr) return hist_file_->read_at(idx * bytes, dst, bytes);

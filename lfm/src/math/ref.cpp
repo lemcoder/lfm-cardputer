@@ -271,6 +271,13 @@ float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, s
     return sum;
 }
 
+void dot_q4_0_q8_multi(const std::byte* row, const int8_t* xq, std::size_t xq_stride, const float* xscale,
+                       std::size_t xs_stride, int n_tok, std::size_t n, float* out) {
+    for (int t = 0; t < n_tok; ++t) {
+        out[t] = dot_q4_0_q8(row, xq + static_cast<std::size_t>(t) * xq_stride, xscale + static_cast<std::size_t>(t) * xs_stride, n);
+    }
+}
+
 void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq, const float* xscale,
                   float* out) {
     const std::size_t rb = n / 32 * 18;

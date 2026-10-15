@@ -192,8 +192,28 @@ public:
         double flash_proj_s = 0; // part of flash_scan_s: the projection
         double topk_s = 0;       // part of flash_scan_s: top-k inserts
         double draft_head_s = 0; // draft heads' LM head (draft_token), not in lm_head_s
+        double prof[16] = {};    // wall time per ProfCat (prof_flush() first)
     };
     const Stats& stats() const { return stats_; }
+
+    // Where the time goes: every moment is charged to exactly one category
+    // (the innermost engine function running; kProfOutside while no engine
+    // call is active). Stats::prof is up to date after prof_flush().
+    enum ProfCat : uint8_t {
+        kProfOutside,   // the caller's own work between engine calls
+        kProfIo,        // waiting for the Source / the engine's files
+        kProfMatvec,    // weight matrix x activations (incl. quantizing the inputs)
+        kProfAttn,      // attention besides its matvecs and K/V I/O
+        kProfConv,      // short conv besides its matvecs and state I/O
+        kProfMlp,       // SwiGLU activation
+        kProfResidual,  // embedding rows, norms, residual adds
+        kProfLmHead,    // the LM head after the last layer (scan, top-k, re-score)
+        kProfDraft,     // draft head support: its matvecs, embeddings, LM head scans
+        kProfOther,     // accept/rollback, reset, prompt cache
+        kNumProf
+    };
+    static const char* prof_name(int cat);
+    void prof_flush() { prof_switch(prof_cat_); }
 
     // The engine's own files (KV cache, conv state + history): time and
     // operation counts since open().
@@ -367,6 +387,16 @@ private:
     int pending_n_ = 0;
 
     Stats stats_;
+    // Profiler (Stats::prof).
+    void prof_switch(ProfCat c);
+    struct Prof {
+        Engine& e;
+        ProfCat prev;
+        Prof(Engine& eng, ProfCat c) : e(eng), prev(eng.prof_cat_) { e.prof_switch(c); }
+        ~Prof() { e.prof_switch(prev); }
+    };
+    ProfCat prof_cat_ = kProfOutside;
+    int64_t prof_t_us_ = -1;
     Worker* worker_ = nullptr;
     LayerHook layer_hook_ = nullptr;
     void* layer_ctx_ = nullptr;

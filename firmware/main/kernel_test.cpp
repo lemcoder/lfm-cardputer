@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
@@ -110,6 +111,45 @@ bool kernel_test(PrintFn print) {
         print(line);
         ESP_LOGI(TAG, "%s", line);
         heap_caps_free(table);
+    }
+    // Multi-token Q4 dot: one row against 1..7 token inputs, vs the per-token kernel.
+    {
+        constexpr std::size_t kStride = 2560;  // the engine's xq_cols_
+        auto* xqm = static_cast<int8_t*>(heap_caps_aligned_alloc(16, kStride * 7, MALLOC_CAP_8BIT));
+        static float xsm[7 * (kStride / 32)];
+        esp_fill_random(xqm, kStride * 7);
+        for (float& v : xsm) v = 0.001f + (esp_random() % 1000) * 1e-5f;
+        for (std::size_t n : {std::size_t{1024}, std::size_t{2560}}) {
+            esp_fill_random(raw, n / 32 * 18);
+            for (std::size_t b = 0; b < n / 32; ++b) {
+                const uint16_t sc = static_cast<uint16_t>(0x2000 + (esp_random() & 0x0FFF));
+                std::memcpy(raw + b * 18, &sc, 2);
+            }
+            for (int tok : {1, 3, 7}) {
+                float single[7], multi[7];
+                uint32_t t0 = esp_cpu_get_cycle_count();
+                for (int rep = 0; rep < 20; ++rep) {
+                    for (int t = 0; t < tok; ++t) {
+                        single[t] = m::esp32s3::dot_q4_0_q8(raw, xqm + t * kStride, xsm + t * (kStride / 32), n);
+                    }
+                }
+                const uint32_t single_cyc = (esp_cpu_get_cycle_count() - t0) / 20;
+                t0 = esp_cpu_get_cycle_count();
+                for (int rep = 0; rep < 20; ++rep) {
+                    m::esp32s3::dot_q4_0_q8_multi(raw, xqm, kStride, xsm, kStride / 32, tok, n, multi);
+                }
+                const uint32_t multi_cyc = (esp_cpu_get_cycle_count() - t0) / 20;
+                int bad = 0;
+                for (int t = 0; t < tok; ++t) bad += single[t] != multi[t];
+                all_ok = all_ok && bad == 0;
+                std::snprintf(line, sizeof(line), "q4 multi n=%u tok=%d %s: %lu vs %lu cyc/block", (unsigned)n, tok,
+                              bad ? "BAD" : "OK", (unsigned long)(multi_cyc / (n / 32)),
+                              (unsigned long)(single_cyc / (n / 32)));
+                print(line);
+                ESP_LOGI(TAG, "%s", line);
+            }
+        }
+        heap_caps_free(xqm);
     }
     heap_caps_free(raw);
     heap_caps_free(xq);

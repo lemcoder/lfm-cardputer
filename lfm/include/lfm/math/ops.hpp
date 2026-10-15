@@ -57,6 +57,15 @@ inline float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xs
 #endif
 }
 
+inline void dot_q4_0_q8_multi(const std::byte* row, const int8_t* xq, std::size_t xq_stride, const float* xscale,
+                              std::size_t xs_stride, int n_tok, std::size_t n, float* out) {
+#if defined(LFM_ESP32S3_HAS_DOT_Q4_Q8_MULTI)
+    esp32s3::dot_q4_0_q8_multi(row, xq, xq_stride, xscale, xs_stride, n_tok, n, out);
+#else
+    ref::dot_q4_0_q8_multi(row, xq, xq_stride, xscale, xs_stride, n_tok, n, out);
+#endif
+}
+
 inline void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq,
                          const float* xscale, float* out) {
 #if defined(LFM_ESP32S3_HAS_SCAN_Q4_Q8)

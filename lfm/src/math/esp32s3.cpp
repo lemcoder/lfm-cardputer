@@ -9,7 +9,15 @@ extern "C" {
 void lfm_s3_q4_q8_sums(const std::byte* row, const int8_t* xq, int32_t* sums, int nb);
 void lfm_s3_q8_q8_sums(const std::byte* row, const int8_t* xq, int32_t* sums, int nb);
 void lfm_s3_q4_q8_rows(const std::byte* blocks, const int8_t* xq, int32_t* sums, int rows, int nb);
-void lfm_s3_q4_q8_multi(const std::byte* row, const int8_t* xq, int32_t* sums, int nb, int n_tok, int xq_stride);
+struct MultiArgs {
+    const std::byte* row;
+    const int8_t* xq;
+    const float* d;
+    const float* xs;
+    float* out;
+    int nb, n_tok, xq_stride_minus_16, xs_stride_bytes;
+};
+void lfm_s3_q4_q8_multi(const MultiArgs* a);
 }
 
 namespace lfm::math::esp32s3 {
@@ -57,29 +65,23 @@ float dot_q4_0_q8(const std::byte* row, const int8_t* xq, const float* xscale, s
     return combine(row, 18, xscale, sums, nb);
 }
 
-// Each weight block unpacked once for all tokens (sums[block][token]), each
-// scale converted once; per token the same arithmetic in the same order as
-// dot_q4_0_q8, so the results are identical.
+// Each weight block unpacked once for all tokens, each scale converted once;
+// per token the same arithmetic in the same order as dot_q4_0_q8 (mul.s,
+// then madd.s), so the results are identical.
 void dot_q4_0_q8_multi(const std::byte* row, const int8_t* xq, std::size_t xq_stride, const float* xscale,
                        std::size_t xs_stride, int n_tok, std::size_t n, float* out) {
     constexpr int kMaxTok = 8;
     const std::size_t nb = n / 32;
     assert(nb <= kMaxBlocks && n_tok >= 1 && n_tok <= kMaxTok && (reinterpret_cast<uintptr_t>(xq) & 15) == 0 &&
            xq_stride % 16 == 0);
-    int32_t sums[kMaxBlocks * kMaxTok];
-    lfm_s3_q4_q8_multi(row, xq, sums, static_cast<int>(nb), n_tok, static_cast<int>(xq_stride));
-    // Block scales once, then each token's sum in a register (the same
-    // expression, d * xs * sum, in the same block order as dot_q4_0_q8).
+    // Block scales once (rare f16 specials through the reference); the
+    // kernel does the rest, accumulators in float registers.
     float d[kMaxBlocks];
     const auto* p = reinterpret_cast<const uint8_t*>(row);
     for (std::size_t b = 0; b < nb; ++b, p += 18) d[b] = f16_fast(p[0] | (static_cast<uint32_t>(p[1]) << 8));
-    for (int t = 0; t < n_tok; ++t) {
-        const float* xs = xscale + static_cast<std::size_t>(t) * xs_stride;
-        const int32_t* s = sums + t;
-        float acc = 0.0f;
-        for (std::size_t b = 0; b < nb; ++b, s += n_tok) acc += d[b] * xs[b] * static_cast<float>(*s);
-        out[t] = acc;
-    }
+    const MultiArgs a{row, xq, d, xscale, out, static_cast<int>(nb), n_tok, static_cast<int>(xq_stride) - 16,
+                      static_cast<int>(xs_stride * sizeof(float))};
+    lfm_s3_q4_q8_multi(&a);
 }
 
 void scan_q4_0_q8(const std::byte* rows, std::size_t n_rows, std::size_t n, const int8_t* xq, const float* xscale,

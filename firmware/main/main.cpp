@@ -724,7 +724,8 @@ extern "C" void app_main(void) {
     if (head_drafts) drafter.set_head(&draft_head);
     ESP_LOGI(TAG, "drafts: prompt lookup%s", head_drafts ? ", then the draft head in flash" : " only (no draft head flashed)");
     const bool tree = rc.tree && drafter.head() != nullptr && cfg.max_batch >= lfm::kTree3x1.n;
-    if (tree) drafter.set_shape(&lfm::kTree3x1);  // 6 drafts per pass; prompt lookup may use as many
+    if (tree) drafter.set_shape(&lfm::kTree3x1);
+    // 6 drafts per pass with a tree; prompt lookup may use as many.
     const int max_draft = tree ? lfm::kTree3x1.n - 1 : rc.max_draft >= 0 ? rc.max_draft : cfg.max_batch - 1;
     ESP_LOGI(TAG, "draft shape: %s", tree ? "tree (3 first guesses, 6 drafts)" : "chain");
 

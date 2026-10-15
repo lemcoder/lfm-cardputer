@@ -483,7 +483,7 @@ float Engine::score_row(int b, Dtype dt, const std::byte* row, const float* in, 
 // token takes the best over the union. Nearby rows are fetched together in
 // one sector-aligned read: a separate small read costs ~0.5 ms (rows straddle
 // 512-byte sectors), about the same as reading 4 KB more. xs must be quantized.
-bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out, int32_t* top, int m) {
+bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out, DraftTop* tops) {
     cancel_prefetch();  // uses io_ and io2_
     const std::size_t erb = row_bytes(h_.embed_dtype, h_.dim);
     constexpr uint64_t kSector = 512;
@@ -521,10 +521,15 @@ bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* coun
         out[b] = n_uni > 0 ? uni[0] : 0;
     }
     auto row_off = [&](int32_t id) { return h_.embed + static_cast<uint64_t>(id) * erb; };
-    // top: the m best for token 0, best first (ties: lower id).
-    float top_s[4];
-    int n_top_m = 0;
-    if (m > 4) m = 4;
+    // tops: per token the kTop best (ties: lower id) and a running softmax
+    // (max, sum of exp) over every row scored.
+    float top_l[kMaxBatch][DraftTop::kTop];
+    float sm_max[kMaxBatch], sm_sum[kMaxBatch];
+    for (int b = 0; b < n && tops != nullptr; ++b) {
+        tops[b].n = 0;
+        sm_max[b] = -INFINITY;
+        sm_sum[b] = 0.0f;
+    }
     auto score_all = [&](const std::byte* row, int32_t id) {
         for (int b = 0; b < n; ++b) {
             const float v = score_row(b, h_.embed_dtype, row, xs.p[b], h_.dim);
@@ -532,14 +537,22 @@ bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* coun
                 best[b] = v;
                 out[b] = id;
             }
-            if (b == 0 && top != nullptr && (n_top_m < m || v > top_s[n_top_m - 1])) {
-                int i = n_top_m < m ? n_top_m++ : m - 1;
-                for (; i > 0 && v > top_s[i - 1]; --i) {
-                    top_s[i] = top_s[i - 1];
-                    top[i] = top[i - 1];
+            if (tops == nullptr) continue;
+            if (v > sm_max[b]) {
+                sm_sum[b] = sm_sum[b] * std::exp(sm_max[b] - v) + 1.0f;
+                sm_max[b] = v;
+            } else {
+                sm_sum[b] += std::exp(v - sm_max[b]);
+            }
+            DraftTop& t = tops[b];
+            if (t.n < DraftTop::kTop || v > top_l[b][t.n - 1]) {
+                int i = t.n < DraftTop::kTop ? t.n++ : DraftTop::kTop - 1;
+                for (; i > 0 && v > top_l[b][i - 1]; --i) {
+                    top_l[b][i] = top_l[b][i - 1];
+                    t.id[i] = t.id[i - 1];
                 }
-                top_s[i] = v;
-                top[i] = id;
+                top_l[b][i] = v;
+                t.id[i] = id;
             }
         }
     };
@@ -562,6 +575,9 @@ bool Engine::rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* coun
         if (!src_->read_at(start, io_, static_cast<std::size_t>(end - start))) return false;
         ++stats_.rescore_reads;
         for (; i < j; ++i) score_all(io_ + (row_off(uni[i]) - start), uni[i]);
+    }
+    for (int b = 0; b < n && tops != nullptr; ++b) {
+        for (int k = 0; k < tops[b].n; ++k) tops[b].prob[k] = std::exp(top_l[b][k] - sm_max[b]) / sm_sum[b];
     }
     return true;
 }
@@ -623,7 +639,7 @@ void Engine::scan_job(void* arg) {
 
 // LM head from the memory-mapped flash table: no SD reads except the
 // exact re-score of the shortlist.
-bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates, int32_t* top, int m,
+bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates, DraftTop* tops,
                            const int32_t* lazy_tokens) {
     const std::size_t rank = fh_.rank;
     const std::size_t prb = row_bytes(fh_.proj_dtype, h_.dim);
@@ -694,7 +710,7 @@ bool Engine::lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates, 
     stats_.flash_scan_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_scan).count();
     stats_.topk_s += topk_s;
     if (xq_ != nullptr) quantize_inputs(xs, n, h_.dim);
-    if (lazy_tokens == nullptr) return rescore(xs, n, ti, n_top, out, top, m);
+    if (lazy_tokens == nullptr) return rescore(xs, n, ti, n_top, out, tops);
     // Verification: a token's prediction only matters if its path is still
     // alive. Re-score the root, then the child (if any) whose token is what
     // the root predicts, and so on.
@@ -1178,7 +1194,7 @@ int32_t Engine::run_batch(const int32_t* tokens, int n, bool want_next, float* l
         if (fh_table_ != nullptr && first_pred == 0) {
             // verify / verify_tree: only along the path that can be accepted.
             const auto t0 = std::chrono::steady_clock::now();
-            const bool ok = lm_head_flash(heads, n, preds, static_cast<int>(fh_.candidates), nullptr, 0, tokens);
+            const bool ok = lm_head_flash(heads, n, preds, static_cast<int>(fh_.candidates), nullptr, tokens);
             stats_.lm_head_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (!ok) return kIoError;
             next = kNoToken;
@@ -1240,23 +1256,39 @@ bool Engine::embedding(int32_t token, float* out) {
     return true;
 }
 
-int32_t Engine::draft_token(const float* h, float* work, int32_t* top, int m) {
+bool Engine::draft_tokens(const float* const* hs, int n, float* work, DraftTop* tops) {
+    if (n < 1 || n > cfg_.max_batch) return false;
     std::span<float> norm_w{norm_w_, h_.dim};
-    if (!read_f32(h_.final_norm, norm_w)) return kIoError;
-    m::rmsnorm({work, h_.dim}, {h, h_.dim}, norm_w, h_.norm_eps);
+    if (!read_f32(h_.final_norm, norm_w)) return false;
     Ptrs xs{};
-    xs.p[0] = work;
-    int32_t tok = kNoToken;
+    for (int b = 0; b < n; ++b) {
+        xs.p[b] = work + static_cast<std::size_t>(b) * h_.dim;
+        m::rmsnorm({xs.p[b], h_.dim}, {hs[b], h_.dim}, norm_w, h_.norm_eps);
+    }
+    int32_t best[kMaxBatch];
     const auto t0 = std::chrono::steady_clock::now();
     bool ok;
     if (fh_table_ != nullptr) {
-        ok = lm_head_flash(xs, 1, &tok, kDraftCandidates, top, m);
-    } else {
-        ok = lm_head_impl(xs, 1, &tok, nullptr);  // exact, top-1 only
-        for (int i = 0; i < m; ++i) top[i] = i == 0 ? tok : kNoToken;
+        ok = lm_head_flash(xs, n, best, kDraftCandidates, tops);
+    } else {  // exact argmax only (host tests without the flash table)
+        ok = true;
+        for (int b = 0; b < n && ok; ++b) {
+            Ptrs one{};
+            one.p[0] = xs.p[b];
+            ok = lm_head_impl(one, 1, &best[b], nullptr);
+            tops[b].n = 1;
+            tops[b].id[0] = best[b];
+            tops[b].prob[0] = 1.0f;
+        }
     }
     stats_.draft_head_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    return ok ? tok : kIoError;
+    return ok;
+}
+
+int32_t Engine::draft_token(const float* h, float* work, DraftTop* top) {
+    DraftTop local;
+    DraftTop* t = top != nullptr ? top : &local;
+    return draft_tokens(&h, 1, work, t) ? t->id[0] : kIoError;
 }
 
 int32_t Engine::forward(int32_t token, bool want_next, float* logits) {

@@ -166,11 +166,22 @@ public:
     // Embedding row of `token`, dequantized (from the flash head's cache if
     // there, else from the Source).
     bool embedding(int32_t token, float* out);
+    // A position's best draft guesses: the top kTop of the exactly re-scored
+    // candidates, best first, with probabilities from a softmax over all the
+    // re-scored candidates (an estimate: the rest of the vocab is left out).
+    struct DraftTop {
+        static constexpr int kTop = 3;
+        int32_t id[kTop];
+        float prob[kTop];
+        int n;  // how many are set
+    };
     // Greedy token for a raw (not yet final-normed) hidden state h, for drafts.
     // With the flash head: its low-rank scan, top kDraftCandidates re-scored
     // exactly (close to, not always, the exact argmax). work: dim floats.
-    // top (optional): the m <= 4 best of the re-scored candidates, best first.
-    int32_t draft_token(const float* h, float* work, int32_t* top = nullptr, int m = 0);
+    int32_t draft_token(const float* h, float* work, DraftTop* top = nullptr);
+    // The same for n states in one table scan; work: n * dim floats (outside
+    // scratch(0), which the scan uses). False on an I/O error.
+    bool draft_tokens(const float* const* hs, int n, float* work, DraftTop* tops);
     static constexpr int kDraftCandidates = 16;
 
     // Counters for experiments (since open()).
@@ -227,7 +238,7 @@ private:
     bool lm_head_impl(const Ptrs& xs, int n, int32_t* out, float* logits);
     // lazy_tokens (verify): re-score only along the path that can still be
     // accepted (the batch's tokens and parent_); other outputs stay kNoToken.
-    bool lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates, int32_t* top = nullptr, int m = 0,
+    bool lm_head_flash(const Ptrs& xs, int n, int32_t* out, int candidates, DraftTop* tops = nullptr,
                        const int32_t* lazy_tokens = nullptr);
     struct ScanJob {
         const std::byte* table;
@@ -245,8 +256,7 @@ private:
     static void scan_job(void* arg);
     void quantize_inputs(const Ptrs& in, int n, std::size_t cols);
     float score_row(int b, Dtype dt, const std::byte* row, const float* in, std::size_t cols) const;
-    bool rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out, int32_t* top = nullptr,
-                 int m = 0);
+    bool rescore(const Ptrs& xs, int n, int32_t* const* ids, const int* count, int32_t* out, DraftTop* tops = nullptr);
 
     // n tokens at positions pos_ .. pos_+n-1: read xn_[b], write tmp_[b].
     // preds != nullptr: next token after every position (verify).

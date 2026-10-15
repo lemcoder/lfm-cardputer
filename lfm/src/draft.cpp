@@ -81,7 +81,7 @@ int DraftHead::draft_tree(Engine& eng, int32_t fed, const DraftShape& shape, int
     float* store[4] = {s2, s2 + dim, s3, s3 + dim};
     const float* state[Engine::kMaxBatch] = {};  // the state each node's guess came from
     const float* out_of[Engine::kMaxBatch] = {};  // state after expanding node i
-    int32_t cand[Engine::kMaxBatch][3];
+    Engine::DraftTop cand[Engine::kMaxBatch];
     int n_store = 0;
     tokens[0] = fed;
     parents[0] = -1;
@@ -93,13 +93,11 @@ int DraftHead::draft_tree(Engine& eng, int32_t fed, const DraftShape& shape, int
             if (n_store == 4) return Engine::kInvalid;
             float* h = store[n_store++];
             if (!step(eng, state[p], tokens[p], h)) return Engine::kIoError;
-            cand[p][0] = cand[p][1] = cand[p][2] = Engine::kNoToken;
-            const int32_t t = eng.draft_token(h, work, cand[p], 3);
+            const int32_t t = eng.draft_token(h, work, &cand[p]);
             if (t < 0) return t;
             out_of[p] = h;
         }
-        tokens[i] = cand[p][shape.rank[i]];
-        if (tokens[i] < 0) tokens[i] = cand[p][0];  // fewer candidates than asked: repeat the best
+        tokens[i] = shape.rank[i] < cand[p].n ? cand[p].id[shape.rank[i]] : cand[p].id[0];  // fewer: repeat the best
         parents[i] = static_cast<int8_t>(p);
         state[i] = out_of[p];
     }

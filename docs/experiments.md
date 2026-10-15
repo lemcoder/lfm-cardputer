@@ -96,6 +96,7 @@ adaptive drafts (#6, #24) don't beat plain k=2.
 | 41 | **Lossless compression of the layer weights** (`tools/zcodec.py`, `lfm/zcodec.hpp`, `lfm/zfile.hpp`): Huffman codes (≤ 10 bits, one table for the 4-bit-value bytes, one for the scales' high byte; low byte raw), chunks = the engine's 32 KB blocks, stored in `/lfm.lfz` next to the `.lfm`. Each block streams into the end of the engine's buffer and the reader task on core 1 decodes it in place while the DMA is still writing it. Ideal order-0 saving 10.4% (values 7%, scales 37%); achieved 8.4% (91.4 → 83.7 MB); decoder 14.8 MB/s on one core (first version 6.0) | Same tokens. Like for like (batch 6, chain) B2 4.93 → **4.75 s/token (−3.7%)**, prompt +1%. But ~8 KB of RAM (tables, index, buffer extra) drops the prompt batch 7 → 6, which also disables the tree: 78.2 → 92.0 s. Code removed (see Cleanup) | no (RAM) |
 | 42 | **EAGLE-2 dynamic draft trees**, simulated (`tools/tree_sim.py`): expand the k best nodes per depth by path confidence, keep the 6 best nodes overall; confidences from the top 16 candidates (what the device can score exactly) | Chat 1.95 → 2.02 tokens/pass, est. −4% s/token (partly from one shared flash scan per depth); clean ±0, −1%. The paper's +20–40% comes from 50–60 draft tokens per pass; at a budget of 6 the fixed tree is already near the best choice. Exact vs top-16 confidences: same | not built |
 | 43 | **Distilled draft head** (Hydra++): train on the model's whole next-token distribution (teacher = stored final hidden state × the tied LM head) instead of its top token; also a 50/50 mix | Simulated, fixed tree: chat 1.95 → 1.98, clean 2.04 → 2.05 tokens/pass (mix: 1.96 / 2.05). On the device: B2 unchanged (78.2 s), 48-token chat reply 316.5 → 339.2 s (26 passes vs 24). No measurable gain | no |
+| 44 | **Dynamic draft trees on the device** (#42 built): per depth one batched head step and one LM head table scan for the 2 most likely nodes; their top-3 guesses with confidences from a softmax over the exactly re-scored candidates; keep the 6 most likely nodes. Host test: output identical to greedy | 48-token chat reply: 316.7 s vs 316.5 s with the fixed tree, 24 passes each, drafting 14.2 vs 14.0 s (a 2-position table scan costs about two 1-position scans). Code removed; the per-position top-3 with confidences stays (the fixed tree uses it) | no |
 
 
 ## 29 in detail: Wi-Fi + SD in parallel
@@ -219,6 +220,7 @@ b0ead88:<path>` to get a file back).
 | SD test modes: `sd_speed.cpp` (clock sweep, raw reads, stream test), `sd_bench.cpp` | #2–4, #34–36 | measurements, done |
 | Medusa heads and `--draft-vocab` in `tools/draft_heads.py` | #30, #32 | worse than the recurrent head / no gain |
 | `tools/quant2_study.py`, `tools/sparsity_eval.py` | #8, #38 | studies of rejected ideas |
+| Dynamic draft trees (`DraftHead::draft_dynamic`, `Engine::matvec_mem_multi`, cfg `tree=2`; removed before it was committed: #44 describes it, `tools/tree_sim.py` still simulates it) | #44 | tied the fixed tree on the device |
 
 Kept: the SIMD kernel test mode (`kKernelTest`, correctness of the PIE
 kernels on the device) and every host test of code that ships.

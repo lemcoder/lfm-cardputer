@@ -1,7 +1,51 @@
 # lfm-cardputer
 
-LFM2.5-230M inference on the M5Stack Cardputer-Adv (ESP32-S3), weights streamed from microSD.
-Hand-written, for learning inference engineering.
+LFM2.5-230M running on a stock M5Stack Cardputer-Adv (ESP32-S3, no PSRAM), every
+weight streamed from the microSD card. A from-scratch C++ inference engine:
+type a message on the Cardputer's keyboard and the model answers on its screen.
+
+| | first working build | now |
+|---|---|---|
+| "The capital of France is" → " Paris." | 413 s | **21 s** |
+| per generated token (planets benchmark) | 63.1 s | **4.39 s** |
+| per generated token (chat reply) | — | **~6.1 s** (~2 tokens per weight pass) |
+
+Same unmodified hardware throughout. The card's 1-bit bus at 80 MHz (~9.4 MB/s,
+busy ~92%) is the limit: [docs/performance.md](docs/performance.md) explains
+where the time goes, [docs/experiments.md](docs/experiments.md) lists every
+idea tried (kept or not), [docs/extensions.md](docs/extensions.md) the hardware
+changes that would go further, [docs/medium.md](docs/medium.md) the story.
+
+## Install a release (no build needed)
+
+Each [release](https://github.com/lemcoder/lfm-cardputer/releases) has
+everything the device needs:
+
+| file | goes to | |
+|---|---|---|
+| `bootloader.bin`, `partition-table.bin`, `lfm_cardputer.bin` | flash 0x0 / 0x8000 / 0x10000 | firmware |
+| `dhead.bin` | flash 0x110000 (`draft`) | speculative-decoding draft head |
+| `lmhead.bin` | flash 0x250000 (`lmhead`) | LM head shortlist table |
+| `lfm.lfm` | SD card | the model, Q4 (148 MB) |
+| `tok.bin` | SD card | tokenizer |
+| `cfg.txt` | SD card | `chat=1` |
+| `SHA256SUMS` | | checksums |
+
+With a FAT32 microSD card in the Cardputer and the USB cable plugged in:
+
+```sh
+tools/install.sh            # latest release; or: tools/install.sh v1.0 /dev/cu.usbmodemXXXX
+```
+
+It downloads the release (`gh`), checks the checksums, flashes with esptool
+(`uvx`), then copies the SD files over the USB cable (~6 min, no card reader
+needed; or copy them to the card root yourself).
+
+On the device: type, Enter sends, fn+` starts a new chat. Words already typed
+are pushed through the model while you type, so the reply starts sooner.
+
+The `.lfm` is derived from the LFM2.5-230M weights and covered by their
+license.
 
 ## Layout
 
@@ -9,7 +53,7 @@ Hand-written, for learning inference engineering.
 lfm/        portable C++20 inference core (ESP-IDF component AND host static lib)
 host/       host build: reference engine, tests vs golden dumps
 firmware/   ESP-IDF 5.4.x standalone app (.bin) for the Cardputer-Adv; prints tokens on screen
-tools/      Python: golden activation dumps, weight converter -> .lfm
+tools/      Python: golden dumps, weight export, tokenizer, draft-head training, bench, upload, install
 docs/       notes, measurements
 ```
 
@@ -50,33 +94,29 @@ Uses clangd. Each of `firmware/`, `host/`, `lfm/` has a `.clangd` pointing at th
 For firmware, Espressif's `esp-clang` (`idf_tools.py install esp-clang`) gives better
 Xtensa header resolution than macOS clangd.
 
-**Performance and findings:** [docs/performance.md](docs/performance.md): what limits speed on this
-hardware, every optimisation with device measurements (413 s -> 55 s for the golden prompt), quality of
-the quantized variants, and what's next.
-
-Hardware changes that would go further (4-bit SD, a second card on the EXT
-header) are out of scope and written down in [docs/extensions.md](docs/extensions.md).
-
 ## Hardware facts (Cardputer-Adv, verified against M5Cardputer-UserDemo `CardputerADV` branch)
 
-- ESP32-S3FN8, 240 MHz dual core, 8 MB flash, **no PSRAM** -> ~512 KB SRAM, ~300 KB usable.
-- microSD wired for SPI: MISO 39, MOSI 14, SCLK 40, CS 12. Bus shared with LoRa cap (NSS 5).
-- **Measured (an SD test mode, 32 KB sequential reads; removed in the cleanup, see docs/experiments.md):**
-  - SPI 20 MHz: 1.82 MB/s. SPI 40 MHz: fails (GPIO-matrix input timing).
-  - **SD 1-bit mode on the same wires** (CLK 40, CMD 14, DAT0 39, DAT3 12): 2.45 MB/s @ 20 MHz,
-    **4.85 MB/s @ 40 MHz** (97% of the 1-bit ceiling). Input delay phase 0-3 makes no difference.
-  - FATFS `read()` costs ~0% vs raw sectors. `fread()` with `_IONBF` is ~30x slower: don't use it.
-  - 4 KB reads ~17% slower than 32 KB; read weights in >= 32 KB chunks.
-  - Once a card has been in SPI mode it needs a power cycle to enter SD mode (and vice versa here).
-- Free heap after display init: 366 KB, largest block 272 KB.
+- ESP32-S3FN8, 240 MHz dual core, 8 MB flash (GD25Q64, run at 120 MHz QIO), **no PSRAM**
+  -> ~512 KB SRAM, ~300 KB usable.
+- microSD wired for SPI only: MISO 39, MOSI 14, SCLK 40, CS 12; card DAT1/DAT2 unconnected,
+  so no 4-bit SD mode. Bus shared with the LoRa cap (NSS 5).
+- **SD 1-bit mode works on the same wires** (CLK 40, CMD 14, DAT0 39, DAT3 12 held high).
+  Measured: SPI 20 MHz 1.82 MB/s (40 MHz fails); SD 1-bit 40 MHz 4.85 MB/s (the IDF maximum),
+  **80 MHz overclock (160 MHz PLL ÷ 2) ~9.4 MB/s in the engine**, 9.9 MB/s streamed raw;
+  160 MHz doesn't answer. Details: docs/performance.md, experiments #34–36.
+  - Once a card has been in SPI mode it needs a power cycle to enter SD mode.
+  - `fread()` with `_IONBF` is ~30x slower than `read()`: don't use it.
+- Keyboard: TCA8418 on I2C (SDA 8, SCL 9, address 0x34).
 
 ## Model facts (LFM2.5-230M config.json)
 
 - dim 1024, ff 2560 (SwiGLU), 14 layers: conv x8, attn x6 (layers 2,4,6,8,10,12)
 - 16 heads, 8 KV heads, head_dim 64, RoPE theta 1e6, vocab 65536, tied embeddings
-- KV cache: 6 x 8 x 64 x 2 x 2 B = **12 KB/token** fp16 (6 KB int8) -> context is RAM-bound
+- KV cache: 6 x 8 x 64 x 2 x 2 B = **12 KB/token** fp16, kept on the SD card (context cap 1024)
 - ~163M MACs in layers + 67M in full LM head per token
-- **Bytes read per token is the metric.** Q4 ~130 MB, Q2 ~70 MB; tied head = 25% of it
+- **Bytes read per token is the metric.** Q4 layers ~91 MB per weight pass; the tied head
+  (25% of the model) is replaced by a low-rank shortlist in flash + ~768 exact rows from SD
+- Q4 is the floor: 2-bit breaks the model, 3-bit isn't worth it (experiment #38)
 
 ## Golden reference (tools/golden.py)
 
@@ -100,34 +140,39 @@ Semantics the C++ must match:
 - Layer: `h = x + op(operator_norm(x)); out = h + mlp(ffn_norm(h))`.
 - Head: `logits = embed_tokens @ embedding_norm(h)` (tied).
 
-## Running the model
+## Building it yourself
 
+```sh
+uv run tools/lm_basis.py                                       # out/lm_basis.npy (low-rank LM head basis)
+uv run tools/export.py --quant q4 --lm-head lowrank --out out/lfm-q4-head-lr256.lfm
+uv run tools/export_tokenizer.py                               # out/tok.bin
+uv run tools/flash_head.py                                     # out/lmhead.bin
+uv run tools/selfgen_corpus.py ...                             # model's own text (see draft_heads.py)
+uv run tools/draft_heads.py collect && uv run tools/draft_heads.py train && uv run tools/draft_heads.py export
+tools/idf.sh build flash                                       # firmware
+tools/flash_part.sh lmhead out/lmhead.bin
+tools/flash_part.sh draft out/dhead.bin
+printf 'chat=1\n' > out/cfg.txt
+uv run tools/upload.py out/lfm-q4-head-lr256.lfm:lfm.lfm out/tok.bin:tok.bin out/cfg.txt:cfg.txt
+./host/build/lfm_tests                                         # host tests
 ```
-uv run tools/export.py                 # out/lfm-q8.lfm (245 MB) + out/prompt.txt
-uv run tools/export.py --dtype bf16    # out/lfm-bf16.lfm (460 MB), exact weights for host tests
-./host/build/lfm_host out/lfm-q8.lfm   # same engine on the Mac
-```
 
-On the device: copy `out/lfm-q8.lfm` to the SD card root as `lfm.lfm` and
-`out/prompt.txt` as `prompt.txt`, then Zed task **fw: flash + monitor**.
-No card reader: flash first, then `uv run tools/upload.py` sends both files
-over the USB cable (~0.4 MB/s, ~10 min for the model; `--prompt-only` for
-just the prompt). The firmware listens for it for 1.5 s after every boot.
-G0 runs the prompt again. Change the prompt with
-`uv run tools/export.py --prompt "..."` (rewrites prompt.txt; the model file
-is rewritten too, same content).
-
-Engine (`lfm/engine.hpp`): one token at a time, every weight streamed from the
-file through one 32 KB buffer. On the device the KV cache is a file too
-(`/kv.bin`, 12 KB per token, read back with an online softmax), so RAM is a
-fixed ~136 KB and the context is limited to 1024 tokens by config only.
+`/cfg.txt` on the card holds `key=value` knobs (`RunConfig` in `firmware/main/main.cpp`).
+`chat=0` runs `/prompt.txt` instead (`uv run tools/export.py --prompt "..."`), which is
+what `tools/bench.py` uses; G0 runs it again. `kKernelTest` in `main.cpp` switches the
+firmware to the SIMD kernel test.
 
 ## Milestones
 
-0. [x] tools: dump golden per-layer activations + logits from HF transformers
-1. [ ] host: fp32 single-token forward in C++, matches golden layer-by-layer
-2. [ ] host: custom Q4/Q2 block quant; per-layer error, top-1 agreement, perplexity
-3. [ ] host: streaming engine, fixed ~280 KB arena, bytes/token counter
-4. [x] device: SD sequential read benchmark -> SD 1-bit @ 40 MHz, 4.85 MB/s
-5. [ ] device: quantized matvec benchmark, scalar then PIE SIMD (cycles/MAC)
-6. [ ] device: full model; then BPE tokenizer; then UI
+0. [x] tools: golden per-layer activations + logits from HF transformers
+1. [x] host: fp32 forward in C++, matches golden layer by layer
+2. [x] host: Q8 / Q4 block quantization; perplexity, top-1 agreement, KL vs BF16
+3. [x] host + device: streaming engine, fixed RAM, KV cache on SD
+4. [x] device: SD 1-bit mode, overclocked 40 -> 80 MHz, async + aligned reads
+5. [x] device: PIE SIMD Q4/Q8 kernels (6-7x vs C), multi-token kernel in assembly
+6. [x] device: full model, " Paris." in 413 s -> 55 s
+7. [x] device: LM head shortlist in flash, batched prefill (batch 7), prompt cache
+8. [x] device: speculative decoding: draft head trained on the model's own text, tree drafts
+9. [x] device: patched SD driver, one streamed command per matrix (-10%)
+10. [x] device: BPE tokenizer, keyboard chat, prefill while typing
+11. [x] release: prebuilt firmware + model, `tools/install.sh`

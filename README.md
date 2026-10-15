@@ -54,6 +54,9 @@ Xtensa header resolution than macOS clangd.
 hardware, every optimisation with device measurements (413 s -> 55 s for the golden prompt), quality of
 the quantized variants, and what's next.
 
+Hardware changes that would go further (4-bit SD, a second card on the EXT
+header) are out of scope and written down in [docs/extensions.md](docs/extensions.md).
+
 ## Hardware facts (Cardputer-Adv, verified against M5Cardputer-UserDemo `CardputerADV` branch)
 
 - ESP32-S3FN8, 240 MHz dual core, 8 MB flash, **no PSRAM** -> ~512 KB SRAM, ~300 KB usable.

@@ -236,13 +236,13 @@ reads the file back and checks size and CRC-32.
 
 ## Next steps
 
-1. **Speculative decoding.** CPU is idle ~78% of a generated token, so
-   verifying 2 drafts per pass is nearly free. Plan: prompt lookup plus a
-   1 MB n-gram table in flash; batch-3 verification with one shared LM head
-   scan. Expected ~10–11 s/token.
-2. **Scale step in assembly.** The C part is ~32 of ~53 cycles per block.
-   That would matter once compute is the limit again (batch verification).
-3. **Faster uploads (Wi-Fi)** if model variants get swapped often.
+On the stock board the device is at its limits: the SD card reads at its
+1-bit, 80 MHz ceiling (~92% busy), RAM leaves no room to read ahead, and
+draft tuning (fixed tree, dynamic tree, distilled head) has converged
+within ~1% (experiments #42–44). The next factor of two needs more data
+lines to the card, which means changing the hardware. That's outside this
+project; [extensions.md](extensions.md) writes those options down (4-bit
+SD wiring, a second card on the EXT header, a second processor).
 
 ## Reproducing
 
